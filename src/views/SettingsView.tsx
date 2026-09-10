@@ -13,8 +13,11 @@ const IMPORT_SOURCES = [
 ];
 
 export function SettingsView() {
-  const { config, persistConfig, toast, refreshSessions, selectSession } = useApp();
+  const { config, persistConfig, toast, refreshSessions, selectSession, runUpdateCheck } = useApp();
   const [skills, setSkills] = useState<SkillInfo[]>([]);
+  // update check preference lives in localStorage (client-side only);
+  // "off" = disabled, anything else / missing = enabled
+  const [autoUpdate, setAutoUpdate] = useState(() => localStorage.getItem("cc.autoUpdateCheck") !== "off");
   const [impSource, setImpSource] = useState("claude-code");
   const [impCands, setImpCands] = useState<ImportCandidate[] | null>(null);
   const [impScanning, setImpScanning] = useState(false);
@@ -163,6 +166,51 @@ export function SettingsView() {
             只读工具直接执行；<b>写工具每次执行前弹出审批卡</b>（显示变更预览），120 秒未响应自动拒绝——
             拒绝、超时、会话中断一律不落盘。可勾选「本次会话内记住」，授权只记到会话级、重启即失效。
             系统提示随之分层装配：身份 → 全局指令 → AGENTS.md → 运行环境。
+          </div>
+        </div>
+
+        <div className="card">
+          <h3>应用更新</h3>
+          <div className="row" style={{ marginTop: 10, marginBottom: 6 }}>
+            <button
+              className={`switch ${autoUpdate ? "on" : ""}`}
+              role="switch"
+              aria-checked={autoUpdate}
+              onClick={() => {
+                const next = !autoUpdate;
+                setAutoUpdate(next);
+                localStorage.setItem("cc.autoUpdateCheck", next ? "on" : "off");
+              }}
+            />
+            <span style={{ fontSize: 13 }}>
+              启动时自动检查更新（每 24 小时最多一次，仅提示、不自动下载）
+            </span>
+          </div>
+          <label style={{ fontSize: 12, color: "var(--text-dim)", display: "block", marginBottom: 8 }}>
+            GitHub 访问令牌（Releases 在私有仓库时检查更新需要；留空仅检查公开仓库）
+            <input
+              className="input mono"
+              type="password"
+              style={{ display: "block", marginTop: 4, width: "100%" }}
+              value={config.settings.update_token ?? ""}
+              placeholder="github_pat_… / ghp_…"
+              onChange={(e) => update({ update_token: e.target.value })}
+            />
+          </label>
+          <div className="hint" style={{ marginBottom: 10 }}>
+            令牌仅用于读取 Releases 元数据，随 API Key 一同加密存储（macOS 钥匙串 / Linux
+            密钥环 / Windows DPAPI）。
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            <button
+              className="btn small"
+              onClick={() => void runUpdateCheck(true)}
+            >
+              立即检查更新
+            </button>
+            <span style={{ fontSize: 11, color: "var(--text-faint)" }}>
+              也可以随时点击侧边栏底部的版本号
+            </span>
           </div>
         </div>
 

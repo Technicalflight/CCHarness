@@ -20,6 +20,7 @@ mod skillhub;
 mod skills;
 mod sysprompt;
 mod types_rs;
+mod update;
 mod urlguard;
 mod worktree;
 
@@ -127,6 +128,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::save_config,
+            update::check_update,
             commands::ccswitch_import,
             commands::hide_to_tray,
             commands::app_quit,

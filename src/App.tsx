@@ -22,7 +22,7 @@ import { SubagentsView } from "./views/SubagentsView";
 import { WorkflowView } from "./views/WorkflowView";
 
 export function App() {
-  const { view, bootstrap, sidebarOpen } = useApp();
+  const { view, bootstrap, sidebarOpen, runUpdateCheck } = useApp();
   const previewOpen = useApp((s) => s.previewOpen);
   const panelW = useApp((s) => s.panelW);
   const [closeAsk, setCloseAsk] = useState(false);
@@ -30,6 +30,17 @@ export function App() {
   useEffect(() => {
     void bootstrap();
   }, [bootstrap]);
+
+  // silent startup update check, throttled to once per 24h; a found update
+  // only lights the sidebar badge + a toast (manual download by design)
+  useEffect(() => {
+    if (localStorage.getItem("cc.autoUpdateCheck") === "off") return;
+    const DAY = 24 * 60 * 60 * 1000;
+    const last = Number(localStorage.getItem("cc.lastUpdateCheck") ?? 0);
+    if (Date.now() - last < DAY) return;
+    localStorage.setItem("cc.lastUpdateCheck", String(Date.now()));
+    void runUpdateCheck(false);
+  }, [runUpdateCheck]);
 
   // Rust intercepts the close button when settings.close_action === "ask"
   // and emits this event — show the tray-or-quit dialog.

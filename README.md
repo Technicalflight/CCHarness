@@ -23,6 +23,18 @@ CCHarness 是一个自带模型（BYOM）的桌面工作台：一个界面管理
 
 ---
 
+## 下载安装
+
+前往 [Releases](https://github.com/Technicalflight/CCHarness/releases) 页面下载对应平台的安装包（自 v0.1.0 起提供三平台构建）：
+
+| 平台 | 文件 | 说明 |
+|:--|:--|:--|
+| Windows | `.exe`（NSIS 安装向导）或 `.msi` | x64 |
+| macOS | `.dmg` | Apple Silicon + Intel 通用二进制 |
+| Linux | `.deb` / `.rpm` / `.AppImage` | Debian 系 / 红帽系 / 免安装运行 |
+
+安装包未做代码签名：Windows 首次运行可能出现 SmartScreen 提示（点「仍要运行」）；macOS 首次打开需在「系统设置 → 隐私与安全性」中放行。应用内置**更新检查**——点击侧边栏底部的版本号或在设置页开启启动自动检查，发现新版本会提示前往 Releases 下载。
+
 ## 为什么选择 CCHarness？
 
 | | |
@@ -30,7 +42,7 @@ CCHarness 是一个自带模型（BYOM）的桌面工作台：一个界面管理
 | 🧭 **桌面优先** | 原生桌面应用而非浏览器标签页：直接读写工作区文件、`@` 文件引用补全、系统级通知、`Ctrl+K` 命令面板，会话与配置全部留在本机。 |
 | 💰 **缓存是一级指标** | 上游前缀缓存命中 token 约 1/10 价格。CCHarness 在**请求侧制造可缓存性**（而非在响应侧猜测相似性），命中率曲线、逐请求账本、miss 归因全部内置进遥测面板。 |
 | 🔄 **工作流引擎** | 智能体 / 规划 / 目标 / 深度推理 / 生图 / 自定义状态机——六种模式一个下拉切换，权限边界、指令注入、工具面随模式自动收敛。 |
-| 🔒 **Local-first** | 会话、API Key、记忆全部落在本机：Key 经系统 DPAPI 加密，请求直连你配置的 Provider，不经过任何第三方中转。 |
+| 🔒 **Local-first** | 会话、API Key、记忆全部落在本机：Key 经系统级加密（Windows DPAPI / macOS 钥匙串 / Linux 密钥环），请求直连你配置的 Provider，不经过任何第三方中转。 |
 
 ## 从提示词到补丁
 
@@ -132,7 +144,7 @@ Zone T  尾区     本轮新增（用户消息），下一轮落入 H 成为稳�
 | 数据 | 存储 | 保护 |
 |---|---|---|
 | 会话 | 本机应用数据目录 | 原子写入（tmp + rename），损坏自动备份重建 |
-| API Key | 本机应用数据目录 | Windows DPAPI 加密落盘（macOS / Linux 等价保护在路线图） |
+| API Key | 本机应用数据目录 | 系统级加密落盘：Windows DPAPI / macOS 钥匙串 + AES-GCM / Linux 密钥环（Secret Service）+ AES-GCM；密钥环不可用时降级明文并明确提示 |
 | 辅助调用缓存 | L1 内存 LRU + L2 磁盘 | 工作区隔离、静态加密、8 MiB 有界 |
 | 出站请求 | 直连你配置的 Provider | 不经过任何第三方中转 |
 
@@ -150,7 +162,7 @@ flowchart LR
     CMD --> TELE["遥测与账本<br/>命中率 · 成本 · miss 归因"]
 ```
 
-技术栈：Tauri 2 + React 18 + TypeScript（strict）/ Rust 后端约 12,000 行 + 前端约 11,700 行，97 个后端单元测试覆盖前缀字节稳定性、SSRF、Git 面板、worktree 往返等核心链路。
+技术栈：Tauri 2 + React 18 + TypeScript（strict）/ Rust 后端约 12,000 行 + 前端约 11,700 行，98+ 个后端单元测试覆盖前缀字节稳定性、SSRF、Git 面板、worktree 往返等核心链路。
 
 ## 开发
 
@@ -195,8 +207,9 @@ src-tauri/              Rust 后端
 
 ## 项目状态
 
-- 当前版本 v0.1.x，处于快速迭代期；
-- 路线图：应用内更新检查、macOS / Linux 下的 Key 等价保护、RAG 知识库管线、A2A 协议接入。
+- 当前版本 v0.1.1，处于快速迭代期，更新日志见 [Releases](https://github.com/Technicalflight/CCHarness/releases)；
+- v0.1.1 新增：应用内更新检查（侧边栏版本号 / 启动自动检查）、macOS / Linux 下的 Key 等价保护（钥匙串 / 密钥环保存主密钥 + AES-256-GCM 加密落盘）；
+- 路线图：RAG 知识库管线、A2A 协议接入。
 
 ## Built on open source
 

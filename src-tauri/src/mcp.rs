@@ -134,7 +134,7 @@ impl McpManager {
                 json!({
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": { "name": "CCHarness", "version": "0.1.0" }
+                    "clientInfo": { "name": "CCHarness", "version": env!("CARGO_PKG_VERSION") }
                 }),
                 HANDSHAKE_TIMEOUT_SECS,
             )

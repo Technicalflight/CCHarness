@@ -61,7 +61,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: "CCHarness v__VERSION__"
           releaseBody: |
-            CCHarness 第一个打包发布版本。
+            CCHarness v__VERSION__ 更新说明。
 
             CCHarness 是一款本地优先的多模型 AI 聊天桌面应用（Tauri 2 + React 18 + Rust）：
             - 六种工作流模式：智能体 / 规划 / 目标 / 深度推理 / 生图 / 自定义状态机
@@ -71,8 +71,14 @@ jobs:
             - 16+ 内置工具、MCP、Skills、Guardrails 安全护栏、Worktree 隔离、多模态输入与生图
             - 模型支持：DeepSeek / GLM / Kimi / OpenAI / Anthropic / Ollama 及任意 OpenAI 兼容端点
 
+            v0.1.1 新增：
+            - 应用内更新检查：点击侧边栏底部版本号手动检查，或开启启动时自动检查（24 小时节流）；发现新版本后一键打开 Releases 页面下载
+            - macOS / Linux 下的 Key 等价保护：API Key 主密钥存入系统钥匙串 / 密钥环（macOS Keychain / Linux Secret Service），各 Key 以 AES-256-GCM 加密落盘，与 Windows DPAPI 等价；密钥环不可用时自动降级明文并提示
+            - 设置页新增「应用更新」卡片：启动自动检查开关 + 私有仓库更新检查用的 GitHub 访问令牌（随其他密钥一同加密存储）
+            - MCP clientInfo、侧边栏版本号统一接入构建版本号，不再硬编码
+
             安装说明：
-            - Windows：下载 CCHarness_0.1.0_x64-setup.exe（NSIS 安装向导），或 .msi
+            - Windows：下载 .exe（NSIS 安装向导）或 .msi
             - macOS：下载 .dmg（Apple Silicon 与 Intel 通用二进制）
             - Linux：下载 .deb（Debian/Ubuntu）、.rpm（Fedora/openSUSE）或 .AppImage
 

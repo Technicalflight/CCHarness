@@ -1,6 +1,6 @@
 [package]
 name = "ccharness"
-version = "0.1.0"
+version = "0.1.1"
 description = "CCHarness — multi-model chat platform with prefix-cache telemetry"
 edition = "2021"
 
@@ -27,6 +27,11 @@ glob = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # bundled SQLite for reading the cc-switch provider database (~/.cc-switch/cc-switch.db)
 rusqlite = { version = "0.32", features = ["bundled"] }
+# cross-platform API-key sealing: master key in the OS keyring
+# (macOS Keychain / Linux Secret Service), AES-256-GCM for the inline blob
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+aes-gcm = "0.10"
+rand = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

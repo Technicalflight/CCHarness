@@ -123,6 +123,11 @@ pub struct AppSettings {
     /// None = unlimited. Enforced frontend-side (cost data lives in records).
     #[serde(default)]
     pub goal_budget_usd: Option<f64>,
+    /// GitHub access token used only by the in-app update check — needed
+    /// when the releases live in a private repository. Sealed at rest like
+    /// API keys.
+    #[serde(default)]
+    pub update_token: String,
 }
 
 impl Default for AppSettings {
@@ -143,6 +148,7 @@ impl Default for AppSettings {
             guardrails: false,
             guardrails_extra: Vec::new(),
             goal_budget_usd: None,
+            update_token: String::new(),
         }
     }
 }
@@ -340,12 +346,22 @@ pub fn config_path(data_dir: &Path) -> PathBuf {
 
 // ---------- API-key at-rest protection ----------
 
-// Windows: keys are sealed with DPAPI (CryptProtectData, user scope) and
-// stored as `dpapi:v1:<hex>` in config.json. Other platforms: plaintext
-// (documented limitation; a keyring backend can replace this later).
-// In memory the key is always plaintext: load() unseals, save() seals.
+// Sealed forms stored in config.json:
+//   Windows:  `dpapi:v1:<hex>`  — DPAPI (CryptProtectData, user scope)
+//   Other OS: `enc:v1:<b64>`    — AES-256-GCM keyed by a 32-byte master key
+//                                 held in the OS keyring (macOS Keychain /
+//                                 Linux Secret Service via the keyring crate)
+// If the OS keyring is unavailable (headless Linux, CI), sealing degrades to
+// plaintext (fail open — losing the key would be worse than storing it).
+// Unsealing a sealed value that cannot be decrypted returns "" (re-enter the
+// key). In memory the key is always plaintext: load() unseals, save() seals.
 
 const KEY_MARK: &str = "dpapi:v1:";
+const KEY_MARK_ENC: &str = "enc:v1:";
+#[cfg(not(windows))]
+const KEYRING_SERVICE: &str = "com.ccharness.app";
+#[cfg(not(windows))]
+const KEYRING_USER: &str = "api-key-master";
 
 #[cfg(windows)]
 fn dpapi_protect(plain: &[u8]) -> Result<Vec<u8>, String> {
@@ -409,31 +425,118 @@ fn dpapi_unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// 32-byte master key for AES-GCM sealing, stored in the OS keyring
+/// (created on first use). Cached in memory to avoid repeated keyring
+/// round-trips within a config load/save.
+#[cfg(not(windows))]
+fn os_master_key() -> Result<[u8; 32], String> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+    if let Some(k) = CACHE.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        return Ok(*k);
+    }
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+        .map_err(|e| format!("keyring unavailable: {e}"))?;
+    let key: [u8; 32] = match entry.get_password() {
+        Ok(s) => {
+            let bytes = hex::decode(s.trim()).map_err(|e| format!("master key corrupt: {e}"))?;
+            if bytes.len() != 32 {
+                return Err("master key corrupt: bad length".into());
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&bytes);
+            k
+        }
+        Err(keyring::Error::NoEntry) => {
+            use rand::RngCore;
+            let mut k = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut k);
+            entry
+                .set_password(&hex::encode(k))
+                .map_err(|e| format!("keyring write failed: {e}"))?;
+            k
+        }
+        Err(e) => return Err(format!("keyring read failed: {e}")),
+    };
+    if let Ok(mut c) = CACHE.lock() {
+        *c = Some(key);
+    }
+    Ok(key)
+}
+
+/// Seal `plain` with AES-256-GCM under the keyring master key.
+/// Blob layout: base64(12-byte nonce || ciphertext+tag).
+#[cfg(not(windows))]
+fn aes_seal(plain: &str, master: &[u8; 32]) -> Result<String, String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use base64::Engine as _;
+    use rand::RngCore;
+    let cipher = Aes256Gcm::new(master.into());
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), plain.as_bytes())
+        .map_err(|e| format!("encrypt failed: {e}"))?;
+    let mut blob = Vec::with_capacity(12 + ct.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ct);
+    Ok(format!(
+        "{KEY_MARK_ENC}{}",
+        base64::engine::general_purpose::STANDARD.encode(blob)
+    ))
+}
+
+#[cfg(not(windows))]
+fn aes_unseal(sealed: &str, master: &[u8; 32]) -> Result<String, String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use base64::Engine as _;
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(sealed)
+        .map_err(|e| format!("bad blob: {e}"))?;
+    if blob.len() < 13 {
+        return Err("blob too short".into());
+    }
+    let cipher = Aes256Gcm::new(master.into());
+    let pt = cipher
+        .decrypt(Nonce::from_slice(&blob[..12]), &blob[12..])
+        .map_err(|e| format!("decrypt failed: {e}"))?;
+    String::from_utf8(pt).map_err(|e| format!("bad utf8: {e}"))
+}
+
 /// Seal a plaintext key for disk storage. Already-sealed and empty keys pass
 /// through; on seal failure the plaintext is kept (fail open — losing the
 /// key would be worse than storing it).
 pub fn protect_api_key(plain: &str) -> String {
-    if plain.is_empty() || plain.starts_with(KEY_MARK) {
+    if plain.is_empty() || plain.starts_with(KEY_MARK) || plain.starts_with(KEY_MARK_ENC) {
         return plain.to_string();
     }
     #[cfg(windows)]
-    {
-        return match dpapi_protect(plain.as_bytes()) {
-            Ok(blob) => format!("{KEY_MARK}{}", hex::encode(blob)),
-            Err(e) => {
-                eprintln!("[config] api-key seal failed ({e}); storing plaintext");
-                plain.to_string()
-            }
-        };
-    }
-    #[allow(unreachable_code)]
-    plain.to_string()
+    let sealed = dpapi_protect(plain.as_bytes())
+        .map(|blob| format!("{KEY_MARK}{}", hex::encode(blob)))
+        .unwrap_or_else(|e| {
+            eprintln!("[config] api-key seal failed ({e}); storing plaintext");
+            plain.to_string()
+        });
+    #[cfg(not(windows))]
+    let sealed = match os_master_key().and_then(|m| aes_seal(plain, &m)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[config] api-key seal unavailable ({e}); storing plaintext");
+            plain.to_string()
+        }
+    };
+    sealed
 }
 
 /// Unseal a stored key. Unrecognized (plaintext) values pass through, which
-/// transparently migrates pre-encryption configs on their next save.
+/// transparently migrates pre-encryption configs on their next save. Sealed
+/// values that cannot be decrypted on this platform unseal to "" (the key
+/// must be re-entered).
 pub fn unprotect_api_key(stored: &str) -> String {
     match stored.strip_prefix(KEY_MARK) {
+        // DPAPI blobs only unseal on Windows.
         #[cfg(windows)]
         Some(rest) => hex::decode(rest)
             .ok()
@@ -443,10 +546,28 @@ pub fn unprotect_api_key(stored: &str) -> String {
                 eprintln!("[config] api-key unseal failed; key must be re-entered");
                 String::new()
             }),
-        // DPAPI blobs cannot be unsealed off-Windows; force re-entry.
         #[cfg(not(windows))]
-        Some(_) => String::new(),
-        None => stored.to_string(),
+        Some(_) => {
+            eprintln!("[config] DPAPI key on non-Windows; key must be re-entered");
+            String::new()
+        }
+        None => match stored.strip_prefix(KEY_MARK_ENC) {
+            // AES-GCM blobs only unseal where the OS keyring holds the master key.
+            #[cfg(not(windows))]
+            Some(sealed) => match os_master_key().and_then(|m| aes_unseal(sealed, &m)) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("[config] api-key unseal failed ({e}); key must be re-entered");
+                    String::new()
+                }
+            },
+            #[cfg(windows)]
+            Some(_) => {
+                eprintln!("[config] non-Windows sealed key on Windows; key must be re-entered");
+                String::new()
+            }
+            None => stored.to_string(),
+        },
     }
 }
 
@@ -473,6 +594,7 @@ pub fn load(data_dir: &Path) -> AppConfig {
     for p in &mut cfg.providers {
         p.api_key = unprotect_api_key(&p.api_key);
     }
+    cfg.settings.update_token = unprotect_api_key(&cfg.settings.update_token);
     cfg
 }
 
@@ -483,6 +605,7 @@ pub fn save(data_dir: &Path, cfg: &AppConfig) {
     for p in &mut out.providers {
         p.api_key = protect_api_key(&p.api_key);
     }
+    out.settings.update_token = protect_api_key(&out.settings.update_token);
     // atomic-ish: write temp then rename
     let path = config_path(data_dir);
     let tmp = data_dir.join("config.json.tmp");
@@ -501,9 +624,9 @@ mod tests {
     fn plaintext_keys_pass_through() {
         assert_eq!(protect_api_key(""), "");
         assert_eq!(unprotect_api_key("sk-plain"), "sk-plain");
-        // non-windows: sealing is a no-op by design
-        #[cfg(not(windows))]
-        assert_eq!(protect_api_key("sk-plain"), "sk-plain");
+        // already-sealed values of either mark are never double-sealed
+        assert_eq!(protect_api_key("dpapi:v1:aa"), "dpapi:v1:aa");
+        assert_eq!(protect_api_key("enc:v1:aa"), "enc:v1:aa");
     }
 
     #[cfg(windows)]
@@ -516,6 +639,27 @@ mod tests {
         assert_eq!(protect_api_key(&sealed), sealed);
         // garbage blob unseals to empty, not a panic
         assert_eq!(unprotect_api_key("dpapi:v1:deadbeef"), "");
+        // blobs sealed on a non-Windows machine cannot unseal here
+        assert_eq!(unprotect_api_key("enc:v1:deadbeef"), "");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn keyring_roundtrip_or_failopen() {
+        let sealed = protect_api_key("sk-test-12345");
+        if sealed.starts_with(KEY_MARK_ENC) {
+            // OS keyring available (desktop): full roundtrip.
+            assert_eq!(unprotect_api_key(&sealed), "sk-test-12345");
+            // already-sealed input must not be double-sealed
+            assert_eq!(protect_api_key(&sealed), sealed);
+            // garbage blob unseals to empty, not a panic
+            assert_eq!(unprotect_api_key("enc:v1:not-base64!!"), "");
+            // DPAPI blobs from a Windows config unseal to empty here
+            assert_eq!(unprotect_api_key("dpapi:v1:deadbeef"), "");
+        } else {
+            // No OS keyring (headless CI): fail-open to plaintext by design.
+            assert_eq!(sealed, "sk-test-12345");
+        }
     }
 
     #[test]

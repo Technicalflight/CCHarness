@@ -31,6 +31,7 @@ import type {
   StreamEvent,
   TestResult,
   TodoItem,
+  UpdateInfo,
   WriteLog,
   WriteLogEntry,
   WtInfo,
@@ -64,6 +65,12 @@ export async function listWorkspaceDir(workspace: string, path: string): Promise
 
 export async function openExternal(url: string): Promise<void> {
   await invoke("open_external", { url });
+}
+
+/** Check GitHub Releases for a newer version. `token` (settings
+ *  `update_token`) is only needed for private-repository releases. */
+export async function checkUpdate(token: string): Promise<UpdateInfo> {
+  return invoke<UpdateInfo>("check_update", { token });
 }
 
 export async function getTodos(sessionId: string): Promise<TodoItem[]> {

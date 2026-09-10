@@ -12,6 +12,7 @@ import type {
   SessionMeta,
   StreamEvent,
   TodoItem,
+  UpdateInfo,
 } from "./types";
 
 export type View = "chat" | "arena" | "models" | "mcp" | "market" | "telemetry" | "review" | "subagents" | "workflows" | "bench" | "settings";
@@ -91,6 +92,13 @@ interface AppState {
   fsVersion: number;
   /** preview panel width in logical px (draggable splitter, persisted) */
   panelW: number;
+
+  /** in-app update check (sidebar version button / silent startup check) */
+  updateInfo: UpdateInfo | null;
+  updateChecking: boolean;
+  updateDialogOpen: boolean;
+  runUpdateCheck: (openDialog: boolean) => Promise<UpdateInfo>;
+  setUpdateDialogOpen: (open: boolean) => void;
 
   bootstrap: () => Promise<void>;
   setView: (v: View) => void;
@@ -331,6 +339,43 @@ export const useApp = create<AppState>((set, get) => ({
   todos: {},
   fsVersion: 0,
   panelW: Number(localStorage.getItem("cc.panelW")) || 400,
+
+  updateInfo: null,
+  updateChecking: false,
+  updateDialogOpen: false,
+
+  runUpdateCheck: async (openDialog) => {
+    set({ updateChecking: true });
+    if (openDialog) set({ updateDialogOpen: true });
+    try {
+      const token = get().config?.settings?.update_token ?? "";
+      const info = await api.checkUpdate(token);
+      set({ updateInfo: info });
+      if (info.update_available && !openDialog) {
+        get().toast(
+          "info",
+          `发现新版本 v${info.latest} — 点击侧边栏底部版本号查看`
+        );
+      }
+      return info;
+    } catch (e) {
+      const info: UpdateInfo = {
+        current: "",
+        latest: null,
+        update_available: false,
+        release_name: null,
+        notes: null,
+        url: null,
+        error: String(e),
+      };
+      set({ updateInfo: info });
+      return info;
+    } finally {
+      set({ updateChecking: false });
+    }
+  },
+
+  setUpdateDialogOpen: (open) => set({ updateDialogOpen: open }),
 
   bootstrap: async () => {
     try {

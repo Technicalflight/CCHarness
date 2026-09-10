@@ -3791,3 +3791,59 @@ kbd {
   20% { opacity: 1; transform: translateY(-6px) scale(1); }
   100% { opacity: 0; transform: translateY(-36px) scale(1.15); }
 }
+
+/* ---------- in-app update check ---------- */
+.ver-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 4px;
+}
+.ver-btn:hover { color: var(--accent, var(--text)); }
+.upd-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent, #4a9eff);
+  box-shadow: 0 0 6px var(--accent, #4a9eff);
+  animation: upd-pulse 2s ease-in-out infinite;
+}
+@keyframes upd-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.update-dialog .upd-cur {
+  font-size: 11px;
+  font-weight: normal;
+  color: var(--text-faint);
+  margin-left: 4px;
+}
+.update-dialog .upd-relname {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+.update-dialog .upd-notes {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  background: var(--bg1, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: var(--r-md, 8px);
+  padding: 10px 12px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0 0 16px;
+  font-family: inherit;
+}
+.update-dialog .upd-err {
+  margin-bottom: 16px;
+}

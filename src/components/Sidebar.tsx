@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { useApp } from "../store";
 import { providerColor } from "../lib/color";
 import { fmtHit } from "../lib/format";
@@ -114,10 +115,34 @@ function SessionRow({
 }
 
 export function Sidebar() {
-  const { view, setView, openChatHome, sessions, activeSessionId, selectSession, deleteSession, newSession, refreshSessions, lastRequest, config } =
-    useApp();
+  const {
+    view,
+    setView,
+    openChatHome,
+    sessions,
+    activeSessionId,
+    selectSession,
+    deleteSession,
+    newSession,
+    refreshSessions,
+    lastRequest,
+    config,
+    updateInfo,
+    updateChecking,
+    updateDialogOpen,
+    runUpdateCheck,
+    setUpdateDialogOpen,
+  } = useApp();
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
+  // app version from tauri.conf.json (single source of truth), rendered in
+  // the footer; clicking it runs an update check
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => {});
+  }, []);
   // 「更多」popover: hover or click OPENS it. Moving from the button across
   // the positioning gap onto the menu must NOT close it, yet a fly-by hover
   // must not leave it open forever → grace-period close: leaving the
@@ -303,11 +328,86 @@ export function Sidebar() {
       </div>
 
       <div className="sidebar-foot">
-        <span>v0.1.0 · {providerCount} 个 Provider 就绪</span>
+        <button
+          className="ver-btn"
+          title="点击检查更新"
+          onClick={() => void runUpdateCheck(true)}
+        >
+          v{appVersion || "…"} · {providerCount} 个 Provider 就绪
+          {updateInfo?.update_available ? (
+            <span className="upd-dot" title={`有新版本 v${updateInfo.latest}`} />
+          ) : null}
+        </button>
         {hit && hit.cached_tokens != null && hit.input_tokens ? (
           <span className="hit-pill">缓存 {fmtHit(hit.cached_tokens, hit.input_tokens)}</span>
         ) : null}
       </div>
+
+      {updateDialogOpen && (
+        <div className="dialog-overlay" onClick={() => setUpdateDialogOpen(false)}>
+          <div className="dialog update-dialog" onClick={(e) => e.stopPropagation()}>
+            {updateChecking && !updateInfo ? (
+              <>
+                <h3>正在检查更新…</h3>
+                <div className="hint">连接 GitHub Releases</div>
+              </>
+            ) : updateInfo?.update_available ? (
+              <>
+                <h3>
+                  发现新版本 v{updateInfo.latest}
+                  <span className="upd-cur">（当前 v{updateInfo.current}）</span>
+                </h3>
+                {updateInfo.release_name ? (
+                  <div className="upd-relname">{updateInfo.release_name}</div>
+                ) : null}
+                <pre className="upd-notes">{updateInfo.notes || "暂无更新说明"}</pre>
+                <div className="d-actions">
+                  <button className="btn" onClick={() => setUpdateDialogOpen(false)}>
+                    关闭
+                  </button>
+                  <button
+                    className="btn primary"
+                    onClick={() => {
+                      if (updateInfo.url) void api.openExternal(updateInfo.url);
+                      setUpdateDialogOpen(false);
+                    }}
+                  >
+                    打开 Releases 页面下载
+                  </button>
+                </div>
+              </>
+            ) : updateInfo?.error ? (
+              <>
+                <h3>检查更新失败</h3>
+                <div className="hint upd-err">{updateInfo.error}</div>
+                <div className="d-actions">
+                  <button className="btn" onClick={() => setUpdateDialogOpen(false)}>
+                    关闭
+                  </button>
+                  <button
+                    className="btn primary"
+                    onClick={() => void runUpdateCheck(true)}
+                  >
+                    重试
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <h3>已是最新版本</h3>
+                <div className="hint">
+                  当前 v{updateInfo?.current || appVersion} 已是最新发布版本。
+                </div>
+                <div className="d-actions">
+                  <button className="btn primary" onClick={() => setUpdateDialogOpen(false)}>
+                    好的
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </aside>
   );
 }
