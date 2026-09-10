@@ -9,6 +9,9 @@ vite.config.ts.timestamp-*.mjs
 .mimosa/
 **/.mimosa/
 
+# Internal design docs (not part of the distributed project)
+docs/
+
 # OS files
 Thumbs.db
 Desktop.ini
