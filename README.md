@@ -222,6 +222,20 @@ src-tauri/              Rust 后端
 
 本项目在 AI 模型协作下开发。
 
+## ☕ 赞助 / Sponsor
+
+如果 CCHarness 对你有帮助，欢迎请作者喝杯咖啡或可乐 ☕🥤——每一杯都是持续开发的动力。
+
+<p align="center">
+  <img src="assets/sponsor-alipay.png" width="250" alt="支付宝收款码"/>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="assets/sponsor-wechat.png" width="250" alt="微信收款码"/>
+</p>
+<p align="center"><sub>左：支付宝 Alipay &nbsp;·&nbsp; 右：微信 WeChat Pay</sub></p>
+
+> [!WARNING]
+> **赞助前请务必阅读**：赞助是**完全自愿**的感谢行为。**赞助不会提高或加快任何功能、缺陷修复或其他工作的实现优先级**——所有开发均按路线图与社区需求推进，与是否赞助、赞助多少完全无关。赞助仅代表感谢，不构成任何商业授权、优先支持或其他额外承诺。
+
 ## 许可证 / License
 
 CCHarness is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**, available at <https://www.gnu.org/licenses/agpl-3.0.html> — see the [LICENSE](./LICENSE) file for the full text.
