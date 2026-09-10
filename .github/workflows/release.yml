@@ -1,0 +1,82 @@
+name: Release
+
+# Push a tag like "v0.1.0" to trigger a multi-platform build and publish a GitHub Release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  publish-tauri:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Universal macOS binary (Apple Silicon + Intel in one .dmg)
+          - platform: "macos-latest"
+            args: "--target universal-apple-darwin"
+          - platform: "ubuntu-22.04"
+            args: ""
+          - platform: "windows-latest"
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu only)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: "."
+          tagName: v__VERSION__
+          releaseName: "CCHarness v__VERSION__"
+          releaseBody: |
+            CCHarness 第一个打包发布版本。
+
+            CCHarness 是一款本地优先的多模型 AI 聊天桌面应用（Tauri 2 + React 18 + Rust）：
+            - 六种工作流模式：智能体 / 规划 / 目标 / 深度推理 / 生图 / 自定义状态机
+            - 多智能体协作：竞技场对比、圆桌群聊、具名子智能体
+            - 记忆系统：向量长期记忆、自动反思、AuxMemo 辅助记忆
+            - 前缀缓存工程：三区上下文分区 + 指纹链 + 命中率遥测与 miss 归因
+            - 16+ 内置工具、MCP、Skills、Guardrails 安全护栏、Worktree 隔离、多模态输入与生图
+            - 模型支持：DeepSeek / GLM / Kimi / OpenAI / Anthropic / Ollama 及任意 OpenAI 兼容端点
+
+            安装说明：
+            - Windows：下载 CCHarness_0.1.0_x64-setup.exe（NSIS 安装向导），或 .msi
+            - macOS：下载 .dmg（Apple Silicon 与 Intel 通用二进制）
+            - Linux：下载 .deb（Debian/Ubuntu）、.rpm（Fedora/openSUSE）或 .AppImage
+
+            注意：本版本安装包未做代码签名，Windows 首次运行可能出现 SmartScreen 提示；macOS 首次打开需在「系统设置 - 隐私与安全性」中放行，或右键 App 选择「打开」。
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
