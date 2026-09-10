@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Main window capabilities. core:default deliberately does NOT include window dragging, so the custom titlebar's data-tauri-drag-region needs an explicit allow-start-dragging grant.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "notification:default",
+    "dialog:allow-open"
+  ]
+}

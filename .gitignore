@@ -1,5 +1,13 @@
-# Local tool state
+# Dependencies & build output
+node_modules/
+dist/
+src-tauri/target/
+vite.config.ts.timestamp-*.mjs
+
+# Local assistant / tool state (personal, never commit)
+.workbuddy/
 .mimosa/
+**/.mimosa/
 
 # OS files
 Thumbs.db

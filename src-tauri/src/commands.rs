@@ -1,0 +1,3828 @@
+// Tauri command layer: the glue between the frontend and the engine.
+// All session-file mutations go through one async lock so parallel arena
+// lanes cannot interleave read-modify-write cycles.
+use crate::chat::{self, SendCtx};
+use crate::config::{self, AppConfig, Provider};
+use crate::prefix::{message_json, ChatMessage, LanePrefix};
+use crate::sessions::{now_ms, SessionStore};
+use crate::types_rs::{
+    GoalInfo, GoalState, MessageRecord, RequestStat, SessionBinding, SessionMeta, SessionTelemetry,
+    StreamEvent, TelemetrySummary,
+};
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tauri::{Manager, State};
+use uuid::Uuid;
+
+/// Prefix state lives for the whole process — one window, one engine.
+/// Key: (session_id, lane).
+static PREFIXES: Mutex<Option<HashMap<(String, u32), LanePrefix>>> = Mutex::new(None);
+static SEQ: AtomicU64 = AtomicU64::new(1);
+static LAST_TS: AtomicU64 = AtomicU64::new(0);
+/// Pending write-tool approvals: approval_id → resolver. Dropped senders
+/// simply fail the await (deny, fail-closed).
+static APPROVALS: Mutex<Option<HashMap<String, tokio::sync::oneshot::Sender<bool>>>> = Mutex::new(None);
+/// Session-level grants: "session_id:tool" remembered via the approval card.
+static GRANTS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+/// Last total sent bytes per lane for chain-continuity checks, with the
+/// epoch it belonged to (an epoch change is a legitimate rebuild).
+static LAST_SPAN: Mutex<Option<HashMap<(String, u32), (u32, usize)>>> = Mutex::new(None);
+/// Auto-compaction threshold: compact at a user boundary once the last
+/// request's input tokens reached this fraction of the context window.
+const COMPACT_AT_FRACTION: f64 = 0.7;
+/// Don't bother compacting tiny conversations.
+const COMPACT_MIN_MESSAGES: usize = 8;
+/// Character budget fed to the summarizer.
+const SUMMARIZE_INPUT_CAP: usize = 24_000;
+
+/// Session tool-permission mode: "readonly" (write tools not offered),
+/// "approve" (default — write tools gated by the approval card), "auto"
+/// (write tools run without per-execution approval, still workspace-bound).
+static PERMISSIONS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+const VALID_MODES: &[&str] = &["readonly", "approve", "auto"];
+
+/// Session workflow gate: "agent" (default — direct execution) | "plan"
+/// (read-only research, then a frozen ```plan proposal that the user must
+/// approve before any write can happen) | "goal" (only the goal + acceptance
+/// criteria are locked; the agent picks its own path until all criteria pass,
+/// with dynamic re-planning) | "deep" (Tree-of-Thoughts rehearsal: parallel
+/// candidate approaches + judge, then the normal loop) | "sm:<def_id>:<state>"
+/// (declarative state machine, see SM_STATE).
+/// In-memory like PERMISSIONS, checkpointed onto SessionMeta.wf_gate so a
+/// restart resumes the same mode instead of falling back to agent.
+static WORKFLOW: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// Declarative state-machine position per session: session_id → gate string
+/// "sm:<def_id>:<state_name>". Mirrored into WORKFLOW (the gate is the single
+/// source of truth for mode checks; SM_STATE marks that the session is
+/// actively running a state machine and remembers the resolved position for
+/// auto-advance). In-memory like WORKFLOW — a restart drops back to agent.
+static SM_STATE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// Store an SM position and mirror it into the workflow gate.
+fn sm_put(session_id: &str, gate: &str) {
+    WORKFLOW
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(session_id.to_string(), gate.to_string());
+    SM_STATE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(session_id.to_string(), gate.to_string());
+}
+
+/// Checkpoint the workflow gate onto the session meta (best-effort — a
+/// failed save leaves the in-memory gate in charge; it only matters across
+/// restarts).
+fn persist_gate(data_dir: &std::path::Path, session_id: &str, gate: Option<&str>) {
+    let store = SessionStore::new(data_dir);
+    if let Ok(mut sf) = store.load(session_id) {
+        sf.meta.wf_gate = gate.map(|g| g.to_string());
+        let _ = store.save(&sf);
+    }
+}
+
+/// Resolve the active workflow gate. In-memory first; on a miss (fresh
+/// process) backfill from the persisted checkpoint on SessionMeta so a
+/// restart resumes the previous mode (断点续传). Falls back to "agent".
+fn workflow_of_in(session_id: &str, data_dir: &std::path::Path) -> String {
+    let cached = WORKFLOW
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(session_id))
+        .cloned();
+    let gate = match cached {
+        Some(g) => Some(g),
+        None => match SessionStore::new(data_dir)
+            .load(session_id)
+            .ok()
+            .and_then(|sf| sf.meta.wf_gate.clone())
+        {
+            Some(g) => {
+                WORKFLOW
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(HashMap::new)
+                    .insert(session_id.to_string(), g.clone());
+                Some(g)
+            }
+            None => None,
+        },
+    };
+    match gate.as_deref() {
+        Some("plan") => "plan".to_string(),
+        Some("goal") => "goal".to_string(),
+        Some("deep") => "deep".to_string(),
+        Some("image") => "image".to_string(),
+        Some(w) if w.starts_with("sm:") => w.to_string(),
+        _ => "agent".to_string(),
+    }
+}
+
+#[tauri::command]
+pub fn set_workflow_mode(
+    state: State<'_, AppState>,
+    session_id: String,
+    mode: String,
+) -> Result<(), String> {
+    if matches!(mode.as_str(), "agent" | "plan" | "goal" | "deep" | "image") {
+        // leaving (or never entering) a state machine — clear the SM position
+        if let Some(m) = SM_STATE.lock().unwrap().as_mut() {
+            m.remove(&session_id);
+        }
+        WORKFLOW
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(session_id.clone(), mode.clone());
+        // checkpoint: "agent" clears the persisted gate, everything else
+        // persists so a restart resumes the same mode
+        if mode == "agent" {
+            persist_gate(&state.data_dir, &session_id, None);
+        } else {
+            persist_gate(&state.data_dir, &session_id, Some(&mode));
+        }
+        return Ok(());
+    }
+    if let Some(def_id) = mode.strip_prefix("sm:") {
+        // declarative workflow: validate the def is real and enabled, then
+        // initialize the session at its entry state (states[0])
+        let cfg = config::load(&state.data_dir);
+        let def = cfg
+            .workflows
+            .iter()
+            .find(|d| d.id == def_id && d.enabled)
+            .ok_or_else(|| format!("工作流不存在或未启用: sm:{def_id}"))?;
+        let first = def
+            .states
+            .first()
+            .ok_or_else(|| format!("工作流「{}」没有任何状态", def.name))?;
+        let gate = format!("sm:{}:{}", def.id, first.name);
+        sm_put(&session_id, &gate);
+        persist_gate(&state.data_dir, &session_id, Some(&gate));
+        return Ok(());
+    }
+    Err(format!("未知工作流模式: {mode}"))
+}
+
+#[tauri::command]
+pub fn get_workflow_mode(state: State<'_, AppState>, session_id: String) -> String {
+    workflow_of_in(&session_id, &state.data_dir)
+}
+
+// ---- goal lifecycle (Codex /goal parity) ----
+
+/// Goal statuses the command surface may set. The model can only reach
+/// achieved/unmet — and only through the update_goal tool (see
+/// handle_goal_tool); pause/resume/clear are user-only.
+const GOAL_STATUSES: &[&str] = &["active", "paused", "achieved", "unmet", "budget_limited"];
+
+/// Parse the LAST ```goal checklist block in an assistant reply:
+/// returns (✅ count, total criteria (✅+⬜ lines), GOAL_DONE seen).
+/// Lines without a ✅/⬜ marker (progress notes, replan remarks) are not
+/// counted as criteria.
+pub fn parse_goal_summary(content: &str) -> (usize, usize, bool) {
+    let mut block: Option<&str> = None;
+    let mut rest = content;
+    while let Some(pos) = rest.find("```goal") {
+        let after = &rest[pos + 7..];
+        match after.find("```") {
+            Some(end) => {
+                block = Some(&after[..end]);
+                rest = &after[end + 3..];
+            }
+            None => {
+                block = Some(after);
+                break;
+            }
+        }
+    }
+    let Some(body) = block else {
+        return (0, 0, false);
+    };
+    let done = body.contains("GOAL_DONE");
+    let mut ok = 0usize;
+    let mut total = 0usize;
+    for line in body.lines() {
+        let t = line.trim_start();
+        if t.starts_with("✅") {
+            ok += 1;
+            total += 1;
+        } else if t.starts_with("⬜") {
+            total += 1;
+        }
+    }
+    (ok, total, done)
+}
+
+/// Create/replace the session goal and activate the goal gate. Shared by
+/// the /goal command surface and the model's create_goal tool.
+fn set_goal_inner(
+    data_dir: &std::path::Path,
+    session_id: &str,
+    objective: String,
+) -> Result<GoalState, String> {
+    let store = SessionStore::new(data_dir);
+    let mut sf = store.load(session_id)?;
+    let now = now_ms();
+    let g = GoalState {
+        objective,
+        status: "active".into(),
+        created_at: now,
+        updated_at: now,
+    };
+    sf.meta.goal = Some(g.clone());
+    sf.meta.updated_at = now;
+    store.save(&sf)?;
+    // flip the workflow gate to goal (same map + persist as
+    // set_workflow_mode) so the next turn runs under GOAL_DIRECTIVE
+    if let Some(m) = SM_STATE.lock().unwrap().as_mut() {
+        m.remove(session_id);
+    }
+    WORKFLOW
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(session_id.to_string(), "goal".to_string());
+    persist_gate(data_dir, session_id, Some("goal"));
+    Ok(g)
+}
+
+#[tauri::command]
+pub fn goal_set(
+    state: State<'_, AppState>,
+    session_id: String,
+    objective: String,
+) -> Result<GoalState, String> {
+    let objective = objective.trim().to_string();
+    if objective.is_empty() {
+        return Err("目标内容不能为空".into());
+    }
+    if objective.chars().count() > 4_000 {
+        return Err("目标内容过长（上限 4000 字符）".into());
+    }
+    set_goal_inner(&state.data_dir, &session_id, objective)
+}
+
+/// Goal summary for the command surface and the summary bar: the persisted
+/// goal record plus live transcript stats.
+#[tauri::command]
+pub fn goal_get(state: State<'_, AppState>, session_id: String) -> Result<GoalInfo, String> {
+    let store = SessionStore::new(&state.data_dir);
+    let sf = store.load(&session_id)?;
+    let goal = sf.meta.goal.clone();
+    let mut cost = 0f64;
+    let mut has_cost = false;
+    let mut last_assistant = String::new();
+    for m in &sf.messages {
+        if m.role == "assistant" {
+            if let Some(c) = m.cost_usd {
+                cost += c;
+                has_cost = true;
+            }
+            last_assistant = m.content.clone();
+        }
+    }
+    let (checklist_done, checklist_total, checklist_all_met) = parse_goal_summary(&last_assistant);
+    Ok(GoalInfo {
+        goal,
+        cost_usd: if has_cost { Some(cost) } else { None },
+        checklist_done,
+        checklist_total,
+        checklist_all_met,
+    })
+}
+
+/// User/runtime-side status transition (pause/resume/soft-stop/achieved
+/// bookkeeping). Any whitelist status is allowed here — the restriction to
+/// achieved/unmet applies only to the model's update_goal tool.
+#[tauri::command]
+pub fn goal_status(
+    state: State<'_, AppState>,
+    session_id: String,
+    status: String,
+) -> Result<GoalState, String> {
+    if !GOAL_STATUSES.contains(&status.as_str()) {
+        return Err(format!("未知目标状态: {status}"));
+    }
+    let store = SessionStore::new(&state.data_dir);
+    let mut sf = store.load(&session_id)?;
+    let mut g = sf.meta.goal.clone().ok_or("该会话还没有目标")?;
+    g.status = status;
+    g.updated_at = now_ms();
+    sf.meta.goal = Some(g.clone());
+    sf.meta.updated_at = now_ms();
+    store.save(&sf)?;
+    Ok(g)
+}
+
+/// Remove the goal, returning the previous record (for the toast).
+#[tauri::command]
+pub fn goal_clear(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<GoalState>, String> {
+    let store = SessionStore::new(&state.data_dir);
+    let mut sf = store.load(&session_id)?;
+    let prev = sf.meta.goal.take();
+    sf.meta.updated_at = now_ms();
+    store.save(&sf)?;
+    Ok(prev)
+}
+
+/// Model-facing goal tools (Codex /goal parity): get_goal (read),
+/// create_goal (create + flip the gate), update_goal (declare achieved /
+/// unmet only). Pausing, resuming and clearing are NOT reachable from the
+/// model — the same safety boundary Codex draws.
+fn handle_goal_tool(data_dir: &std::path::Path, session_id: &str, name: &str, args: &Value) -> String {
+    let store = SessionStore::new(data_dir);
+    match name {
+        "get_goal" => {
+            let Ok(sf) = store.load(session_id) else {
+                return "ERROR: 会话不存在".into();
+            };
+            let Some(g) = sf.meta.goal else {
+                return "NONE: 当前会话尚未创建目标（可用 create_goal 创建）".into();
+            };
+            let last = sf
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "assistant")
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            let (ok, total, all_met) = parse_goal_summary(&last);
+            let info = serde_json::json!({
+                "objective": g.objective,
+                "status": g.status,
+                "checklist_done": ok,
+                "checklist_total": total,
+                "checklist_all_met": all_met,
+            });
+            format!("OK:{info}")
+        }
+        "create_goal" => {
+            let obj = args
+                .get("objective")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if obj.is_empty() {
+                return "ERROR: objective 参数不能为空".into();
+            }
+            if obj.chars().count() > 4_000 {
+                return "ERROR: objective 超过 4000 字符上限".into();
+            }
+            match set_goal_inner(data_dir, session_id, obj) {
+                Ok(_) => "OK: 目标已创建并进入目标模式。请按目标模式规则推进：每轮回复末尾输出 ```goal 验收清单（✅/⬜ + 证据），全部 ✅ 时输出 GOAL_DONE。".into(),
+                Err(e) => format!("ERROR: {e}"),
+            }
+        }
+        "update_goal" => {
+            let st = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if st != "achieved" && st != "unmet" {
+                return "ERROR: update_goal 仅允许 status=\"achieved\" 或 \"unmet\"（暂停/恢复/清除只能由用户操作）".into();
+            }
+            let Ok(mut sf) = store.load(session_id) else {
+                return "ERROR: 会话不存在".into();
+            };
+            let Some(g) = sf.meta.goal.as_mut() else {
+                return "NONE: 当前会话尚未创建目标".into();
+            };
+            if g.status == "achieved" || g.status == "unmet" {
+                return format!("ERROR: 目标已是终态（{}），不能再次变更", g.status);
+            }
+            g.status = st.to_string();
+            g.updated_at = now_ms();
+            sf.meta.updated_at = now_ms();
+            if store.save(&sf).is_err() {
+                return "ERROR: 目标状态保存失败".into();
+            }
+            format!("OK: 目标状态已更新为 {st}")
+        }
+        _ => "ERROR: 未知目标工具".into(),
+    }
+}
+
+/// Current state-machine gate for a session: "sm:<def_id>:<state>" or "".
+#[tauri::command]
+pub fn sm_get(session_id: String) -> String {
+    SM_STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&session_id))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Manual state jump (progress-bar chips): validates the target state exists
+/// in the definition, then moves the session there. The next turn runs under
+/// the new state's directive and tool surface.
+#[tauri::command]
+pub fn sm_set(
+    state: State<'_, AppState>,
+    session_id: String,
+    def_id: String,
+    state_name: String,
+) -> Result<(), String> {
+    let cfg = config::load(&state.data_dir);
+    let def = cfg
+        .workflows
+        .iter()
+        .find(|d| d.id == def_id)
+        .ok_or_else(|| format!("工作流不存在: {def_id}"))?;
+    if !def.states.iter().any(|s| s.name == state_name) {
+        return Err(format!("工作流「{}」没有状态「{state_name}」", def.name));
+    }
+    let gate = format!("sm:{def_id}:{state_name}");
+    sm_put(&session_id, &gate);
+    persist_gate(&state.data_dir, &session_id, Some(&gate));
+    Ok(())
+}
+
+fn permission_of(session_id: &str) -> &'static str {
+    let m = PERMISSIONS.lock().unwrap().as_ref().and_then(|m| m.get(session_id)).cloned();
+    match m.as_deref() {
+        Some("readonly") => "readonly",
+        Some("auto") => "auto",
+        _ => "approve",
+    }
+}
+
+#[tauri::command]
+pub fn set_permission_mode(session_id: String, mode: String) -> Result<(), String> {
+    if !VALID_MODES.contains(&mode.as_str()) {
+        return Err(format!("未知权限模式: {mode}"));
+    }
+    PERMISSIONS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(session_id, mode);
+    Ok(())
+}
+
+/// Guard against runaway tool loops; each round is one provider request.
+const MAX_TOOL_ROUNDS: usize = 8;
+/// Goal mode locks the result, not the path — allow a longer loop per turn.
+const GOAL_MAX_TOOL_ROUNDS: usize = 24;
+/// Sub-agent delegations allowed per parent turn (cost bound).
+const MAX_DELEGATIONS_PER_TURN: usize = 3;
+/// Per-side file snapshot cap for the review panel's write log (chars).
+const WRITE_LOG_CAP: usize = 64_000;
+/// Approval timeout — fail-closed like every other permission surface here.
+const APPROVAL_TIMEOUT_SECS: u64 = 120;
+
+fn grant_key(session_id: &str, tool: &str) -> String {
+    format!("{session_id}:{tool}")
+}
+
+/// Register a pending approval and return its receiver.
+fn open_approval(id: &str) -> tokio::sync::oneshot::Receiver<bool> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    APPROVALS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(id.to_string(), tx);
+    rx
+}
+
+fn take_approval(id: &str) -> Option<tokio::sync::oneshot::Sender<bool>> {
+    APPROVALS.lock().unwrap().as_mut()?.remove(id)
+}
+
+/// Monotonic per-record timestamp: equal-ms records keep their order.
+fn next_record_ts() -> u64 {
+    loop {
+        let now = now_ms();
+        let prev = LAST_TS.load(Ordering::Relaxed);
+        let next = now.max(prev + 1);
+        if LAST_TS
+            .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
+fn prefixes_lock() -> std::sync::MutexGuard<'static, Option<HashMap<(String, u32), LanePrefix>>> {
+    PREFIXES.lock().unwrap()
+}
+
+/// Zone H empty (only the frozen system prompt, if any) — used to detect a
+/// fresh process that must rebuild its prefix from the persisted transcript.
+fn lp_is_empty(lp: &LanePrefix) -> bool {
+    lp.prefix_bytes_public() <= 0 || lp.history_len_public() == 0
+}
+
+pub struct AppState {
+    pub data_dir: PathBuf,
+    pub store: SessionStore,
+    pub client: reqwest::Client,
+    /// Cancellation flags per session.
+    pub stops: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Serializes session-file read-modify-write across lanes.
+    pub save_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+// ---------- task-list panel (todo_write tool) ----------
+
+/// One entry of a session's task list. Status is one of
+/// "pending" | "in_progress" | "done" (normalized on write).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TodoItem {
+    pub text: String,
+    pub status: String,
+}
+
+impl AppState {
+    pub fn get_todos(&self, session_id: &str) -> Vec<TodoItem> {
+        load_todos(&self.data_dir, session_id)
+    }
+}
+
+fn todos_path(data_dir: &std::path::Path, session_id: &str) -> PathBuf {
+    data_dir.join("todos").join(format!("{session_id}.json"))
+}
+
+fn load_todos(data_dir: &std::path::Path, session_id: &str) -> Vec<TodoItem> {
+    std::fs::read_to_string(todos_path(data_dir, session_id))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_todos(data_dir: &std::path::Path, session_id: &str, todos: &[TodoItem]) {
+    let path = todos_path(data_dir, session_id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(todos) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// Task list of one session, shown in the preview panel's 任务 tab.
+#[tauri::command]
+pub fn get_todos(state: State<'_, AppState>, session_id: String) -> Vec<TodoItem> {
+    state.get_todos(&session_id)
+}
+
+impl AppState {
+    pub fn new(data_dir: PathBuf) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .build()
+            .expect("http client");
+        let store = SessionStore::new(&data_dir);
+        // The request sequence must survive restarts: seed the global counter
+        // from the highest seq already recorded in any session file, or old
+        // and new records collide on the same numbers.
+        let mut max_seq = 0u64;
+        for meta in store.list() {
+            if let Ok(sf) = store.load(&meta.id) {
+                for r in &sf.telemetry {
+                    if r.seq > max_seq {
+                        max_seq = r.seq;
+                    }
+                }
+            }
+        }
+        SEQ.store(max_seq + 1, Ordering::Relaxed);
+        Self {
+            store,
+            data_dir,
+            client,
+            stops: Mutex::new(HashMap::new()),
+            save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct TestResult {
+    pub ok: bool,
+    pub message: String,
+    pub models: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct SendResult {
+    pub ok: bool,
+}
+
+#[derive(Serialize)]
+pub struct GlobalStats {
+    pub sessions: u64,
+    pub requests: u64,
+    pub total_input: u64,
+    pub total_cached: u64,
+    pub total_output: u64,
+    pub total_cost: f64,
+}
+
+// ---------- config ----------
+
+#[tauri::command]
+pub fn get_config(state: State<'_, AppState>) -> AppConfig {
+    config::load(&state.data_dir)
+}
+
+#[tauri::command]
+pub fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<(), String> {
+    for p in &config.providers {
+        // empty base_url = "preset added, endpoint not yet filled in" —
+        // legitimate state; skip the SSRF check until a URL exists
+        if p.base_url.trim().is_empty() {
+            continue;
+        }
+        if let crate::urlguard::UrlCheck::Refused(msg) =
+            crate::urlguard::check_base_url(&p.base_url, p.allow_local)
+        {
+            return Err(format!("{}: {msg}", p.name));
+        }
+    }
+    config::save(&state.data_dir, &config);
+    Ok(())
+}
+
+/// One-click import from cc-switch (https://github.com/farion1231/cc-switch).
+/// Reads the provider table from ~/.cc-switch/cc-switch.db and maps entries
+/// into our Provider model:
+///   - app_type "claude": settings_config.env.ANTHROPIC_BASE_URL / _AUTH_TOKEN
+///     → anthropic provider
+///   - app_type "codex":  settings_config.auth.OPENAI_API_KEY + TOML config
+///     text (model = "...", base_url = "...") → openai_compatible provider
+/// Skips entries without a key and anything whose (base_url, api_key) pair
+/// already exists in the config. Appends the rest and returns what was added.
+#[tauri::command]
+pub fn ccswitch_import(state: State<'_, AppState>) -> Result<Vec<Provider>, String> {
+    let db_path = home_dir()
+        .join(".cc-switch")
+        .join("cc-switch.db");
+    if !db_path.exists() {
+        return Err("未找到 cc-switch 数据库（~/.cc-switch/cc-switch.db）—— 请确认已安装 cc-switch".into());
+    }
+    let db = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| format!("打开 cc-switch 数据库失败: {e}"))?;
+
+    let mut stmt = db
+        .prepare(
+            "SELECT name, settings_config FROM providers
+             WHERE app_type IN ('claude', 'codex') ORDER BY app_type, sort_index",
+        )
+        .map_err(|e| format!("读取 providers 表失败: {e}"))?;
+
+    let mut config = config::load(&state.data_dir);
+    let mut imported: Vec<Provider> = Vec::new();
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let iterate = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|e| format!("查询 providers 失败: {e}"))?;
+    for row in iterate {
+        let (name, cfg_json) = row.map_err(|e| format!("读取行失败: {e}"))?;
+        rows.push((name, cfg_json));
+    }
+    drop(stmt);
+    drop(db);
+
+    for (name, cfg_json) in rows {
+        let cfg: serde_json::Value = match serde_json::from_str(&cfg_json) {
+            Ok(v) => v,
+            Err(_) => continue, // malformed entry — skip
+        };
+        let env = cfg.get("env");
+        let (kind, base_url, api_key, models) = if let Some(env) = env {
+            // claude-style: {"env": {"ANTHROPIC_BASE_URL": ..., "ANTHROPIC_AUTH_TOKEN": ...}}
+            let url = env
+                .get("ANTHROPIC_BASE_URL")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches('/')
+                .to_string();
+            let key = env
+                .get("ANTHROPIC_AUTH_TOKEN")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            (crate::config::ProviderKind::Anthropic, url, key, Vec::new())
+        } else {
+            // codex-style: {"auth": {"OPENAI_API_KEY": ...}, "config": "<toml>"}
+            let key = cfg
+                .pointer("/auth/OPENAI_API_KEY")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let toml_text = cfg.get("config").and_then(|v| v.as_str()).unwrap_or("");
+            let mut model = String::new();
+            let mut url = String::new();
+            for line in toml_text.lines() {
+                let line = line.trim();
+                if model.is_empty() && line.starts_with("model =") {
+                    model = unquote_toml_value(line.trim_start_matches("model ="));
+                } else if url.is_empty() && line.starts_with("base_url =") {
+                    url = unquote_toml_value(line.trim_start_matches("base_url ="));
+                }
+            }
+            let url = url.trim_end_matches('/').to_string();
+            let models = if model.is_empty() { Vec::new() } else { vec![model] };
+            (crate::config::ProviderKind::OpenaiCompatible, url, key, models)
+        };
+
+        if api_key.is_empty() {
+            continue; // official placeholder entries carry no key — skip
+        }
+        let base_url = if base_url.is_empty() {
+            // key without endpoint still imports; user fills the URL later
+            String::new()
+        } else {
+            base_url
+        };
+        // dedupe against existing providers and this batch
+        let dup = config
+            .providers
+            .iter()
+            .chain(imported.iter())
+            .any(|p| p.api_key == api_key && p.base_url == base_url);
+        if dup {
+            continue;
+        }
+
+        imported.push(Provider {
+            id: format!("p_{}", uuid::Uuid::new_v4().simple()),
+            name,
+            kind,
+            base_url,
+            api_key,
+            models,
+            enabled: true,
+            allow_local: false,
+            context_window: None,
+            pricing: std::collections::BTreeMap::new(),
+            behavior: std::collections::BTreeMap::new(),
+        });
+    }
+
+    if imported.is_empty() {
+        return Ok(imported);
+    }
+    config.providers.extend(imported.iter().cloned());
+    // reuse the save_config SSRF guard semantics via config::save directly
+    for p in &config.providers {
+        if p.base_url.trim().is_empty() {
+            continue;
+        }
+        if let crate::urlguard::UrlCheck::Refused(msg) =
+            crate::urlguard::check_base_url(&p.base_url, p.allow_local)
+        {
+            return Err(format!("{}: {msg}", p.name));
+        }
+    }
+    config::save(&state.data_dir, &config);
+    Ok(imported)
+}
+
+/// `"...value..."` → `value` (tolerates trailing commas / whitespace).
+fn unquote_toml_value(raw: &str) -> String {
+    raw.trim()
+        .trim_end_matches(',')
+        .trim()
+        .trim_matches('"')
+        .to_string()
+}
+
+fn home_dir() -> std::path::PathBuf {
+    std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+#[tauri::command]
+pub async fn test_provider(provider: Provider) -> TestResult {
+    // same SSRF guard as save_config: these commands hit an arbitrary URL,
+    // so loopback/private endpoints need the explicit allow_local consent
+    if let crate::urlguard::UrlCheck::Refused(msg) =
+        crate::urlguard::check_base_url(&provider.base_url, provider.allow_local)
+    {
+        return TestResult { ok: false, message: msg, models: vec![] };
+    }
+    match chat::fetch_models_async(&reqwest::Client::new(), &provider).await {
+        Ok(models) => TestResult {
+            ok: true,
+            message: format!("连接成功，{} 个模型可用", models.len()),
+            models: models.clone(),
+        },
+        Err(e) => TestResult { ok: false, message: e, models: vec![] },
+    }
+}
+
+#[tauri::command]
+pub async fn fetch_models(provider: Provider) -> Result<Vec<String>, String> {
+    if let crate::urlguard::UrlCheck::Refused(msg) =
+        crate::urlguard::check_base_url(&provider.base_url, provider.allow_local)
+    {
+        return Err(msg);
+    }
+    chat::fetch_models_async(&reqwest::Client::new(), &provider).await
+}
+
+// ---------- sessions ----------
+
+#[tauri::command]
+pub fn list_sessions(state: State<'_, AppState>) -> Vec<SessionMeta> {
+    state.store.list()
+}
+
+#[tauri::command]
+pub fn create_session(
+    state: State<'_, AppState>,
+    kind: String,
+    bindings: Vec<SessionBinding>,
+    title: String,
+) -> Result<SessionMeta, String> {
+    let sf = state.store.create(&kind, bindings, &title)?;
+    Ok(sf.meta)
+}
+
+#[tauri::command]
+pub fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    if let Some(map) = prefixes_lock().as_mut() {
+        map.retain(|(sid, _), _| sid != &session_id);
+    }
+    state.store.delete(&session_id)
+}
+
+#[tauri::command]
+pub fn rename_session(state: State<'_, AppState>, session_id: String, title: String) -> Result<SessionMeta, String> {
+    state.store.rename(&session_id, &title)
+}
+
+#[tauri::command]
+pub fn update_bindings(
+    state: State<'_, AppState>,
+    session_id: String,
+    bindings: Vec<SessionBinding>,
+) -> Result<SessionMeta, String> {
+    state.store.set_bindings(&session_id, bindings)
+}
+
+#[tauri::command]
+pub fn set_workspace(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: Option<String>,
+) -> Result<SessionMeta, String> {
+    // validate the folder exists before binding
+    if let Some(ws) = &workspace {
+        if !ws.trim().is_empty() && !std::path::Path::new(ws.trim()).is_dir() {
+            return Err(format!("目录不存在: {ws}"));
+        }
+    }
+    state.store.set_workspace(&session_id, workspace)
+}
+
+#[tauri::command]
+pub fn set_session_pinned(state: State<'_, AppState>, session_id: String, pinned: bool) -> Result<SessionMeta, String> {
+    state.store.set_pinned(&session_id, pinned)
+}
+
+#[tauri::command]
+pub fn set_session_archived(state: State<'_, AppState>, session_id: String, archived: bool) -> Result<SessionMeta, String> {
+    state.store.set_archived(&session_id, archived)
+}
+
+/// Fork a chat session at the clicked user message (inclusive).
+#[tauri::command]
+pub fn branch_session(
+    state: State<'_, AppState>,
+    session_id: String,
+    from_ts: u64,
+) -> Result<SessionMeta, String> {
+    state.store.branch(&session_id, from_ts).map(|sf| sf.meta)
+}
+
+// ---------- @-file references ----------
+
+/// Workspace-relative file paths for the composer's @ completion menu.
+#[tauri::command]
+pub fn search_workspace_files(workspace: String, query: String) -> Result<Vec<String>, String> {
+    if !std::path::Path::new(&workspace).is_dir() {
+        return Err("工作区不存在".into());
+    }
+    Ok(crate::agent_tools::search_files(&workspace, &query))
+}
+
+/// Read one workspace text file for @-reference expansion (same path guard
+/// and 256KB cap as the read_file tool).
+#[tauri::command]
+pub fn read_workspace_file(workspace: String, path: String) -> Result<String, String> {
+    if !std::path::Path::new(&workspace).is_dir() {
+        return Err("工作区不存在".into());
+    }
+    crate::agent_tools::read_file_public(&workspace, &path)
+}
+
+// ---------- preview panel ----------
+
+/// One entry of a workspace directory listing (structured, for the file
+/// explorer in the preview panel).
+#[derive(serde::Serialize)]
+pub struct WorkspaceEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// List one directory of the workspace. Hidden/skip-listed entries
+/// (.git, node_modules, target, …) are filtered; dirs first, both groups
+/// case-insensitively sorted. Path is workspace-relative and guarded by
+/// the same resolve_in_workspace check as the agent tools.
+#[tauri::command]
+pub fn list_workspace_dir(workspace: String, path: String) -> Result<Vec<WorkspaceEntry>, String> {
+    if !std::path::Path::new(&workspace).is_dir() {
+        return Err("工作区不存在".into());
+    }
+    let dir = crate::agent_tools::resolve_in_workspace(&workspace, &path)?;
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("无法读取目录: {e}"))?;
+    let mut out: Vec<WorkspaceEntry> = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || crate::agent_tools::is_skip_dir(&name) {
+            continue;
+        }
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let size = if is_dir { 0 } else { e.metadata().map(|m| m.len()).unwrap_or(0) };
+        out.push(WorkspaceEntry { name, is_dir, size });
+    }
+    out.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(out)
+}
+
+/// Open an http/https URL in the system browser (preview panel "open
+/// externally"). Scheme is whitelisted — no file/other handlers.
+#[tauri::command]
+pub fn open_external(url: String) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("仅支持 http/https 链接".into());
+    }
+    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
+// ---------- session import ----------
+
+/// Scan a source's default transcript location (source: "claude-code" |
+/// "codex" | "opencode").
+#[tauri::command]
+pub fn import_scan(source: String) -> Vec<crate::importer::ImportCandidate> {
+    crate::importer::scan(&source)
+}
+
+/// Import one transcript file as a regular chat session. `source` selects
+/// the adapter ("claude-code" or "generic" for custom paths). Messages get
+/// timestamps derived from the file's mtime; model binding is left empty —
+/// pick one in the composer after importing.
+#[tauri::command]
+pub fn import_session(
+    state: State<'_, AppState>,
+    source: String,
+    path: String,
+    title: Option<String>,
+) -> Result<SessionMeta, String> {
+    if !std::path::Path::new(&path).is_file() {
+        return Err(format!("文件不存在: {path}"));
+    }
+    let msgs = crate::importer::parse_file(&source, &path)?;
+    if msgs.is_empty() {
+        return Err("未解析出可导入的 user/assistant 消息".into());
+    }
+    let suggested: String = msgs
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.chars().take(24).collect())
+        .unwrap_or_default();
+    let title = title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or(suggested);
+    let sf = state.store.create("chat", Vec::new(), &title)?;
+    let base: u64 = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_else(now_ms);
+    let records: Vec<MessageRecord> = msgs
+        .iter()
+        .enumerate()
+        .map(|(i, m)| MessageRecord {
+            id: Uuid::new_v4().to_string(),
+            lane: 0,
+            role: m.role.clone(),
+            content: m.content.clone(),
+            reasoning: None,
+            ts: base + i as u64,
+            model: if m.role == "assistant" { Some("imported".into()) } else { None },
+            status: "ok".into(),
+            usage: None,
+            cost_usd: None,
+            confidence: None,
+            tool_calls: None,
+            tool_call_id: None,
+            skill_calls: None,
+            workflow: None,
+            images: Vec::new(),
+        })
+        .collect();
+    let mut out = state.store.load(&sf.meta.id)?;
+    out.messages = records;
+    out.meta.updated_at = now_ms();
+    state.store.save(&out)?;
+    Ok(out.meta)
+}
+
+#[tauri::command]
+pub fn get_session_messages(state: State<'_, AppState>, session_id: String) -> Result<Vec<MessageRecord>, String> {
+    Ok(state.store.load(&session_id)?.messages)
+}
+
+/// Return one stored attachment as a data URI so the frontend can render
+/// image bubbles without enabling Tauri's asset protocol.
+#[tauri::command]
+pub fn attachment_data(
+    state: State<'_, AppState>,
+    session_id: String,
+    filename: String,
+) -> Result<String, String> {
+    crate::sessions::attachment_data_uri(&state.data_dir, &session_id, &filename)
+}
+
+// ---------- telemetry ----------
+
+#[tauri::command]
+pub fn get_telemetry(state: State<'_, AppState>, session_id: String) -> Result<SessionTelemetry, String> {
+    let sf = state.store.load(&session_id)?;
+    let mut requests = sf.telemetry.clone();
+    // chronological order; seq is the secondary key (legacy files may hold
+    // duplicate seqs from before the restart-safe counter)
+    requests.sort_by_key(|r| (r.ts, r.seq));
+
+    let mut epochs: Vec<u64> = Vec::new();
+    let mut total_input = 0u64;
+    let mut total_cached = 0u64;
+    let mut total_output = 0u64;
+    let mut total_cost = 0f64;
+    let mut hit_rates: Vec<f64> = Vec::new();
+    let mut steady_rates: Vec<f64> = Vec::new();
+    let mut prev_epoch: Option<u32> = None;
+
+    for r in &requests {
+        if prev_epoch != Some(r.epoch) {
+            epochs.push(r.ts);
+        }
+        let is_first_of_epoch = prev_epoch != Some(r.epoch);
+        prev_epoch = Some(r.epoch);
+
+        if let (Some(c), Some(i)) = (r.cached_tokens, r.input_tokens) {
+            total_input += i;
+            total_cached += c;
+            if i > 0 {
+                let rate = c as f64 / i as f64 * 100.0;
+                hit_rates.push(rate);
+                // the first request of every epoch is an expected rebuild
+                if !is_first_of_epoch {
+                    steady_rates.push(rate);
+                }
+            }
+        }
+        total_output += r.output_tokens.unwrap_or(0);
+        total_cost += r.cost_usd.unwrap_or(0.0);
+    }
+
+    let avg = |v: &[f64]| if v.is_empty() { None } else { Some(v.iter().sum::<f64>() / v.len() as f64) };
+    let current_epoch = requests.last().map(|r| r.epoch).unwrap_or(0);
+    let prefix_bytes = requests.last().map(|r| r.prefix_bytes + r.added_bytes).unwrap_or(0);
+
+    Ok(SessionTelemetry {
+        session_id,
+        epochs,
+        divergences: crate::divergence::classify(&requests),
+        requests,
+        summary: TelemetrySummary {
+            requests: sf.telemetry.len() as u64,
+            avg_hit_rate: avg(&hit_rates),
+            steady_hit_rate: avg(&steady_rates),
+            total_input,
+            total_cached,
+            total_output,
+            total_cost: (total_cost * 10000.0).round() / 10000.0,
+            current_epoch,
+            prefix_bytes,
+        },
+    })
+}
+
+#[tauri::command]
+pub fn get_global_stats(state: State<'_, AppState>) -> GlobalStats {
+    let mut g = GlobalStats { sessions: 0, requests: 0, total_input: 0, total_cached: 0, total_output: 0, total_cost: 0.0 };
+    for meta in state.store.list() {
+        if let Ok(sf) = state.store.load(&meta.id) {
+            g.sessions += 1;
+            g.requests += sf.telemetry.len() as u64;
+            for r in &sf.telemetry {
+                g.total_input += r.input_tokens.unwrap_or(0);
+                g.total_cached += r.cached_tokens.unwrap_or(0);
+                g.total_output += r.output_tokens.unwrap_or(0);
+                g.total_cost += r.cost_usd.unwrap_or(0.0);
+            }
+        }
+    }
+    g.total_cost = (g.total_cost * 10000.0).round() / 10000.0;
+    g
+}
+
+#[tauri::command]
+pub fn export_session(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
+    let sf = state.store.load(&session_id)?;
+    let dir = state.data_dir.join("exports");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let safe: String = sf
+        .meta
+        .title
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path = dir.join(format!("{}-{}.md", safe, chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    fs::write(&path, crate::sessions::export_markdown(&sf)).map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
+pub fn get_app_data_dir(state: State<'_, AppState>) -> String {
+    state.data_dir.display().to_string()
+}
+
+#[tauri::command]
+pub fn open_data_dir(state: State<'_, AppState>) -> Result<(), String> {
+    tauri_plugin_opener::open_path(state.data_dir.display().to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+// ---------- custom window frame ----------
+// Window actions live behind app commands (not the JS window API) so the
+// buttons work regardless of capability grants; state *reading* (is_maximized
+// + resize events) uses core:default via the drag-region/`onResized` path.
+
+fn main_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
+    app.get_webview_window("main")
+}
+
+#[tauri::command]
+pub fn window_minimize(app: tauri::AppHandle) {
+    if let Some(w) = main_window(&app) {
+        let _ = w.minimize();
+    }
+}
+
+#[tauri::command]
+pub fn window_toggle_maximize(app: tauri::AppHandle) -> bool {
+    if let Some(w) = main_window(&app) {
+        if w.is_maximized().unwrap_or(false) {
+            let _ = w.unmaximize();
+        } else {
+            let _ = w.maximize();
+        }
+        return w.is_maximized().unwrap_or(false);
+    }
+    false
+}
+
+#[tauri::command]
+pub fn window_close(app: tauri::AppHandle) {
+    if let Some(w) = main_window(&app) {
+        let _ = w.close();
+    }
+}
+
+// ---------- close-to-tray ----------
+
+/// Set once the user confirmed a real exit (dialog / tray menu). The
+/// CloseRequested handler lets the window close only when this is set.
+static FORCE_QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn is_force_quit() -> bool {
+    FORCE_QUIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Mark exit-as-confirmed, then close the window for real.
+pub fn request_quit(app: &tauri::AppHandle) {
+    FORCE_QUIT.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(w) = main_window(app) {
+        let _ = w.close();
+    }
+}
+
+/// Hide the window instead of closing — the tray icon keeps the app alive.
+#[tauri::command]
+pub fn hide_to_tray(app: tauri::AppHandle) {
+    if let Some(w) = main_window(&app) {
+        let _ = w.hide();
+    }
+}
+
+/// Dialog "退出" / tray-menu "退出" — bypasses the close interception.
+#[tauri::command]
+pub fn app_quit(app: tauri::AppHandle) {
+    request_quit(&app);
+}
+
+// ---------- sending ----------
+
+/// Build the text fed to the summarizer: previous summary (if any) plus a
+/// bounded excerpt of the transcript.
+fn summarize_input(sf: &crate::sessions::SessionFile) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(prev) = &sf.compaction {
+        parts.push(format!("[上次摘要]\n{}", prev.summary));
+    }
+    let upto = sf.compaction.as_ref().map(|c| c.upto_ts).unwrap_or(0);
+    for m in &sf.messages {
+        if m.ts < upto || m.status == "error" {
+            continue;
+        }
+        let role = match m.role.as_str() {
+            "user" => "用户",
+            "assistant" => "助手",
+            "tool" => "工具",
+            _ => continue,
+        };
+        let head: String = m.content.chars().take(600).collect();
+        parts.push(format!("{role}: {head}"));
+    }
+    let mut text = parts.join("\n\n");
+    if text.chars().count() > SUMMARIZE_INPUT_CAP {
+        text = text.chars().take(SUMMARIZE_INPUT_CAP).collect::<String>() + "\n…[已截断]";
+    }
+    text
+}
+
+/// Run boundary compaction for a chat session: summarize everything up to
+/// now, persist the record, invalidate the lane prefix (next request
+/// rebuilds from the compacted transcript — an expected epoch bump).
+async fn compact_now(
+    client: &reqwest::Client,
+    data_dir: &std::path::Path,
+    session_id: &str,
+    provider: &Provider,
+    model: &str,
+) -> Result<(), String> {
+    let store = SessionStore::new(data_dir);
+    let sf = store.load(session_id)?;
+    if sf.messages.len() < COMPACT_MIN_MESSAGES {
+        return Err(format!("对话过短（{} 条），无需压缩", sf.messages.len()));
+    }
+    let input = summarize_input(&sf);
+    let outcome = chat::complete_once(
+        client,
+        provider,
+        model,
+        "你是对话摘要器。把输入的对话压缩为一段信息密集的中文摘要（不超过 600 字），必须保留：用户目标、已做出的决定、涉及的关键文件与路径、未尽事项。只输出摘要本身。",
+        &input,
+    )
+    .await?;
+    let summary = outcome.text;
+    let upto_ts = sf.messages.last().map(|m| m.ts).unwrap_or(0);
+    let record = crate::types_rs::CompactionRecord {
+        summary: summary.trim().to_string(),
+        upto_ts,
+        created_at: now_ms(),
+    };
+    let mut sf = store.load(session_id)?;
+    sf.compaction = Some(record);
+    sf.meta.updated_at = now_ms();
+    store.save(&sf)?;
+    if let Some(map) = prefixes_lock().as_mut() {
+        map.remove(&(session_id.to_string(), 0));
+    }
+    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+        map.remove(&(session_id.to_string(), 0));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn compact_session(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
+    let cfg = config::load(&state.data_dir);
+    let sf = state.store.load(&session_id)?;
+    if sf.meta.kind != "chat" {
+        return Err("竞技场会话暂不支持压缩".into());
+    }
+    let binding = sf.meta.bindings.first().cloned().ok_or("会话未绑定模型")?;
+    let provider = resolve_provider(&cfg, &binding).cloned().ok_or("Provider 未配置")?;
+    compact_now(&state.client, &state.data_dir, &session_id, &provider, &binding.model).await?;
+    Ok(sf.compaction.as_ref().map(|_| "已在旧摘要基础上再次压缩".to_string()).unwrap_or_else(|| "已压缩".into()))
+}
+
+#[tauri::command]
+pub fn get_session_compaction(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<crate::types_rs::CompactionRecord>, String> {
+    Ok(state.store.load(&session_id)?.compaction)
+}
+
+// ---------- Skills ----------
+
+#[tauri::command]
+pub fn get_skills(workspace: Option<String>) -> Vec<crate::skills::SkillInfo> {
+    crate::skills::scan(workspace.as_deref())
+}
+
+/// Delete an installed skill file. Only files inside the global skills dir
+/// are deletable from the app; project skills are managed in the workspace.
+#[tauri::command]
+pub fn delete_skill(name: String) -> Result<(), String> {
+    let safe: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if safe.is_empty() || safe != name {
+        return Err(format!("非法技能名: {name}"));
+    }
+    let dir = crate::skillhub::install_dir()?;
+    let path = dir.join(format!("{safe}.md"));
+    if !path.exists() {
+        return Err(format!("技能 {name} 不存在于全局目录"));
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("删除失败: {e}"))
+}
+
+/// Wipe a session's messages, telemetry and compaction (visible history
+/// included — this is destructive and gated by a frontend confirm dialog).
+#[tauri::command]
+pub fn clear_session(state: State<'_, AppState>, session_id: String) -> Result<usize, String> {
+    let mut sf = state.store.load(&session_id)?;
+    let removed = sf.messages.len();
+    sf.messages.clear();
+    sf.telemetry.clear();
+    sf.compaction = None;
+    sf.meta.updated_at = now_ms();
+    state.store.save(&sf)?;
+    if let Some(map) = prefixes_lock().as_mut() {
+        map.remove(&(session_id.clone(), 0));
+    }
+    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+        map.remove(&(session_id, 0));
+    }
+    Ok(removed)
+}
+
+// ---------- SkillHub market ----------
+
+#[derive(Serialize)]
+pub struct MarketPage {
+    pub skills: Vec<crate::config::MarketSkill>,
+    pub total: u64,
+}
+
+#[tauri::command]
+pub async fn skillhub_list(
+    state: State<'_, AppState>,
+    page: u32,
+    page_size: u32,
+    sort_by: String,
+    keyword: String,
+) -> Result<MarketPage, String> {
+    let page_size = page_size.clamp(1, 50);
+    let (skills, total) = crate::skillhub::fetch_market(&state.client, page.max(1), page_size, &sort_by, &keyword).await?;
+    Ok(MarketPage { skills, total })
+}
+
+#[tauri::command]
+pub async fn skillhub_install(
+    state: State<'_, AppState>,
+    slug: String,
+    namespace: String,
+    version: Option<String>,
+    description: String,
+) -> Result<String, String> {
+    let (path, files) = crate::skillhub::install_skill(
+        &state.client,
+        &slug,
+        &namespace,
+        version.as_deref(),
+        &description,
+    )
+    .await?;
+    Ok(format!("已安装到 {path}（包内 {files} 个文件，仅启用 SKILL.md 提示层）"))
+}
+
+#[tauri::command]
+pub async fn skillhub_plugins(
+    state: State<'_, AppState>,
+    page: u32,
+    page_size: u32,
+    category: String,
+) -> Result<crate::skillhub::PluginPage, String> {
+    let page_size = page_size.clamp(1, 50);
+    crate::skillhub::fetch_plugins(&state.client, page.max(1), page_size, &category).await
+}
+
+/// Install a SkillHub plugin: pull its GitHub archive and extract every
+/// SKILL.md as a global skill (prompt layer only).
+#[tauri::command]
+pub async fn skillhub_plugin_install(
+    state: State<'_, AppState>,
+    owner: String,
+    name: String,
+    default_branch: String,
+    description: String,
+) -> Result<String, String> {
+    let (installed, files) = crate::skillhub::install_plugin(
+        &state.client,
+        &owner,
+        &name,
+        &default_branch,
+        &description,
+    )
+    .await?;
+    let list = installed.iter().map(|s| format!("/{s}")).collect::<Vec<_>>().join(" ");
+    Ok(format!(
+        "已安装 {} 个技能 {list}（包内 {files} 个文件，仅启用提示层）",
+        installed.len()
+    ))
+}
+
+// ---------- MCP ----------
+
+#[tauri::command]
+pub fn mcp_status(state: State<'_, AppState>) -> Vec<Value> {
+    let cfg = config::load(&state.data_dir);
+    crate::mcp::global().status(&cfg.mcp_servers)
+}
+
+/// Connect (or reconnect) one server: spawn + handshake + tools/list.
+#[tauri::command]
+pub async fn mcp_test(
+    _state: State<'_, AppState>,
+    server: crate::config::McpServerConfig,
+) -> Result<TestResult, String> {
+    crate::mcp::global().drop_server(&server.id);
+    match crate::mcp::global().ensure(&server).await {
+        Ok(n) => Ok(TestResult {
+            ok: true,
+            message: format!("连接成功，发现 {n} 个工具"),
+            models: Vec::new(),
+        }),
+        Err(e) => Ok(TestResult { ok: false, message: e, models: Vec::new() }),
+    }
+}
+
+/// Cached tool schemas of all enabled, connected servers (spawned-task safe).
+fn state_mcp_tools(data_dir: &std::path::Path) -> Vec<Value> {
+    let cfg = config::load(data_dir);
+    let enabled: Vec<crate::config::McpServerConfig> =
+        cfg.mcp_servers.iter().filter(|s| s.enabled).cloned().collect();
+    crate::mcp::global().cached_tools(&enabled)
+}
+
+/// Connect every enabled server once (best-effort) so the first send does
+/// not pay the handshake latency. Called from run_send before lanes start.
+async fn ensure_mcp_servers(data_dir: &std::path::Path) {
+    let cfg = config::load(data_dir);
+    for s in cfg.mcp_servers.iter().filter(|s| s.enabled) {
+        if let Err(e) = crate::mcp::global().ensure(s).await {
+            eprintln!("[mcp] {} 连接失败: {e}", s.name);
+        }
+    }
+}
+
+/// Auto boundary compaction: called at the user boundary inside run_send.
+async fn maybe_auto_compact(state: &State<'_, AppState>, session_id: &str, cfg: &AppConfig) {
+    let Ok(sf) = state.store.load(session_id) else { return };
+    if sf.meta.kind != "chat" || sf.messages.len() < COMPACT_MIN_MESSAGES {
+        return;
+    }
+    let binding = match sf.meta.bindings.first() {
+        Some(b) => b.clone(),
+        None => return,
+    };
+    let Some(provider) = resolve_provider(cfg, &binding) else { return };
+    let window = provider.context_window.unwrap_or(131_072) as f64;
+    let last_input = sf
+        .telemetry
+        .iter()
+        .filter_map(|r| r.input_tokens)
+        .next_back()
+        .unwrap_or(0) as f64;
+    if last_input < window * COMPACT_AT_FRACTION {
+        return;
+    }
+    let _ = compact_now(&state.client, &state.data_dir, session_id, provider, &binding.model).await;
+}
+
+#[tauri::command]
+pub fn stop_generation(state: State<'_, AppState>, session_id: String) {
+    if let Some(flag) = state.stops.lock().unwrap().get(&session_id) {
+        flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Edit-and-resend support: drop the user message at `from_ts` and everything
+/// after it (its replies, tool records, telemetry), and invalidate the prefix
+/// state so the next request rebuilds from the trimmed transcript.
+#[tauri::command]
+pub fn rollback_session(state: State<'_, AppState>, session_id: String, from_ts: u64) -> Result<usize, String> {
+    let mut sf = state.store.load(&session_id)?;
+    let before = sf.messages.len();
+    sf.messages.retain(|m| m.ts < from_ts);
+    let removed = before - sf.messages.len();
+    sf.telemetry.retain(|r| r.ts < from_ts);
+    sf.meta.updated_at = now_ms();
+    state.store.save(&sf)?;
+    if let Some(map) = prefixes_lock().as_mut() {
+        map.remove(&(session_id.clone(), 0));
+    }
+    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+        map.remove(&(session_id, 0));
+    }
+    Ok(removed)
+}
+
+/// User's answer to a write-tool approval card. `remember` records a
+/// session-level grant for that tool (only a session — never global).
+#[tauri::command]
+pub fn resolve_approval(
+    approval_id: String,
+    session_id: String,
+    tool: String,
+    approved: bool,
+    remember: bool,
+) -> Result<(), String> {
+    let tx = take_approval(&approval_id).ok_or("审批已不存在（可能已超时）")?;
+    let _ = tx.send(approved);
+    if approved && remember {
+        if let Some(set) = GRANTS.lock().unwrap().as_mut() {
+            set.insert(grant_key(&session_id, &tool));
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn send_message(
+    state: State<'_, AppState>,
+    session_id: String,
+    content: String,
+    skill_calls: Option<Vec<String>>,
+    images: Option<Vec<crate::prefix::ChatImage>>,
+    channel: tauri::ipc::Channel<StreamEvent>,
+) -> Result<SendResult, String> {
+    let bindings = {
+        let sf = state.store.load(&session_id)?;
+        sf.meta.bindings.clone()
+    };
+    run_send(
+        &state,
+        session_id,
+        content,
+        skill_calls,
+        images.unwrap_or_default(),
+        bindings,
+        channel,
+        false,
+    )
+    .await?;
+    Ok(SendResult { ok: true })
+}
+
+#[tauri::command]
+pub async fn arena_send(
+    state: State<'_, AppState>,
+    session_id: String,
+    content: String,
+    skill_calls: Option<Vec<String>>,
+    images: Option<Vec<crate::prefix::ChatImage>>,
+    lanes: Vec<SessionBinding>,
+    channel: tauri::ipc::Channel<StreamEvent>,
+) -> Result<SendResult, String> {
+    // persist lanes first so they survive restarts
+    state.store.set_bindings(&session_id, lanes.clone())?;
+    run_send(
+        &state,
+        session_id,
+        content,
+        skill_calls,
+        images.unwrap_or_default(),
+        lanes,
+        channel,
+        true,
+    )
+    .await?;
+    Ok(SendResult { ok: true })
+}
+
+/// Group chat / round-table: the SAME prompt goes to N members SEQUENTIALLY.
+/// Default (sequential) order is lane order; with `moderated`, after each
+/// member speaks an LLM host picks the next speaker (or ends the table), so
+/// the discussion is scheduled by relevance instead of fixed order. Each
+/// later member's user message carries the earlier members' replies as a
+/// quoted block; every member reuses the arena lane machinery (persistence,
+/// StreamEvent, per-lane prefix cache) with lane = member index. A member
+/// that fails or is stopped ends the round-table with the replies gathered
+/// so far. Attached images ride only on the first member's turn.
+#[tauri::command]
+pub async fn group_send(
+    state: State<'_, AppState>,
+    session_id: String,
+    content: String,
+    skill_calls: Option<Vec<String>>,
+    images: Option<Vec<crate::prefix::ChatImage>>,
+    moderated: Option<bool>,
+    lanes: Vec<SessionBinding>,
+    channel: tauri::ipc::Channel<StreamEvent>,
+) -> Result<SendResult, String> {
+    if lanes.is_empty() {
+        return Err("圆桌成员为空 —— 请先添加要参与的模型".into());
+    }
+    let moderated = moderated.unwrap_or(false);
+    // persist lanes first so they survive restarts (same as arena)
+    state.store.set_bindings(&session_id, lanes.clone())?;
+    let host_binding = lanes[0].clone();
+    // remaining speaker queue; default order = lane order
+    let mut queue: Vec<usize> = (0..lanes.len()).collect();
+    let mut round_text = String::new();
+    let mut pending_images = images.unwrap_or_default();
+    while let Some(idx) = queue.first().copied() {
+        queue.remove(0);
+        let binding = &lanes[idx];
+        let member_content = if round_text.is_empty() {
+            content.clone()
+        } else {
+            format!(
+                "{content}\n\n---\n【圆桌讨论】其他成员已就上述问题发表看法，请阅读后发表你的观点（可以补充、反驳或修正他人，不要重复他人已说的内容）：\n{round_text}"
+            )
+        };
+        // run_send awaits its (single) lane task internally, so this loop is
+        // strictly sequential — each member sees all earlier replies.
+        run_send(
+            &state,
+            session_id.clone(),
+            member_content,
+            skill_calls.clone(),
+            std::mem::take(&mut pending_images),
+            vec![binding.clone()],
+            channel.clone(),
+            true,
+        )
+        .await?;
+        // read this member's final reply back from the persisted transcript
+        let said: String = {
+            let _guard = state.save_lock.lock().await;
+            state
+                .store
+                .load(&session_id)
+                .ok()
+                .and_then(|sf| {
+                    sf.messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.lane == idx as u32 && m.role == "assistant" && m.status == "ok")
+                        .map(|m| m.content.clone())
+                })
+                .unwrap_or_default()
+        };
+        let said = said.trim().to_string();
+        if said.is_empty() {
+            break; // member failed or the user stopped it — end the table
+        }
+        round_text.push_str(&format!("\n【成员 {} · {}】\n{}\n", idx + 1, binding.model, said));
+        // ---- LLM-host scheduling: pick the most valuable next speaker ----
+        if moderated && !queue.is_empty() {
+            let members = queue
+                .iter()
+                .map(|&j| format!("{}. {}", j + 1, lanes[j].model))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let ask = format!(
+                "圆桌讨论进行中。议题：\n{content}\n\n已有发言：\n{round_text}\n\n剩余成员（序号. 模型）：\n{members}\n\n你是主持人。请选出最适合下一个发言的成员（能补充新视角、对抗验证或推进讨论者）。只输出一个成员序号（例如 2）；若认为讨论已充分，只输出：结束"
+            );
+            let next = match resolve_provider(&config::load(&state.data_dir), &host_binding) {
+                Some(p) => chat::ask_once(
+                    &state.client,
+                    p,
+                    &host_binding.model,
+                    "你是圆桌讨论的主持人，负责调度发言顺序。只输出序号或「结束」。",
+                    &ask,
+                    60,
+                )
+                .await
+                .ok(),
+                None => None,
+            };
+            let mut picked: Option<usize> = None;
+            if let Some(reply) = next {
+                let r = reply.trim();
+                if r.contains("结束") || r.eq_ignore_ascii_case("end") {
+                    break;
+                }
+                // first digit in the reply names the member (1-based over
+                // the listed remaining set)
+                if let Some(d) = r.chars().find(|c| c.is_ascii_digit()).and_then(|c| c.to_digit(10)) {
+                    let pos = (d as usize).saturating_sub(1);
+                    if pos < queue.len() {
+                        picked = Some(queue[pos]);
+                    }
+                }
+                // parse failure ⇒ sequential fallback (queue order stands)
+            }
+            if let Some(p) = picked {
+                if let Some(pos) = queue.iter().position(|&j| j == p) {
+                    queue.remove(pos);
+                    queue.insert(0, p);
+                }
+            }
+        }
+    }
+    Ok(SendResult { ok: true })
+}
+
+fn resolve_provider<'a>(cfg: &'a AppConfig, binding: &SessionBinding) -> Option<&'a Provider> {
+    cfg.providers
+        .iter()
+        .find(|p| p.id == binding.provider_id && p.enabled && !p.api_key.is_empty())
+}
+
+/// A named profile overrides provider+model; without one the sub inherits
+/// the parent session's binding.
+fn binding_for_sub(
+    profile: Option<&crate::config::SubagentProfile>,
+    parent: &SessionBinding,
+) -> SessionBinding {
+    match profile {
+        Some(p) => SessionBinding {
+            provider_id: p.provider_id.clone(),
+            model: p.model.clone(),
+        },
+        None => parent.clone(),
+    }
+}
+
+/// Look up an enabled named subagent profile by the delegate call's
+/// `agent` argument.
+fn find_subagent_profile<'a>(
+    cfg: &'a AppConfig,
+    args: &str,
+) -> Option<&'a crate::config::SubagentProfile> {
+    let name = serde_json::from_str::<Value>(args)
+        .ok()
+        .and_then(|a| a.get("agent").and_then(|v| v.as_str()).map(|s| s.trim().to_string()))
+        .unwrap_or_default();
+    if name.is_empty() {
+        return None;
+    }
+    cfg.subagents.iter().find(|p| p.enabled && p.name == name)
+}
+
+/// Max tool rounds inside one sub-agent run. Sub-agents are read-only, so
+/// the loop is naturally bounded; this guards pathological repetition.
+const SUB_MAX_ROUNDS: usize = 12;
+/// Result text handed back to the parent model (chars).
+const SUB_RESULT_CAP: usize = 4_000;
+
+/// Run a background sub-agent for `delegate_subagent`: its own hidden
+/// session (kind "sub"), own prefix state, read-only tools, no MCP, no UI
+/// streaming (events go to a discard channel). Returns the final conclusion
+/// text for the parent's tool-result message. Sub-sessions are kept on disk
+/// (inspectable) but excluded from sidebar lists by the frontend.
+async fn run_subagent(
+    client: &reqwest::Client,
+    data_dir: &std::path::Path,
+    parent_session: &str,
+    task: &str,
+    profile: Option<&crate::config::SubagentProfile>,
+    parent_binding: &SessionBinding,
+    cfg: &AppConfig,
+    parent_channel: &tauri::ipc::Channel<StreamEvent>,
+    parent_lane: u32,
+    call_id: &str,
+) -> Result<String, String> {
+    let store = SessionStore::new(data_dir);
+    let parent_ws = store.load(parent_session).ok().and_then(|sf| sf.meta.workspace.clone());
+    let title: String = task.chars().take(20).collect();
+    // live progress: the sub lane's deltas are forwarded to the parent UI,
+    // tagged with the delegate tool-call id so the card can stream them
+    let tap = chat::ProgressTap {
+        lane: parent_lane,
+        call_id: call_id.to_string(),
+        title: title.clone(),
+        channel: parent_channel.clone(),
+    };
+    let sf = store.create("sub", vec![binding_for_sub(profile, parent_binding)], &format!("🤖 子任务 · {title}"))?;
+    let sub_id = sf.meta.id.clone();
+    store.set_workspace(&sub_id, parent_ws.clone())?;
+
+    let mut system_full = crate::sysprompt::assemble(&cfg.settings.system_prompt, parent_ws.as_deref());
+    if let Some(p) = profile {
+        let sp = p.system_prompt.trim();
+        if !sp.is_empty() {
+            system_full = format!("{system_full}\n\n# Subagent Role — {}\n{sp}", p.name);
+        }
+    }
+    let binding = binding_for_sub(profile, parent_binding);
+    let provider = resolve_provider(cfg, &binding).cloned().ok_or("Provider 未配置或未填 API Key")?;
+    let model = binding.model.clone();
+    let tools = crate::agent_tools::schema_readonly();
+    let cache_key = format!("ccharness-{sub_id}-0");
+
+    // the task record carries workflow="subagent" so transcript_for_lane
+    // injects SUBAGENT_DIRECTIVE — identical bytes live and after restart
+    let task_record = MessageRecord {
+        id: Uuid::new_v4().to_string(),
+        lane: 0,
+        role: "user".into(),
+        content: task.to_string(),
+        reasoning: None,
+        ts: next_record_ts(),
+        model: None,
+        status: "ok".into(),
+        usage: None,
+        cost_usd: None,
+        confidence: None,
+        tool_calls: None,
+        tool_call_id: None,
+        skill_calls: None,
+        workflow: Some("subagent".into()),
+        images: Vec::new(),
+    };
+    {
+        let mut s = store.load(&sub_id)?;
+        s.messages.push(task_record.clone());
+        store.save(&s)?;
+    }
+
+    // prefix state for the sub lane (same static map, distinct key)
+    let owned_prefix = {
+        let mut guard = prefixes_lock();
+        let map = guard.get_or_insert_with(HashMap::new);
+        let lp = map
+            .entry((sub_id.clone(), 0u32))
+            .or_insert_with(|| LanePrefix::new(&system_full, &cache_key));
+        lp.bind_model(&model);
+        // sub agents honor the same per-model sampling params (epoch-gated)
+        let beh = provider.behavior.get(&model);
+        lp.bind_behavior(beh.and_then(|b| b.temperature), beh.and_then(|b| b.max_output));
+        lp.clone()
+    };
+
+    let task_msg = ChatMessage::plain("user", format!("{}{task}", chat::SUBAGENT_DIRECTIVE));
+    let mut sent_this_turn: Vec<ChatMessage> = vec![task_msg.clone()];
+    let channel = tauri::ipc::Channel::<StreamEvent>::new(|_| Ok(()));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mut final_text: Option<String> = None;
+    let mut turn_status = "error".to_string();
+    for _round in 1..=SUB_MAX_ROUNDS {
+        let body = chat::build_body(&provider, &model, &owned_prefix, &sent_this_turn, &system_full, Some(&tools));
+        let message_id = Uuid::new_v4().to_string();
+        let ctx = chat::SendCtx {
+            client,
+            provider: &provider,
+            model: &model,
+            lane: 0,
+            message_id: message_id.clone(),
+            channel: channel.clone(),
+            stop: stop.clone(),
+            progress_tap: Some(tap.clone()),
+        };
+        let outcome = match chat::stream_lane(&ctx, body, chat::auth_for(&provider)).await {
+            Ok(o) => o,
+            Err(e) => return Err(e),
+        };
+        let usage = outcome.usage.clone();
+        let cost = chat::cost_of(&usage, &provider, &model);
+        let stat = RequestStat {
+            seq: SEQ.fetch_add(1, Ordering::Relaxed),
+            ts: now_ms(),
+            lane: 0,
+            model: model.clone(),
+            epoch: owned_prefix.epoch,
+            prefix_bytes: owned_prefix.prefix_bytes_public(),
+            added_bytes: sent_this_turn.iter().map(|m| message_json(m).len() + 1).sum::<usize>(),
+            chain_ok: true,
+            input_tokens: usage.input,
+            cached_tokens: usage.cached,
+            output_tokens: usage.output,
+            cost_usd: cost,
+        };
+        let has_tools = !outcome.tool_calls.is_empty();
+        let tool_wire: Option<Vec<crate::types_rs::ToolCallWire>> = if has_tools {
+            Some(
+                outcome
+                    .tool_calls
+                    .iter()
+                    .map(|tc| crate::types_rs::ToolCallWire {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let asst_msg = ChatMessage {
+            role: "assistant".into(),
+            content: outcome.content.clone(),
+            tool_calls: tool_wire.as_ref().map(|w| chat::tool_calls_wire_value(w)),
+            tool_call_id: None,
+            images: Vec::new(),
+        };
+        let record = MessageRecord {
+            id: message_id,
+            lane: 0,
+            role: "assistant".into(),
+            reasoning: if outcome.reasoning.is_empty() { None } else { Some(outcome.reasoning.clone()) },
+            content: outcome.content.clone(),
+            ts: next_record_ts(),
+            model: Some(model.clone()),
+            status: outcome.status.clone(),
+            usage: Some(usage),
+            cost_usd: cost,
+            confidence: outcome.confidence,
+            tool_calls: tool_wire,
+            tool_call_id: None,
+            skill_calls: None,
+            workflow: None,
+            images: Vec::new(),
+        };
+        sent_this_turn.push(asst_msg.clone());
+        {
+            let mut s = store.load(&sub_id)?;
+            s.messages.push(record);
+            s.telemetry.push(stat);
+            s.meta.updated_at = now_ms();
+            store.save(&s)?;
+        }
+        if outcome.status != "ok" {
+            turn_status = outcome.status;
+            break;
+        }
+        if !has_tools {
+            final_text = Some(outcome.content);
+            turn_status = "ok".into();
+            break;
+        }
+        // execute read tools, feed results back
+        for tc in &outcome.tool_calls {
+            let result = match serde_json::from_str::<Value>(&tc.arguments) {
+                Err(e) => format!("ERROR: 参数不是合法 JSON: {e}"),
+                Ok(args) => crate::agent_tools::execute(parent_ws.as_deref().unwrap_or(""), &tc.name, &args),
+            };
+            let tool_record = MessageRecord {
+                id: Uuid::new_v4().to_string(),
+                lane: 0,
+                role: "tool".into(),
+                content: result.clone(),
+                reasoning: None,
+                ts: next_record_ts(),
+                model: None,
+                status: "ok".into(),
+                usage: None,
+                cost_usd: None,
+                confidence: None,
+                tool_calls: None,
+                tool_call_id: Some(tc.id.clone()),
+                skill_calls: None,
+                workflow: None,
+                images: Vec::new(),
+            };
+            sent_this_turn.push(ChatMessage {
+                role: "tool".into(),
+                content: result,
+                tool_calls: None,
+                tool_call_id: Some(tc.id.clone()),
+                images: Vec::new(),
+            });
+            let mut s = store.load(&sub_id)?;
+            s.messages.push(tool_record);
+            s.meta.updated_at = now_ms();
+            store.save(&s)?;
+        }
+    }
+
+    // fold the sub-turn into its lane's Zone H (mirrors run_send semantics)
+    if turn_status != "error" {
+        let mut guard = prefixes_lock();
+        if let Some(map) = guard.as_mut() {
+            if let Some(lp) = map.get_mut(&(sub_id, 0)) {
+                for m in &sent_this_turn {
+                    lp.append(m);
+                }
+            }
+        }
+    }
+    // flip the parent's delegate card out of its streaming state
+    tap.forward("", true);
+
+    let text = final_text
+        .ok_or("子任务在轮数上限内未产出结论")?
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return Err("子任务返回了空结论".into());
+    }
+    Ok(text.chars().take(SUB_RESULT_CAP).collect())
+}
+
+/// Garnish cap per ToT candidate (chars) — keeps the rehearsal block small
+/// even when a model is verbose.
+const TOT_CANDIDATE_CAP: usize = 1_500;
+
+/// Deep mode (ToT-style rehearsal): three candidate approaches are drafted
+/// in parallel (safe / rigorous / creative angles), then a judge ask_once
+/// picks the most promising one. Returns a text block to append to the user
+/// message actually SENT this turn — same garnish mechanism as vector-memory
+/// recall (persisted record stays clean; restarts rebuild a new epoch
+/// without it). Any failure returns None: deep mode must never block a
+/// normal send.
+async fn run_tot_rehearsal(
+    client: &reqwest::Client,
+    provider: &crate::config::Provider,
+    model: &str,
+    task: &str,
+) -> Option<String> {
+    let clip = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    let angles = [
+        ("A", "最直接稳妥的方案：步骤最少、依赖最少、最快给出可用结果"),
+        ("B", "最周全严谨的方案：覆盖边界情况、风险与备选路径"),
+        ("C", "最有创意的方案：换一个不寻常但可能更优的切入点"),
+    ];
+    let prompts: Vec<String> = angles
+        .iter()
+        .map(|(tag, angle)| {
+            format!(
+                "你是方案规划专家。针对用户任务，只输出「方案{tag}」：{angle}。用简洁的编号步骤（最多 5 步），不要寒暄，不要输出方案 {tag} 以外的内容。"
+            )
+        })
+        .collect();
+    let mut futs = Vec::new();
+    for p in &prompts {
+        futs.push(chat::ask_once(client, provider, model, p, task, 700));
+    }
+    let results = futures_util::future::join_all(futs).await;
+    let mut cands: Vec<(char, String)> = Vec::new();
+    for ((tag, _), r) in angles.iter().zip(results) {
+        if let Ok(text) = r {
+            let text = text.trim();
+            if !text.is_empty() {
+                let tag_ch = tag.chars().next().unwrap_or('A');
+                cands.push((tag_ch, clip(text, TOT_CANDIDATE_CAP)));
+            }
+        }
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    // judge: pick the best candidate; parse failure falls back to A
+    let listing = cands
+        .iter()
+        .map(|(tag, text)| format!("方案{tag}：{text}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let judge_prompt = format!(
+        "任务：{}\n\n三个候选方案：\n{listing}\n\n你是评审专家。选出最有希望成功的方案，只输出 JSON：{{\"best\":\"A\"|\"B\"|\"C\",\"reason\":\"一句话理由\"}}",
+        clip(task, 1_200)
+    );
+    let verdict = chat::ask_once(
+        client,
+        provider,
+        model,
+        "你是评审专家，只输出 JSON，不要输出其他内容。",
+        &judge_prompt,
+        200,
+    )
+    .await
+    .ok();
+    let (best, reason) = match verdict.as_deref().map(str::trim) {
+        Some(v) => {
+            // tolerate markdown fences / surrounding prose: take {..}
+            let json_txt = match (v.find('{'), v.rfind('}')) {
+                (Some(s), Some(e)) if e > s => &v[s..=e],
+                _ => v,
+            };
+            match serde_json::from_str::<serde_json::Value>(json_txt) {
+                Ok(j) => {
+                    let b = j
+                        .get("best")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.chars().next())
+                        .map(|c| c.to_ascii_uppercase())
+                        .unwrap_or('A');
+                    let b = if cands.iter().any(|(tag, _)| *tag == b) { b } else { 'A' };
+                    let r = j.get("reason").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+                    (b, r)
+                }
+                Err(_) => ('A', String::new()),
+            }
+        }
+        None => ('A', String::new()),
+    };
+    let mut block = String::from("\n\n[深度推理预演（ToT）— 三方案并行生成，评审选优]\n");
+    for (tag, text) in &cands {
+        block.push_str(&format!("方案{tag}：{text}\n\n"));
+    }
+    if reason.is_empty() {
+        block.push_str(&format!("评审结论：采用方案{best}。\n\n请按选中的方案作答（可吸收其他方案的优点）。"));
+    } else {
+        block.push_str(&format!("评审结论：采用方案{best} —— {reason}\n\n请按选中的方案作答（可吸收其他方案的优点）。"));
+    }
+    Some(block)
+}
+
+async fn run_send(
+    state: &State<'_, AppState>,
+    session_id: String,
+    content: String,
+    skill_calls: Option<Vec<String>>,
+    images: Vec<crate::prefix::ChatImage>,
+    lanes: Vec<SessionBinding>,
+    channel: tauri::ipc::Channel<StreamEvent>,
+    arena: bool,
+) -> Result<(), String> {
+    if content.trim().is_empty() {
+        return Err("空消息".into());
+    }
+
+    // cancellation flag for this session
+    let stop = Arc::new(AtomicBool::new(false));
+    state.stops.lock().unwrap().insert(session_id.clone(), stop.clone());
+
+    // persist the user message once (lane 0); skill names are validated
+    // against what is actually installed so stale chips cannot persist
+    let cfg = config::load(&state.data_dir);
+    let system = cfg.settings.system_prompt.clone();
+    let ws = state.store.load(&session_id).ok().and_then(|sf| sf.meta.workspace.clone());
+    let valid_skills: std::collections::HashSet<String> = crate::skills::scan(ws.as_deref())
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    let skill_calls: Vec<String> = skill_calls
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| valid_skills.contains(n))
+        .collect();
+    // attached images land in the session's attachment dir BEFORE the record
+    // is written — the record only carries immutable relative filenames, so
+    // rebuilds re-reading the files produce byte-identical requests
+    let image_names = if images.is_empty() {
+        Vec::new()
+    } else {
+        crate::sessions::save_attachments(&state.data_dir, &session_id, &images)?
+    };
+    let user_record = MessageRecord {
+        id: Uuid::new_v4().to_string(),
+        lane: 0,
+        role: "user".into(),
+        content: content.clone(),
+        reasoning: None,
+        ts: next_record_ts(),
+        model: None,
+        status: "ok".into(),
+        usage: None,
+        cost_usd: None,
+        confidence: None,
+        tool_calls: None,
+        tool_call_id: None,
+        skill_calls: if skill_calls.is_empty() { None } else { Some(skill_calls) },
+        workflow: match workflow_of_in(&session_id, &state.data_dir).as_str() {
+            "plan" => Some("plan".into()),
+            "goal" => Some("goal".into()),
+            "deep" => Some("deep".into()),
+            // the full gate "sm:<def>:<state>" rides on the record so every
+            // later rebuild injects the directive of the state the message
+            // was actually sent under (byte-stable per record)
+            w if w.starts_with("sm:") => Some(w.into()),
+            _ => None,
+        },
+        images: image_names,
+    };
+    {
+        let _guard = state.save_lock.lock().await;
+        let mut sf = state.store.load(&session_id)?;
+        sf.messages.push(user_record.clone());
+        sf.meta.updated_at = now_ms();
+        state.store.save(&sf)?;
+    }
+
+    // boundary compaction fires here — only at the user boundary, only for
+    // chat sessions, only when the last request approached the window
+    if !arena {
+        maybe_auto_compact(state, &session_id, &cfg).await;
+    }
+    // MCP handshakes are lazy — warm them before lanes spawn so the first
+    // model turn sees the full tool surface
+    if cfg.mcp_servers.iter().any(|s| s.enabled) {
+        ensure_mcp_servers(&state.data_dir).await;
+    }
+
+    // one task per lane
+    let mut handles = Vec::new();
+    for (lane_idx, binding) in lanes.iter().enumerate() {
+        let lane = lane_idx as u32;
+        let binding = binding.clone();
+        let session_id = session_id.clone();
+        let channel = channel.clone();
+        let stop = stop.clone();
+        let save_lock = state.save_lock.clone();
+        let data_dir = state.data_dir.clone();
+        let client = state.client.clone();
+        let system = system.clone();
+
+        let handle = tauri::async_runtime::spawn(async move {
+            let cfg = config::load(&data_dir);
+            let provider = match resolve_provider(&cfg, &binding) {
+                Some(p) => p.clone(),
+                None => {
+                    let _ = channel.send(StreamEvent::Error {
+                        lane,
+                        message: "Provider 未配置或未填 API Key".into(),
+                    });
+                    return;
+                }
+            };
+            let model = binding.model.clone();
+            let store = SessionStore::new(&data_dir);
+
+            // workspace + layered Zone S (identity → user global → AGENTS.md → env).
+            // Worktree isolation: while active, every tool — read, write,
+            // approval preview, write-log snapshot — operates inside the
+            // session's worktree; the main checkout is untouched until the
+            // user merges (or discards) from the composer capsule.
+            let sf_loaded = store.load(&session_id).ok();
+            let mut workspace = sf_loaded.as_ref().and_then(|sf| sf.meta.workspace.clone());
+            if let Some(wt) = sf_loaded.as_ref().and_then(|sf| sf.meta.wt.clone()) {
+                if std::path::Path::new(&wt.path).is_dir() {
+                    workspace = Some(wt.path);
+                }
+            }
+            let perm_mode = permission_of(&session_id);
+            // plan gate: read-only tool surface, no MCP, no writes — the
+            // directive itself rides on the user message (see transcript_for_lane).
+            // goal gate: full surface, but more tool rounds per turn.
+            // image gate: handled below via chat::image_generate — the turn
+            // never enters the chat pipeline at all.
+            let wf = workflow_of_in(&session_id, &data_dir);
+            let plan_mode = wf == "plan";
+            let goal_mode = wf == "goal";
+            let deep_mode = wf == "deep";
+            let image_mode = wf == "image";
+            // declarative state machine: resolve the current state (if the
+            // def was deleted or redefined since the gate was set, degrade
+            // gracefully to an unrestricted agent turn)
+            let sm_state = match wf.strip_prefix("sm:").and_then(|r| r.split_once(':')) {
+                Some((def_id, state_name)) => {
+                    chat::resolve_sm(&cfg.workflows, def_id, state_name)
+                }
+                None => None,
+            };
+            let sm_tools: Option<&str> = sm_state.as_ref().map(|(_, st)| st.tools.as_str());
+            let sm_no_tools = sm_tools == Some("none");
+            let sm_ro_tools = sm_tools == Some("readonly");
+            let system_full = crate::sysprompt::assemble(&system, workspace.as_deref());
+            let tools_on = cfg.settings.agent_tools && workspace.is_some() && !sm_no_tools;
+            let mcp_enabled = cfg.settings.agent_tools
+                && !plan_mode
+                && !sm_no_tools
+                && !sm_ro_tools
+                && cfg.mcp_servers.iter().any(|s| s.enabled);
+            let mut schema_all: Vec<Value> = Vec::new();
+            if tools_on {
+                schema_all.extend(
+                    match perm_mode == "readonly" || plan_mode || sm_ro_tools {
+                        true => crate::agent_tools::schema_readonly().as_array().cloned().unwrap_or_default(),
+                        false => crate::agent_tools::schema().as_array().cloned().unwrap_or_default(),
+                    },
+                );
+            }
+            if mcp_enabled {
+                schema_all.extend(state_mcp_tools(&data_dir));
+            }
+            // advertise enabled named subagents in the delegate tool so the
+            // model can pick `agent` meaningfully
+            if tools_on && !plan_mode {
+                let names: Vec<String> = cfg
+                    .subagents
+                    .iter()
+                    .filter(|p| p.enabled)
+                    .map(|p| {
+                        if p.description.trim().is_empty() {
+                            p.name.clone()
+                        } else {
+                            format!("{}（{}）", p.name, p.description.trim())
+                        }
+                    })
+                    .collect();
+                if !names.is_empty() {
+                    if let Some(tool) = schema_all.iter_mut().find(|t| {
+                        t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str())
+                            == Some("delegate_subagent")
+                    }) {
+                        tool["function"]["description"] = Value::String(format!(
+                            "把一个相对独立的调研/分析子任务委派给后台子智能体（独立上下文、只读工具），完成后以结论回报。task 需自包含。当前可用的具名子智能体（agent 参数填名字）：{}。不指定 agent 时使用主会话的模型配置。",
+                            names.join("；")
+                        ));
+                    }
+                }
+            }
+            // goal lifecycle tools (Codex /goal parity): the model can read
+            // the goal, create one (flips the gate), and declare achieved /
+            // unmet. Session-scoped — they work even without a workspace,
+            // so they ride regardless of tools_on.
+            if goal_mode {
+                schema_all.push(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": "get_goal",
+                        "description": "查看当前会话的目标状态：目标内容、生命周期状态（active/paused/achieved/unmet/budget_limited）与验收清单进度（x/y、是否已全部满足）。",
+                        "parameters": {"type": "object", "properties": {}, "required": []}
+                    }
+                }));
+                schema_all.push(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": "create_goal",
+                        "description": "创建（或替换）当前会话的目标并进入目标模式。objective 需自包含且可映射为可验证的验收清单：一句话目标 + 范围（Scope）+ 硬性约束（Constraints）+ 验收标准（Done when，每条可验证）+ 停止条件（Stop if）。避免「全部/所有/彻底/improve」这类无法映射成清单的虚词。",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "objective": {
+                                    "type": "string",
+                                    "description": "目标全文（含范围/约束/验收标准/停止条件）"
+                                }
+                            },
+                            "required": ["objective"]
+                        }
+                    }
+                }));
+                schema_all.push(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": "update_goal",
+                        "description": "声明目标达成（status=achieved）或判定无法达成（status=unmet）。调用前必须完成审计：逐条核对验收标准并确认每条 ✅ 都有可核验证据（文件路径/命令输出/测试名）；代理信号（测试通过、代码写完）不能单独作为依据；不确定视作未达成。暂停/恢复/清除不可通过此工具操作。",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "status": {"type": "string", "enum": ["achieved", "unmet"], "description": "achieved=目标达成；unmet=判定无法达成（需说明原因）"}
+                            },
+                            "required": ["status"]
+                        }
+                    }
+                }));
+            }
+            let tools_schema = if schema_all.is_empty() {
+                None
+            } else {
+                Some(Value::Array(schema_all))
+            };
+
+            // ---- prefix state (synchronous, brief lock) ----
+            let cache_key = format!("ccharness-{session_id}-{lane}");
+            let sf_snapshot = match store.load(&session_id) {
+                Ok(sf) => sf,
+                Err(e) => {
+                    let _ = channel.send(StreamEvent::Error { lane, message: e });
+                    return;
+                }
+            };
+
+            // ---- image gate: this turn goes to POST {base}/images/generations,
+            // not the chat pipeline — no prefix state, no tools, no telemetry
+            // ledger entry (the image API has no chat usage to record) ----
+            if image_mode {
+                let prompt = sf_snapshot
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                let message_id = Uuid::new_v4().to_string();
+                let ctx = SendCtx {
+                    client: &client,
+                    provider: &provider,
+                    model: &model,
+                    lane,
+                    message_id: message_id.clone(),
+                    channel: channel.clone(),
+                    stop: stop.clone(),
+                    progress_tap: None,
+                };
+                let outcome = match chat::image_generate(&ctx, &prompt).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        let _ = channel.send(StreamEvent::Error { lane, message: e });
+                        let _ = channel.send(StreamEvent::Done {
+                            lane,
+                            message_id,
+                            status: "error".into(),
+                            confidence: None,
+                        });
+                        return;
+                    }
+                };
+                let record = MessageRecord {
+                    id: message_id.clone(),
+                    lane,
+                    role: "assistant".into(),
+                    reasoning: None,
+                    content: outcome.content.clone(),
+                    ts: next_record_ts(),
+                    model: Some(model.clone()),
+                    status: outcome.status.clone(),
+                    usage: None,
+                    cost_usd: None,
+                    confidence: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    skill_calls: None,
+                    workflow: None,
+                    images: Vec::new(),
+                };
+                {
+                    let _guard = save_lock.lock().await;
+                    if let Ok(mut sf) = store.load(&session_id) {
+                        sf.messages.push(record);
+                        sf.meta.updated_at = now_ms();
+                        let _ = store.save(&sf);
+                    }
+                }
+                let _ = channel.send(StreamEvent::Done {
+                    lane,
+                    message_id,
+                    status: outcome.status,
+                    confidence: None,
+                });
+                return;
+            }
+
+            let owned_prefix = {
+                let mut guard = prefixes_lock();
+                let map = guard.get_or_insert_with(HashMap::new);
+                let key = (session_id.clone(), lane);
+                let lp = map
+                    .entry(key)
+                    .or_insert_with(|| LanePrefix::new(&system_full, &cache_key));
+                lp.bind_model(&model);
+                // per-model behavior overrides (temperature / max_tokens /
+                // reasoning) with global-thinking fallback, all epoch-gated
+                let beh = provider.behavior.get(&model);
+                lp.bind_behavior(beh.and_then(|b| b.temperature), beh.and_then(|b| b.max_output));
+                let reasoning = beh
+                    .and_then(|b| b.reasoning.as_deref())
+                    .filter(|r| !r.is_empty() && *r != "default")
+                    .or(if cfg.settings.thinking_level == "default" {
+                        None
+                    } else {
+                        Some(cfg.settings.thinking_level.as_str())
+                    });
+                lp.bind_thinking(reasoning);
+                // system change (settings/workspace/AGENTS.md) or restart
+                // recovery ⇒ rebuild Zone H from the persisted transcript
+                let needs_rebuild = !lp.system_is(&system_full) || lp_is_empty(lp);
+                if needs_rebuild {
+                    let hist = chat::transcript_for_lane(&sf_snapshot, lane, &cfg.workflows, &data_dir);
+                    if hist.len() > 1 {
+                        lp.rebuild(&system_full, &hist[..hist.len() - 1]);
+                    }
+                }
+                lp.clone()
+            };
+
+            let transcript = chat::transcript_for_lane(&sf_snapshot, lane, &cfg.workflows, &data_dir);
+            if transcript.is_empty() {
+                let _ = channel.send(StreamEvent::Error { lane, message: "会话内容为空".into() });
+                return;
+            }
+
+            // Everything sent beyond Zone H this turn, in order. The next
+            // request replays it verbatim; at turn end it falls into Zone H.
+            let mut sent_this_turn: Vec<ChatMessage> = vec![transcript.last().unwrap().clone()];
+            let mut last_confidence: Option<u32> = None;
+            let mut last_message_id = Uuid::new_v4().to_string();
+            let mut turn_status = "error".to_string();
+            // per-turn delegation budget for delegate_subagent
+            let mut delegations = 0usize;
+            // SM conditional-branch + parallel-fanout bookkeeping: tools
+            // invoked this turn, accumulated reply text (for contains:
+            // predicates), and the one-shot fan-out guard
+            let mut turn_tools: Vec<String> = Vec::new();
+            let mut turn_text = String::new();
+            let mut fanout_done = false;
+
+            // Vector memory recall: attach the top-k semantically relevant
+            // memories as a suffix on the user message actually SENT this
+            // turn. The persisted record stays clean; within the turn every
+            // replay uses the same suffixed bytes, and at turn end the
+            // suffixed message falls into Zone H — restarts simply rebuild a
+            // new epoch without the garnish.
+            if cfg.settings.vector_memory && !cfg.settings.embeddings_url.trim().is_empty() {
+                let user_text = sent_this_turn
+                    .first()
+                    .filter(|m| m.role == "user")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                let ws = sf_snapshot.meta.workspace.clone().unwrap_or_default();
+                if !user_text.is_empty() && !ws.is_empty() {
+                    let mems = crate::memvector::recall(&client, &cfg, &data_dir, &ws, &user_text, 3).await;
+                    if !mems.is_empty() {
+                        let block = format!(
+                            "\n\n[长期记忆参考 — 与本条消息语义相关的既往记忆]\n{}",
+                            mems.iter().map(|m| format!("- {m}")).collect::<Vec<_>>().join("\n")
+                        );
+                        if let Some(first) = sent_this_turn.first_mut() {
+                            first.content.push_str(&block);
+                        }
+                    }
+                }
+            }
+
+            // Deep reasoning (ToT-style rehearsal): three candidate
+            // approaches are generated in parallel, an LLM judge picks one,
+            // and the whole rehearsal is appended to the user message
+            // actually SENT this turn — same garnish mechanism as the memory
+            // recall above (persisted record stays clean; restarts rebuild
+            // a new epoch without it). Any rehearsal failure just proceeds
+            // without it.
+            if deep_mode && !sent_this_turn.is_empty() {
+                let task_text = sent_this_turn[0].content.clone();
+                if let Some(block) = run_tot_rehearsal(&client, &provider, &model, &task_text).await {
+                    if let Some(first) = sent_this_turn.first_mut() {
+                        first.content.push_str(&block);
+                    }
+                }
+            }
+
+            let max_rounds = if goal_mode { GOAL_MAX_TOOL_ROUNDS } else { MAX_TOOL_ROUNDS };
+            for _round in 1..=max_rounds {
+                let body = chat::build_body(
+                    &provider,
+                    &model,
+                    &owned_prefix,
+                    &sent_this_turn,
+                    &system_full,
+                    tools_schema.as_ref(),
+                );
+                let prefix_bytes = owned_prefix.prefix_bytes_public();
+                // tail bytes measured exactly like the request: serialized
+                // message JSON + separator — same units as prefix_bytes
+                let added_bytes = sent_this_turn.iter().map(|m| message_json(m).len() + 1).sum::<usize>();
+                let total_bytes = prefix_bytes + added_bytes;
+                // digest-chain continuity: total bytes sent must grow
+                // monotonically (append-only) within an epoch; a new epoch is
+                // an expected rebuild, not a break
+                let chain_ok = {
+                    let mut guard = LAST_SPAN.lock().unwrap();
+                    let map = guard.get_or_insert_with(HashMap::new);
+                    let prev = map.insert((session_id.clone(), lane), (owned_prefix.epoch, total_bytes));
+                    match prev {
+                        None => true,
+                        Some((prev_epoch, prev_total)) => {
+                            prev_epoch != owned_prefix.epoch || total_bytes >= prev_total
+                        }
+                    }
+                };
+
+                let message_id = Uuid::new_v4().to_string();
+                last_message_id = message_id.clone();
+                let ctx = SendCtx {
+                    client: &client,
+                    provider: &provider,
+                    model: &model,
+                    lane,
+                    message_id: message_id.clone(),
+                    channel: channel.clone(),
+                    stop: stop.clone(),
+                    progress_tap: None,
+                };
+                let outcome = match chat::stream_lane(&ctx, body, chat::auth_for(&provider)).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        let _ = channel.send(StreamEvent::Error { lane, message: e });
+                        turn_status = "error".into();
+                        break;
+                    }
+                };
+
+                // per-round telemetry
+                let usage = outcome.usage.clone();
+                let cost = chat::cost_of(&usage, &provider, &model);
+                let stat = RequestStat {
+                    seq: SEQ.fetch_add(1, Ordering::Relaxed),
+                    ts: now_ms(),
+                    lane,
+                    model: model.clone(),
+                    epoch: owned_prefix.epoch,
+                    prefix_bytes,
+                    added_bytes,
+                    chain_ok,
+                    input_tokens: usage.input,
+                    cached_tokens: usage.cached,
+                    output_tokens: usage.output,
+                    cost_usd: cost,
+                };
+                let _ = channel.send(StreamEvent::Usage {
+                    lane,
+                    message_id: message_id.clone(),
+                    usage: usage.clone(),
+                    request: stat.clone(),
+                });
+
+                // accumulate the turn's reply text for SM branch predicates
+                if !turn_text.is_empty() {
+                    turn_text.push_str("\n\n");
+                }
+                turn_text.push_str(&outcome.content);
+
+                // persist this round's assistant record
+                let has_tools = !outcome.tool_calls.is_empty();
+                // SM parallel fan-out decision: on the clean lane-0 answer of
+                // a workflow state whose `parallel` list is configured (and
+                // not yet fanned out this turn), synthesize parallel_branch
+                // tool calls so the assistant record/transcript stay coherent
+                // with the subagent runs that follow — the same wire shape as
+                // delegate_subagent, preserving prefix-cache alignment.
+                let mut fan_calls: Vec<crate::types_rs::ToolCallWire> = Vec::new();
+                if !has_tools
+                    && lane == 0
+                    && !fanout_done
+                    && outcome.status == "ok"
+                    && wf.starts_with("sm:")
+                {
+                    if let Some((def_id, state_name)) = wf[3..].split_once(':') {
+                        if let Some((def, st)) = chat::resolve_sm(&cfg.workflows, def_id, state_name) {
+                            if !st.terminal {
+                                for (i, tgt) in st.parallel.iter().enumerate() {
+                                    if def.states.iter().any(|s| &s.name == tgt) {
+                                        fan_calls.push(crate::types_rs::ToolCallWire {
+                                            id: format!("par-{message_id}-{i}"),
+                                            name: "parallel_branch".into(),
+                                            arguments: serde_json::json!({ "state": tgt }).to_string(),
+                                        });
+                                    }
+                                }
+                                fanout_done = !fan_calls.is_empty();
+                            }
+                        }
+                    }
+                }
+                let tool_wire: Option<Vec<crate::types_rs::ToolCallWire>> = if has_tools {
+                    Some(
+                        outcome
+                            .tool_calls
+                            .iter()
+                            .map(|tc| crate::types_rs::ToolCallWire {
+                                id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                arguments: tc.arguments.clone(),
+                            })
+                            .collect(),
+                    )
+                } else if !fan_calls.is_empty() {
+                    Some(fan_calls.clone())
+                } else {
+                    None
+                };
+                let asst_msg = ChatMessage {
+                    role: "assistant".into(),
+                    content: outcome.content.clone(),
+                    tool_calls: tool_wire.as_ref().map(|w| chat::tool_calls_wire_value(w)),
+                    tool_call_id: None,
+                    images: Vec::new(),
+                };
+                let record = MessageRecord {
+                    id: message_id,
+                    lane,
+                    role: "assistant".into(),
+                    reasoning: if outcome.reasoning.is_empty() { None } else { Some(outcome.reasoning.clone()) },
+                    content: outcome.content.clone(),
+                    ts: next_record_ts(),
+                    model: Some(model.clone()),
+                    status: outcome.status.clone(),
+                    usage: Some(usage),
+                    cost_usd: cost,
+                    confidence: outcome.confidence,
+                    tool_calls: tool_wire,
+                    tool_call_id: None,
+                    skill_calls: None,
+                    workflow: None,
+                    images: Vec::new(),
+                };
+                last_confidence = outcome.confidence;
+                {
+                    let _guard = save_lock.lock().await;
+                    if let Ok(mut sf) = store.load(&session_id) {
+                        sf.messages.push(record);
+                        sf.telemetry.push(stat);
+                        sf.meta.updated_at = now_ms();
+                        let _ = store.save(&sf);
+                    }
+                }
+
+                if outcome.status != "ok" {
+                    turn_status = outcome.status;
+                    break;
+                }
+                if !has_tools {
+                    sent_this_turn.push(asst_msg);
+                    if fan_calls.is_empty() {
+                        turn_status = "ok".into();
+                        break;
+                    }
+                    // ---- SM parallel fan-out: surface the synthesized
+                    // parallel_branch calls, run every configured parallel
+                    // state concurrently as a subagent, report the results as
+                    // tool messages, then loop for a synthesis round (the
+                    // model sees its "calls" answered).
+                    let def_id_fan = wf[3..].split_once(':').map(|(d, _)| d.to_string()).unwrap_or_default();
+                    for fc in &fan_calls {
+                        let st_name = serde_json::from_str::<Value>(&fc.arguments)
+                            .ok()
+                            .and_then(|a| a.get("state").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        let _ = channel.send(StreamEvent::ToolCall {
+                            lane,
+                            call_id: fc.id.clone(),
+                            name: fc.name.clone(),
+                            args: format!("state={st_name}"),
+                        });
+                    }
+                    let mut fan_tasks: Vec<(String, String)> = Vec::new(); // (call_id, task)
+                    for fc in &fan_calls {
+                        let st_name = serde_json::from_str::<Value>(&fc.arguments)
+                            .ok()
+                            .and_then(|a| a.get("state").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        let directive = chat::resolve_sm(&cfg.workflows, &def_id_fan, &st_name)
+                            .and_then(|(_, st2)| {
+                                let d = st2.directive.trim();
+                                if d.is_empty() { None } else { Some(d.to_string()) }
+                            })
+                            .unwrap_or_default();
+                        let task = if directive.is_empty() {
+                            format!("【工作流并行分支 · {st_name}】请执行该分支状态的工作流任务，完成后输出结果摘要。")
+                        } else {
+                            format!("【工作流并行分支 · {st_name}】{directive}\n\n完成后输出结果摘要。")
+                        };
+                        fan_tasks.push((fc.id.clone(), task));
+                    }
+                    let mut futs = Vec::new();
+                    for (cid, task) in &fan_tasks {
+                        futs.push(run_subagent(
+                            &client,
+                            &data_dir,
+                            &session_id,
+                            task,
+                            None,
+                            &binding,
+                            &cfg,
+                            &channel,
+                            lane,
+                            cid,
+                        ));
+                    }
+                    let results = futures_util::future::join_all(futs).await;
+                    for (fc, res) in fan_calls.iter().zip(results.into_iter()) {
+                        let st_name = serde_json::from_str::<Value>(&fc.arguments)
+                            .ok()
+                            .and_then(|a| a.get("state").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        let result = match res {
+                            Ok(summary) => format!("【并行分支 {st_name} 完成】\n\n{summary}"),
+                            Err(e) => format!("ERROR: 并行分支 {st_name} 失败: {e}"),
+                        };
+                        let preview: String =
+                            result.lines().next().unwrap_or("").chars().take(120).collect();
+                        let _ = channel.send(StreamEvent::ToolResult {
+                            lane,
+                            call_id: fc.id.clone(),
+                            name: fc.name.clone(),
+                            result: preview,
+                        });
+                        let tool_record = MessageRecord {
+                            id: Uuid::new_v4().to_string(),
+                            lane,
+                            role: "tool".into(),
+                            content: result.clone(),
+                            reasoning: None,
+                            ts: next_record_ts(),
+                            model: None,
+                            status: "ok".into(),
+                            usage: None,
+                            cost_usd: None,
+                            confidence: None,
+                            tool_calls: None,
+                            tool_call_id: Some(fc.id.clone()),
+                            skill_calls: None,
+                            workflow: None,
+                            images: Vec::new(),
+                        };
+                        {
+                            let _guard = save_lock.lock().await;
+                            if let Ok(mut sf) = store.load(&session_id) {
+                                sf.messages.push(tool_record);
+                                sf.meta.updated_at = now_ms();
+                                let _ = store.save(&sf);
+                            }
+                        }
+                        sent_this_turn.push(ChatMessage {
+                            role: "tool".into(),
+                            content: result,
+                            tool_calls: None,
+                            tool_call_id: Some(fc.id.clone()),
+                            images: Vec::new(),
+                        });
+                    }
+                    continue; // synthesis round: the model summarizes branches
+                }
+
+                // ---- execute tools, feed results back ----
+                sent_this_turn.push(asst_msg);
+                let mut tool_msgs: Vec<ChatMessage> = Vec::new();
+
+                // ---- pre-scan: this round's delegate_subagent calls run
+                // concurrently. Futures are lazy: they start when joined at
+                // the first delegation's wire position, and results fill back
+                // in that same order. Budget is consumed here so an overflow
+                // call still reports the cap error at its inline position.
+                let mut sub_calls: Vec<(String, String)> = Vec::new(); // (call_id, task)
+                let mut sub_profiles: HashMap<String, Option<crate::config::SubagentProfile>> =
+                    HashMap::new();
+                if tools_on && !plan_mode {
+                    for tc in &outcome.tool_calls {
+                        if tc.name != "delegate_subagent" || delegations >= MAX_DELEGATIONS_PER_TURN {
+                            continue;
+                        }
+                        let task = serde_json::from_str::<Value>(&tc.arguments)
+                            .ok()
+                            .and_then(|a| a.get("task").and_then(|t| t.as_str()).map(|s| s.trim().to_string()))
+                            .unwrap_or_default();
+                        if task.is_empty() {
+                            continue; // reported inline below
+                        }
+                        delegations += 1;
+                        sub_profiles.insert(
+                            tc.id.clone(),
+                            find_subagent_profile(&cfg, &tc.arguments).cloned(),
+                        );
+                        sub_calls.push((tc.id.clone(), task));
+                    }
+                }
+                let mut sub_slots: HashMap<String, usize> = HashMap::new();
+                let mut sub_futs: Option<Vec<_>> = None;
+                if !sub_calls.is_empty() {
+                    let mut futs: Vec<_> = Vec::new();
+                    for (cid, task) in &sub_calls {
+                        sub_slots.insert(cid.clone(), futs.len());
+                        futs.push(run_subagent(
+                            &client,
+                            &data_dir,
+                            &session_id,
+                            task,
+                            sub_profiles.get(cid).and_then(|p| p.as_ref()),
+                            &binding,
+                            &cfg,
+                            &channel,
+                            lane,
+                            cid,
+                        ));
+                    }
+                    sub_futs = Some(futs);
+                }
+                let mut sub_results: Option<Vec<Result<String, String>>> = None;
+
+                for tc in &outcome.tool_calls {
+                    turn_tools.push(tc.name.clone());
+                    // images produced by THIS tool call (take_screenshot):
+                    // filenames for the persisted record + the deterministic
+                    // synthetic user message that carries the payload
+                    let mut rec_images: Vec<String> = Vec::new();
+                    let mut img_user_msgs: Vec<ChatMessage> = Vec::new();
+                    let args_preview: String = tc.arguments.chars().take(160).collect();
+                    let _ = channel.send(StreamEvent::ToolCall {
+                        lane,
+                        call_id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        args: args_preview,
+                    });
+                    let result = if !tools_on {
+                        "ERROR: 工具未启用（会话未绑定工作区，或在设置中关闭了 Agent 工具）".to_string()
+                    } else if plan_mode {
+                        "DENIED: 规划模式下不执行任何工具写入或外部调用——请先输出 ```plan 方案等待用户批准".to_string()
+                    } else if let Some((mcp_sid, mcp_tool)) = crate::mcp::split_tool_name(&tc.name) {
+                        // ---- MCP tool route: trust flag OR per-call approval ----
+                        let cfg2 = config::load(&data_dir);
+                        let decision: Result<bool, String> =
+                            match cfg2.mcp_servers.iter().find(|s| s.id == mcp_sid) {
+                                None => Err("MCP 服务不存在或已移除".into()),
+                                Some(server) => {
+                                    if server.trusted {
+                                        Ok(true)
+                                    } else {
+                                        match serde_json::from_str::<Value>(&tc.arguments) {
+                                            Err(e) => Err(format!("参数不是合法 JSON: {e}")),
+                                            Ok(args) => {
+                                                let approval_id = Uuid::new_v4().to_string();
+                                                let rx = open_approval(&approval_id);
+                                                let _ = channel.send(StreamEvent::ApprovalRequest {
+                                                    lane,
+                                                    approval_id,
+                                                    tool: tc.name.clone(),
+                                                    path: server.name.clone(),
+                                                    preview: format!(
+                                                        "调用 MCP 服务「{}」的工具 {mcp_tool}\n参数：{}",
+                                                        server.name,
+                                                        serde_json::to_string_pretty(&args)
+                                                            .unwrap_or_default()
+                                                    ),
+                                                });
+                                                Ok(matches!(
+                                                    tokio::time::timeout(
+                                                        std::time::Duration::from_secs(APPROVAL_TIMEOUT_SECS),
+                                                        rx
+                                                    )
+                                                    .await,
+                                                    Ok(Ok(true))
+                                                ))
+                                            }
+                                        }
+                                    }
+                                },
+                            };
+                        match decision {
+                            Err(e) => format!("ERROR: {e}"),
+                            Ok(false) => "DENIED: 用户拒绝或审批超时——MCP 工具未执行".to_string(),
+                            Ok(true) => {
+                                let cfg3 = config::load(&data_dir);
+                                match cfg3.mcp_servers.iter().find(|s| s.id == mcp_sid) {
+                                    None => "ERROR: MCP 服务不存在或已移除".to_string(),
+                                    Some(server) => {
+                                        match serde_json::from_str::<Value>(&tc.arguments) {
+                                            Ok(args) => crate::mcp::global()
+                                                .call_tool(server, &mcp_tool, &args)
+                                                .await,
+                                            Err(e) => format!("ERROR: 参数不是合法 JSON: {e}"),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        match serde_json::from_str::<Value>(&tc.arguments) {
+                            Err(e) => format!("ERROR: 参数不是合法 JSON: {e}"),
+                            Ok(args) => {
+                                if tc.name == "delegate_subagent" {
+                                    if let Some(&slot) = sub_slots.get(&tc.id) {
+                                        // pre-spawned concurrent delegation:
+                                        // join once, then read this call's slot
+                                        if sub_results.is_none() {
+                                            let futs = sub_futs.take().expect("delegation futures");
+                                            sub_results = Some(futures_util::future::join_all(futs).await);
+                                        }
+                                        match &sub_results.as_ref().expect("joined results")[slot] {
+                                            Ok(summary) => format!("子任务完成，回报如下：\n\n{summary}"),
+                                            Err(e) => format!("ERROR: 子任务失败: {e}"),
+                                        }
+                                    } else if delegations >= MAX_DELEGATIONS_PER_TURN {
+                                        format!("ERROR: 本轮委派已达上限（{MAX_DELEGATIONS_PER_TURN} 个子任务）")
+                                    } else {
+                                        // pre-scan skipped it ⇒ empty task
+                                        "ERROR: task 不能为空".to_string()
+                                    }
+                                } else if tc.name == "memory_save" || tc.name == "memory_search" {
+                                    // vector long-term memory (async: embeddings
+                                    // API) — workspace-scoped store in data_dir
+                                    let ws = workspace.clone().unwrap_or_default();
+                                    if !cfg.settings.vector_memory {
+                                        "ERROR: 向量长期记忆未启用（设置 → 向量长期记忆）".to_string()
+                                    } else if ws.is_empty() {
+                                        "ERROR: 会话未绑定工作区，无法定位记忆存储".to_string()
+                                    } else if tc.name == "memory_save" {
+                                        let text = args
+                                            .get("text")
+                                            .and_then(|t| t.as_str())
+                                            .unwrap_or("")
+                                            .trim()
+                                            .to_string();
+                                        if text.is_empty() {
+                                            "ERROR: text 不能为空".to_string()
+                                        } else {
+                                            match crate::memvector::remember(&client, &cfg, &data_dir, &ws, &text).await {
+                                                Ok(()) => "OK: 已写入长期记忆".to_string(),
+                                                Err(e) => format!("ERROR: {e}"),
+                                            }
+                                        }
+                                    } else {
+                                        let query = args
+                                            .get("query")
+                                            .and_then(|t| t.as_str())
+                                            .unwrap_or("")
+                                            .trim()
+                                            .to_string();
+                                        let k = args
+                                            .get("k")
+                                            .and_then(|v| v.as_u64())
+                                            .map(|v| (v as usize).clamp(1, 20))
+                                            .unwrap_or(5);
+                                        if query.is_empty() {
+                                            "ERROR: query 不能为空".to_string()
+                                        } else {
+                                            match crate::memvector::embed(
+                                                &client,
+                                                &cfg.settings.embeddings_url.as_str(),
+                                                &cfg.settings.embeddings_key.as_str(),
+                                                &cfg.settings.embeddings_model.as_str(),
+                                                &query,
+                                            )
+                                            .await
+                                            {
+                                                Err(e) => format!("ERROR: {e}"),
+                                                Ok(qv) => {
+                                                    let hits = crate::memvector::search(&data_dir, &ws, &qv, k);
+                                                    if hits.is_empty() {
+                                                        "OK: 记忆库中没有匹配的条目".to_string()
+                                                    } else {
+                                                        let body = hits
+                                                            .iter()
+                                                            .map(|(s, t)| format!("- [{s:.3}] {t}"))
+                                                            .collect::<Vec<_>>()
+                                                            .join("\n");
+                                                        format!("OK:\n{body}")
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if tc.name == "todo_write" {
+                                    // session-scoped task list for the preview
+                                    // panel — no workspace access, no approval
+                                    match serde_json::from_value::<Vec<TodoItem>>(
+                                        args.get("todos").cloned().unwrap_or(Value::Null),
+                                    ) {
+                                        Err(e) => format!("ERROR: todos 参数不合法: {e}"),
+                                        Ok(raw) => {
+                                            if raw.is_empty() {
+                                                save_todos(&data_dir, &session_id, &[]);
+                                                "OK: 任务清单已清空".to_string()
+                                            } else if raw.len() > 20 {
+                                                "ERROR: 任务数超过 20 项上限".to_string()
+                                            } else {
+                                                let todos: Vec<TodoItem> = raw
+                                                    .into_iter()
+                                                    .take(20)
+                                                    .map(|mut t| {
+                                                        t.text = t.text.trim().chars().take(200).collect();
+                                                        if t.text.is_empty() {
+                                                            t.text = "（未命名任务）".into();
+                                                        }
+                                                        match t.status.as_str() {
+                                                            "in_progress" | "done" => {}
+                                                            _ => t.status = "pending".into(),
+                                                        }
+                                                        t
+                                                    })
+                                                    .collect();
+                                                let done = todos.iter().filter(|t| t.status == "done").count();
+                                                save_todos(&data_dir, &session_id, &todos);
+                                                format!("OK: 任务清单已更新（共 {} 项，已完成 {done}）", todos.len())
+                                            }
+                                        }
+                                    }
+                                } else if tc.name == "take_screenshot" {
+                                    // Computer Use "see" primitive: capture
+                                    // the screen, save it into the session's
+                                    // attachment dir and attach the image to
+                                    // the tool result. Privacy: same
+                                    // fail-closed approval gate as write
+                                    // tools (auto/grant bypasses the card).
+                                    let granted = perm_mode == "auto"
+                                        || GRANTS
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .is_some_and(|s| {
+                                                s.contains(&grant_key(&session_id, "take_screenshot"))
+                                            });
+                                    let approved = if granted {
+                                        true
+                                    } else {
+                                        let approval_id = Uuid::new_v4().to_string();
+                                        let rx = open_approval(&approval_id);
+                                        let _ = channel.send(StreamEvent::ApprovalRequest {
+                                            lane,
+                                            approval_id: approval_id.clone(),
+                                            tool: "take_screenshot".into(),
+                                            path: "（整个屏幕）".into(),
+                                            preview: crate::agent_tools::approval_preview(
+                                                "",
+                                                "take_screenshot",
+                                                &args,
+                                            ),
+                                        });
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(APPROVAL_TIMEOUT_SECS),
+                                            rx,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(true)) => true,
+                                            _ => false,
+                                        }
+                                    };
+                                    if approved {
+                                        match crate::agent_tools::take_screenshot(&data_dir, &session_id) {
+                                            Ok((text, shots)) => {
+                                                for s in &shots {
+                                                    rec_images.push(s.filename.clone());
+                                                }
+                                                img_user_msgs.push(ChatMessage::with_images(
+                                                    "user",
+                                                    chat::TOOL_IMAGE_NOTE,
+                                                    shots
+                                                        .into_iter()
+                                                        .map(|s| crate::prefix::ChatImage {
+                                                            mime: s.mime,
+                                                            b64: s.b64,
+                                                        })
+                                                        .collect(),
+                                                ));
+                                                text
+                                            }
+                                            Err(e) => format!("ERROR: {e}"),
+                                        }
+                                    } else {
+                                        "DENIED: 用户拒绝或审批超时（120 秒）——未截取屏幕".to_string()
+                                    }
+                                } else if goal_mode
+                                    && matches!(
+                                        tc.name.as_str(),
+                                        "get_goal" | "create_goal" | "update_goal"
+                                    )
+                                {
+                                    handle_goal_tool(&data_dir, &session_id, &tc.name, &args)
+                                } else if !crate::agent_tools::is_write_tool(&tc.name) {
+                                    crate::agent_tools::execute(
+                                        workspace.as_deref().unwrap_or(""),
+                                        &tc.name,
+                                        &args,
+                                    )
+                                } else if perm_mode == "readonly" || plan_mode {
+                                    "DENIED: 当前为只读或规划模式，写入工具不可用".to_string()
+                                } else {
+                                    // ---- approval gate (fail-closed) ----
+                                    // "auto" mode skips the card; still
+                                    // workspace-bound, still session-scoped
+                                    let granted = perm_mode == "auto"
+                                        || GRANTS
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .is_some_and(|s| s.contains(&grant_key(&session_id, &tc.name)));
+                                    let approved = if granted {
+                                        true
+                                    } else {
+                                        let approval_id = Uuid::new_v4().to_string();
+                                        let path = args
+                                            .get("path")
+                                            .and_then(|p| p.as_str())
+                                            .or_else(|| args.get("command").and_then(|c| c.as_str()))
+                                            .or_else(|| args.get("from").and_then(|f| f.as_str()))
+                                            .unwrap_or("?")
+                                            .to_string();
+                                        let rx = open_approval(&approval_id);
+                                        let _ = channel.send(StreamEvent::ApprovalRequest {
+                                            lane,
+                                            approval_id: approval_id.clone(),
+                                            tool: tc.name.clone(),
+                                            path,
+                                            preview: crate::agent_tools::approval_preview(
+                                                workspace.as_deref().unwrap_or(""),
+                                                &tc.name,
+                                                &args,
+                                            ),
+                                        });
+                                        // 120s deny — a dropped channel denies too
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(APPROVAL_TIMEOUT_SECS),
+                                            rx,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(true)) => true,
+                                            _ => false,
+                                        }
+                                    };
+                                    if approved {
+                                        // review-panel capture: before/after
+                                        // snapshots of the target file (only
+                                        // for file tools — run_command has none)
+                                        let rel =
+                                            args.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                                        let abs = if rel.is_empty() {
+                                            None
+                                        } else {
+                                            crate::agent_tools::resolve_in_workspace(
+                                                workspace.as_deref().unwrap_or(""),
+                                                &rel,
+                                            )
+                                            .ok()
+                                        };
+                                        let snap = |p: &std::path::Path| -> Option<String> {
+                                            std::fs::read_to_string(p).ok().map(|s| {
+                                                s.chars().take(WRITE_LOG_CAP).collect::<String>()
+                                            })
+                                        };
+                                        let before = abs.as_ref().and_then(|p| snap(p));
+                                        let exec = crate::agent_tools::execute_write(
+                                            workspace.as_deref().unwrap_or(""),
+                                            &tc.name,
+                                            &args,
+                                        );
+                                        if exec.starts_with("OK") && !rel.is_empty() {
+                                            let after = abs.as_ref().and_then(|p| snap(p));
+                                            let log = crate::types_rs::WriteLog {
+                                                ts: next_record_ts(),
+                                                tool: tc.name.clone(),
+                                                path: rel,
+                                                before,
+                                                after,
+                                            };
+                                            let _guard = save_lock.lock().await;
+                                            if let Ok(mut sf) = store.load(&session_id) {
+                                                sf.writes.push(log);
+                                                if sf.writes.len() > 200 {
+                                                    sf.writes.drain(..sf.writes.len() - 200);
+                                                }
+                                                sf.meta.updated_at = now_ms();
+                                                let _ = store.save(&sf);
+                                            }
+                                        }
+                                        exec
+                                    } else {
+                                        "DENIED: 用户拒绝或审批超时（120 秒）——本次写入未执行".into()
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    // guardrails: fence untrusted external content (fetched
+                    // pages, MCP tool results) as data — opt-in via settings
+                    let result = if cfg.settings.guardrails
+                        && (tc.name == "web_fetch" || crate::mcp::split_tool_name(&tc.name).is_some())
+                        && !result.starts_with("ERROR:")
+                        && !result.starts_with("DENIED:")
+                    {
+                        let source = match crate::mcp::split_tool_name(&tc.name) {
+                            Some((sid, tool)) => {
+                                let sname = config::load(&data_dir)
+                                    .mcp_servers
+                                    .iter()
+                                    .find(|s| s.id == sid)
+                                    .map(|s| s.name.clone())
+                                    .unwrap_or_else(|| sid.clone());
+                                format!("MCP 服务「{sname}」的 {tool} 结果")
+                            }
+                            None => format!(
+                                "网页 {}",
+                                serde_json::from_str::<Value>(&tc.arguments)
+                                    .ok()
+                                    .and_then(|a| {
+                                        a.get("url").and_then(|u| u.as_str()).map(|s| s.to_string())
+                                    })
+                                    .unwrap_or_default()
+                            ),
+                        };
+                        crate::guard::wrap_untrusted(&source, &result, &cfg.settings.guardrails_extra)
+                    } else {
+                        result
+                    };
+                    let result_preview: String = result.lines().next().unwrap_or("").chars().take(120).collect();
+                    let _ = channel.send(StreamEvent::ToolResult {
+                        lane,
+                        call_id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        result: result_preview,
+                    });
+                    let tool_record = MessageRecord {
+                        id: Uuid::new_v4().to_string(),
+                        lane,
+                        role: "tool".into(),
+                        content: result.clone(),
+                        reasoning: None,
+                        ts: next_record_ts(),
+                        model: None,
+                        status: "ok".into(),
+                        usage: None,
+                        cost_usd: None,
+                        confidence: None,
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                        skill_calls: None,
+                        workflow: None,
+                        images: rec_images,
+                    };
+                    {
+                        let _guard = save_lock.lock().await;
+                        if let Ok(mut sf) = store.load(&session_id) {
+                            sf.messages.push(tool_record);
+                            sf.meta.updated_at = now_ms();
+                            let _ = store.save(&sf);
+                        }
+                    }
+                    tool_msgs.push(ChatMessage {
+                        role: "tool".into(),
+                        content: result,
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                        images: Vec::new(),
+                    });
+                    tool_msgs.extend(img_user_msgs);
+                }
+                sent_this_turn.extend(tool_msgs);
+                // continue to the next round: the model sees tool results
+            }
+
+            // Zone T falls into Zone H for the next user turn
+            if turn_status != "error" {
+                let mut guard = prefixes_lock();
+                if let Some(map) = guard.as_mut() {
+                    if let Some(lp) = map.get_mut(&(session_id.clone(), lane)) {
+                        for m in &sent_this_turn {
+                            lp.append(m);
+                        }
+                    }
+                }
+            } else {
+                // an errored turn's tail never enters Zone H — drop the
+                // span marker so the next request isn't judged against bytes
+                // we deliberately discarded
+                if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+                    map.remove(&(session_id.clone(), lane));
+                }
+            }
+
+            // State-machine auto-advance: only lane 0 (the shared user lane —
+            // arena side-lanes must not move the machine), only on a fully ok
+            // turn, and only from the state this turn actually ran under.
+            // Terminal states stop; a state without `next` holds position
+            // (the user can jump manually from the progress bar).
+            if lane == 0 && turn_status == "ok" && wf.starts_with("sm:") {
+                if let Some((def_id, state_name)) = wf[3..].split_once(':') {
+                    if let Some((def, st)) = chat::resolve_sm(&cfg.workflows, def_id, state_name) {
+                        if !st.terminal {
+                            // conditional branches first: the FIRST matching
+                            // rule wins (evaluated against this turn's reply
+                            // text, tools used, and status); fall back to
+                            // `next` when no rule matches.
+                            let hit = st
+                                .branches
+                                .iter()
+                                .find(|b| {
+                                    chat::eval_when(&b.when, &turn_text, &turn_tools, &turn_status)
+                                })
+                                .map(|b| b.goto.clone());
+                            let target = hit.or_else(|| st.next.clone());
+                            if let Some(nx) = target {
+                                if def.states.iter().any(|s| s.name == nx) {
+                                    let gate = format!("sm:{def_id}:{nx}");
+                                    sm_put(&session_id, &gate);
+                                    // checkpoint so a restart resumes the
+                                    // machine at the auto-advanced state
+                                    persist_gate(&data_dir, &session_id, Some(&gate));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Auto-reflection gate decided BEFORE Done moves turn_status.
+            let do_reflect = lane == 0
+                && turn_status == "ok"
+                && cfg.settings.vector_memory
+                && cfg.settings.auto_reflect
+                && !cfg.settings.embeddings_url.trim().is_empty();
+
+            let _ = channel.send(StreamEvent::Done {
+                lane,
+                message_id: last_message_id,
+                status: turn_status,
+                confidence: last_confidence,
+            });
+
+            // Auto-reflection (#settings.auto_reflect): on a successful main
+            // lane turn, distill durable facts in the background and write
+            // them into vector memory. Fully async + silent: never blocks or
+            // errors the finished turn.
+            if do_reflect {
+                let ws = sf_snapshot.meta.workspace.clone().unwrap_or_default();
+                let user_text = sf_snapshot
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                if !ws.is_empty() && !user_text.is_empty() && !turn_text.trim().is_empty() {
+                    let client = client.clone();
+                    let cfg2 = cfg.clone();
+                    let binding2 = binding.clone();
+                    let data_dir2 = data_dir.clone();
+                    let reply_text = turn_text.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(provider) = resolve_provider(&cfg2, &binding2) {
+                            crate::memvector::reflect_and_remember(
+                                &client,
+                                &cfg2,
+                                provider,
+                                &binding2.model,
+                                &user_text,
+                                &reply_text,
+                                &data_dir2,
+                                &ws,
+                            )
+                            .await;
+                        }
+                    });
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+    state.stops.lock().unwrap().remove(&session_id);
+
+    // AuxMemo application: auto-title (whitelist kind "title"). Fires once
+    // per session when the first exchange finished; served from the exact
+    // cache when the same first exchange was titled before.
+    if !arena {
+        let cfg = config::load(&state.data_dir);
+        let client = state.client.clone();
+        let data_dir = state.data_dir.clone();
+        let sid = session_id.clone();
+        tauri::async_runtime::spawn(async move {
+            let store = SessionStore::new(&data_dir);
+            let Ok(sf) = store.load(&sid) else { return };
+            if sf.meta.title != "新会话" || sf.messages.len() < 2 {
+                return;
+            }
+            // image sessions: the binding is an image model — chat title-gen
+            // would call chat/completions with it; derive from the prompt
+            if workflow_of_in(&sid, &data_dir) == "image" {
+                let t: String = sf
+                    .messages
+                    .iter()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default()
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(16)
+                    .collect();
+                if !t.is_empty() {
+                    let _ = store.rename(&sid, &t);
+                }
+                return;
+            }
+            let Some(binding) = sf.meta.bindings.first().cloned() else { return };
+            let Some(provider) = resolve_provider(&cfg, &binding) else { return };
+            let provider = provider.clone();
+            let ns = crate::auxmemo::namespace(sf.meta.workspace.as_deref());
+            let u = sf.messages.iter().find(|m| m.role == "user").map(|m| m.content.clone()).unwrap_or_default();
+            let a = sf.messages.iter().find(|m| m.role == "assistant").map(|m| m.content.clone()).unwrap_or_default();
+            let clip = |s: String, n: usize| s.chars().take(n).collect::<String>();
+            let input = format!("用户: {}\n\n助手: {}", clip(u, 600), clip(a, 600));
+            let key = crate::auxmemo::compute_key("title", &binding.model, &provider.base_url, &input, &ns);
+            let title = match crate::auxmemo::get(&data_dir, &key, &ns) {
+                Some((e, origin)) => {
+                    crate::auxmemo::record_hit(&data_dir, "title", &e, origin);
+                    e.text
+                }
+                None => {
+                    let Ok(outcome) = chat::complete_once(
+                        &client,
+                        &provider,
+                        &binding.model,
+                        "你是标题生成器。根据对话节选生成一个不超过 12 个字的中文标题，概括主题。只输出标题本身，不要引号、句号或任何前后缀。",
+                        &input,
+                    )
+                    .await
+                    else {
+                        return; // silent: titles are best-effort
+                    };
+                    let cost = chat::cost_of(&outcome.usage, &provider, &binding.model);
+                    let t: String = outcome
+                        .text
+                        .trim()
+                        .chars()
+                        .filter(|c| !c.is_whitespace() && *c != '"' && *c != '“' && *c != '”')
+                        .take(24)
+                        .collect();
+                    if t.is_empty() {
+                        return;
+                    }
+                    crate::auxmemo::put(
+                        &data_dir,
+                        &key,
+                        &ns,
+                        &crate::auxmemo::EntryMeta {
+                            text: t.clone(),
+                            model: binding.model.clone(),
+                            in_tok: outcome.usage.input,
+                            out_tok: outcome.usage.output,
+                            cost_usd: cost,
+                        },
+                    );
+                    crate::auxmemo::record_miss(
+                        &data_dir,
+                        "title",
+                        &binding.model,
+                        outcome.usage.input,
+                        outcome.usage.output,
+                        cost,
+                    );
+                    t
+                }
+            };
+            let _ = store.rename(&sid, &title);
+        });
+    }
+    Ok(())
+}
+
+// ---------- Review panel ----------
+
+#[derive(Serialize)]
+pub struct WriteLogEntry {
+    pub ts: u64,
+    pub tool: String,
+    pub path: String,
+}
+
+/// Metadata list of this session's successful workspace writes (newest
+/// first). Full before/after snapshots are fetched per entry on demand.
+#[tauri::command]
+pub fn list_session_writes(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<WriteLogEntry>, String> {
+    let sf = state.store.load(&session_id)?;
+    Ok(sf
+        .writes
+        .iter()
+        .rev()
+        .map(|w| WriteLogEntry { ts: w.ts, tool: w.tool.clone(), path: w.path.clone() })
+        .collect())
+}
+
+#[tauri::command]
+pub fn get_write_diff(
+    state: State<'_, AppState>,
+    session_id: String,
+    ts: u64,
+) -> Result<Option<crate::types_rs::WriteLog>, String> {
+    let sf = state.store.load(&session_id)?;
+    Ok(sf.writes.into_iter().find(|w| w.ts == ts))
+}
+
+// ---------- worktree isolation ----------
+
+/// One changed file inside the session's isolation worktree.
+#[derive(Serialize)]
+pub struct WtFileInfo {
+    /// Porcelain status letter: M/A/D/R/U/?.
+    pub status: String,
+    /// Workspace-relative path.
+    pub path: String,
+}
+
+/// Isolation status for the composer capsule: the active WtState (if any)
+/// plus the worktree's changed-file list (badge count).
+#[derive(Serialize)]
+pub struct WtInfo {
+    pub wt: Option<crate::types_rs::WtState>,
+    pub files: Vec<WtFileInfo>,
+}
+
+/// Enable worktree isolation: create a git worktree on its own branch off
+/// the workspace's current HEAD. Every agent tool is redirected into it
+/// until the user merges (wt_merge) or discards (wt_discard). The main
+/// workspace must be clean first, so a later `git apply` can't collide.
+#[tauri::command]
+pub fn wt_start(state: State<'_, AppState>, session_id: String) -> Result<crate::types_rs::WtState, String> {
+    let sf = state.store.load(&session_id)?;
+    if sf.meta.wt.is_some() {
+        return Err("该会话已处于 worktree 隔离中".into());
+    }
+    let Some(ws) = sf.meta.workspace.clone() else {
+        return Err("会话未绑定工作区 —— 请先绑定一个目录再开启隔离".into());
+    };
+    if !crate::worktree::is_git_repo(&ws) {
+        return Err("工作区不是 git 仓库 —— 请先在目录中执行 git init 并提交".into());
+    }
+    if !crate::worktree::is_clean(&ws) {
+        return Err("主工作区有未提交的改动 —— 请先提交或 stash 再开启隔离".into());
+    }
+    let st = crate::worktree::create(&ws, &state.data_dir, &session_id)?;
+    state.store.set_wt(&session_id, Some(st.clone()))?;
+    Ok(st)
+}
+
+/// Read-only isolation status: active WtState + changed-file list.
+#[tauri::command]
+pub fn wt_info(state: State<'_, AppState>, session_id: String) -> WtInfo {
+    let wt = state.store.load(&session_id).ok().and_then(|sf| sf.meta.wt);
+    let files = match &wt {
+        Some(w) => crate::worktree::changed_files(w)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(status, path)| WtFileInfo { status, path })
+            .collect(),
+        None => Vec::new(),
+    };
+    WtInfo { wt, files }
+}
+
+/// Full plain-text diff of the isolation branch vs its base commit
+/// (stages untracked files first; binary files show as "differ" lines).
+#[tauri::command]
+pub fn wt_diff(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
+    let wt = state
+        .store
+        .load(&session_id)?
+        .meta
+        .wt
+        .ok_or("当前未开启 worktree 隔离")?;
+    crate::worktree::diff_text(&wt)
+}
+
+/// Merge the isolation branch back into the main workspace as working-tree
+/// edits (git apply of the full binary diff), then remove worktree + branch.
+/// Fail-closed: on any apply error the worktree is kept untouched.
+#[tauri::command]
+pub fn wt_merge(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
+    let sf = state.store.load(&session_id)?;
+    let ws = sf.meta.workspace.clone().ok_or("会话未绑定工作区")?;
+    let wt = sf.meta.wt.ok_or("当前未开启 worktree 隔离")?;
+    let summary = crate::worktree::merge(&wt, &ws)?;
+    state.store.set_wt(&session_id, None)?;
+    Ok(summary)
+}
+
+/// Discard the isolation branch and worktree — every change made inside the
+/// worktree is thrown away (the frontend confirms before calling this).
+#[tauri::command]
+pub fn wt_discard(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    let sf = state.store.load(&session_id)?;
+    let ws = sf.meta.workspace.clone().ok_or("会话未绑定工作区")?;
+    let wt = sf.meta.wt.ok_or("当前未开启 worktree 隔离")?;
+    crate::worktree::discard(&wt, &ws)?;
+    state.store.set_wt(&session_id, None)?;
+    Ok(())
+}
+
+// ---------- AuxMemo: prompt enhancement (whitelist kind "enhance") ----------
+
+#[derive(Serialize)]
+pub struct EnhanceOutcome {
+    pub text: String,
+    /// "l1" | "l2" | "miss"
+    pub origin: String,
+    pub model: String,
+}
+
+const ENHANCE_INPUT_CAP: usize = 4_000;
+const ENHANCE_SYSTEM: &str = "你是提示词工程师。把用户的草稿改写为一条更清晰的最终提示词：补全缺失的上下文与目标、明确输出要求与格式、去除口语化和冗余；但不得添加草稿中不存在的新事实或新要求，保持用户原意与原语言。只输出改写后的提示词本身，不要任何解释、引号或前后缀。";
+
+/// Enhance the composer draft with the session's bound model. Whitelisted
+/// for AuxMemo: input fully determines output, no side effects, the result
+/// never enters model context without an explicit user "apply" in the UI.
+#[tauri::command]
+pub async fn enhance_prompt(
+    state: State<'_, AppState>,
+    session_id: String,
+    draft: String,
+) -> Result<EnhanceOutcome, String> {
+    let draft: String = draft.trim().chars().take(ENHANCE_INPUT_CAP).collect();
+    if draft.is_empty() {
+        return Err("草稿为空".into());
+    }
+    let sf = state.store.load(&session_id)?;
+    let binding = sf.meta.bindings.first().cloned().ok_or("会话未绑定模型")?;
+    let cfg = config::load(&state.data_dir);
+    let provider = resolve_provider(&cfg, &binding).cloned().ok_or("Provider 未配置或未填 API Key")?;
+    let ns = crate::auxmemo::namespace(sf.meta.workspace.as_deref());
+    let key = crate::auxmemo::compute_key("enhance", &binding.model, &provider.base_url, &draft, &ns);
+
+    if let Some((e, origin)) = crate::auxmemo::get(&state.data_dir, &key, &ns) {
+        crate::auxmemo::record_hit(&state.data_dir, "enhance", &e, origin);
+        return Ok(EnhanceOutcome { text: e.text, origin: origin.as_str().into(), model: e.model });
+    }
+
+    let outcome = chat::complete_once(&state.client, &provider, &binding.model, ENHANCE_SYSTEM, &draft).await?;
+    let text = outcome.text.trim().to_string();
+    if text.is_empty() {
+        return Err("增强结果为空".into());
+    }
+    let cost = chat::cost_of(&outcome.usage, &provider, &binding.model);
+    crate::auxmemo::put(
+        &state.data_dir,
+        &key,
+        &ns,
+        &crate::auxmemo::EntryMeta {
+            text: text.clone(),
+            model: binding.model.clone(),
+            in_tok: outcome.usage.input,
+            out_tok: outcome.usage.output,
+            cost_usd: cost,
+        },
+    );
+    crate::auxmemo::record_miss(
+        &state.data_dir,
+        "enhance",
+        &binding.model,
+        outcome.usage.input,
+        outcome.usage.output,
+        cost,
+    );
+    Ok(EnhanceOutcome { text, origin: "miss".into(), model: binding.model })
+}
+
+/// Aggregated AuxMemo ledger for the telemetry panel (per-kind counters +
+/// the most recent rows, newest first).
+#[tauri::command]
+pub fn get_aux_stats(state: State<'_, AppState>) -> crate::auxmemo::AuxStats {
+    crate::auxmemo::stats(&state.data_dir)
+}
+
+#[cfg(test)]
+mod goal_tests {
+    use super::parse_goal_summary;
+
+    #[test]
+    fn parses_last_goal_block_only() {
+        let content = "开头一个旧清单 ```goal\n✅ 旧一\n⬜ 旧二\n``` 中间说明，最终交付清单：\n```goal\n✅ 标准一\n⬜ 标准二\n⬜ 标准三\n```";
+        assert_eq!(parse_goal_summary(content), (1, 3, false));
+    }
+
+    #[test]
+    fn detects_goal_done_marker() {
+        let content = "全部完成：\n```goal\n✅ a\n✅ b\nGOAL_DONE\n```";
+        assert_eq!(parse_goal_summary(content), (2, 2, true));
+    }
+
+    #[test]
+    fn unterminated_block_counts_to_end() {
+        // 缺收尾围栏时取块尾之后的所有内容（与实现一致）。
+        let content = "```goal\n✅ a\n⬜ b\n";
+        assert_eq!(parse_goal_summary(content), (1, 2, false));
+    }
+
+    #[test]
+    fn no_block_yields_zeroes() {
+        assert_eq!(parse_goal_summary("没有任何清单"), (0, 0, false));
+        assert_eq!(parse_goal_summary(""), (0, 0, false));
+    }
+
+    #[test]
+    fn progress_notes_without_marker_not_counted() {
+        // 无 ✅/⬜ 前缀的进展说明行不计入总数。
+        let content = "```goal\n已完成编译检查\n测试全部通过\n```";
+        assert_eq!(parse_goal_summary(content), (0, 0, false));
+    }
+}
