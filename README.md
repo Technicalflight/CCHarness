@@ -13,6 +13,8 @@
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
 ![Rust](https://img.shields.io/badge/Rust-12k%2B%20lines-DEA584?logo=rust&logoColor=white)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-important.svg?logo=gnu)](./LICENSE)
+[![License: Commercial](https://img.shields.io/badge/License-Commercial%20Contact-white.svg?logo=github)](https://github.com/Technicalflight/CCHarness/issues)
 
 </div>
 
@@ -217,8 +219,14 @@ src-tauri/              Rust 后端
 
 本项目在 AI 模型协作下开发。
 
-## 许可
+## 许可证 / License
 
-Copyright (c) 2026 CCHarness Authors. All rights reserved.
+CCHarness is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**, available at <https://www.gnu.org/licenses/agpl-3.0.html> — see the [LICENSE](./LICENSE) file for the full text.
 
-本项目暂未选择开源许可证，**保留所有权利**：未经作者书面许可，不得复制、修改或分发本仓库内容。
+Use of CCHarness for **commercial purposes is permitted**, subject to full compliance with the terms and conditions of the AGPL-3.0 license — including its network-use clause: if you modify CCHarness and offer it as a network service, you must make the complete corresponding source code available to the users of that service.
+
+Should you require a **commercial license** that provides an exemption from the AGPL-3.0 requirements (e.g. closed-source or internal deployment without the source-disclosure obligations), please open an issue at <https://github.com/Technicalflight/CCHarness/issues> to contact the author.
+
+---
+
+中文说明：本项目社区版采用 **AGPL-3.0** 许可证。你可以自由地使用、学习、修改和分发本项目（包括商业用途），但必须完整遵守 AGPL-3.0 全部条款——尤其是**网络服务条款**：修改后的版本若以网络服务形式提供给他人使用，必须向使用者提供完整的对应源代码。如需**豁免上述开源义务的商业授权**（如闭源部署、OEM 集成），请通过 [GitHub Issues](https://github.com/Technicalflight/CCHarness/issues) 联系作者洽谈。
