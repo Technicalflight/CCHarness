@@ -63,23 +63,20 @@ fn unknown(current: &str, error: String) -> UpdateInfo {
 }
 
 /// Query the latest published GitHub release and compare it with the running
-/// version. `token` (optional, from settings) enables checking releases of a
-/// private repository.
+/// version. The repository is public, so the check is anonymous (GitHub's
+/// unauthenticated rate limit is ample for a manual / daily check).
 #[tauri::command]
-pub async fn check_update(token: String) -> Result<UpdateInfo, String> {
+pub async fn check_update() -> Result<UpdateInfo, String> {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let url = "https://api.github.com/repos/Technicalflight/CCHarness/releases/latest";
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut req = client
+    let req = client
         .get(url)
         .header("User-Agent", format!("CCHarness/{current}"))
         .header("Accept", "application/vnd.github+json");
-    if !token.trim().is_empty() {
-        req = req.bearer_auth(token.trim());
-    }
     let info = match req.send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<GhRelease>().await {
             Ok(rel) => UpdateInfo {
@@ -95,11 +92,11 @@ pub async fn check_update(token: String) -> Result<UpdateInfo, String> {
         },
         Ok(resp) => {
             let msg = if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                "未找到 Releases（仓库不存在，或为私有仓库且未在设置中配置访问令牌）".into()
+                "未找到 Releases（仓库不存在或尚无已发布版本）".into()
             } else if resp.status() == reqwest::StatusCode::FORBIDDEN {
-                "GitHub API 限流或令牌无读取权限".into()
+                "GitHub API 限流，请稍后再试".into()
             } else if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-                "访问令牌无效或已过期".into()
+                "GitHub API 认证异常".into()
             } else {
                 format!("GitHub API 返回 {}", resp.status())
             };

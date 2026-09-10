@@ -67,10 +67,10 @@ export async function openExternal(url: string): Promise<void> {
   await invoke("open_external", { url });
 }
 
-/** Check GitHub Releases for a newer version. `token` (settings
- *  `update_token`) is only needed for private-repository releases. */
-export async function checkUpdate(token: string): Promise<UpdateInfo> {
-  return invoke<UpdateInfo>("check_update", { token });
+/** Check GitHub Releases for a newer version (anonymous — the repository
+ *  is public). */
+export async function checkUpdate(): Promise<UpdateInfo> {
+  return invoke<UpdateInfo>("check_update");
 }
 
 export async function getTodos(sessionId: string): Promise<TodoItem[]> {

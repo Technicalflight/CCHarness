@@ -19,7 +19,7 @@
 </div>
 
 > [!IMPORTANT]
-> CCHarness 处于早期开发阶段（v0.1.x），数据格式与接口随时可能变化。本仓库当前为**私有项目**，未经作者许可请勿分发。
+> CCHarness 处于早期开发阶段（v0.1.x），数据格式与接口随时可能变化。项目基于 **AGPL-3.0** 开源——欢迎 Star、Issue 与 PR。
 
 CCHarness 是一个自带模型（BYOM）的桌面工作台：一个界面管理多家 Provider，流式多会话对话，六种工作流模式按任务切换，真实智能体循环直接读写你的工作区——并且把**前缀缓存命中率**当作一级指标内置在遥测面板里。
 
@@ -209,9 +209,10 @@ src-tauri/              Rust 后端
 
 ## 项目状态
 
-- 当前版本 v0.1.1，处于快速迭代期，更新日志见 [Releases](https://github.com/Technicalflight/CCHarness/releases)；
-- v0.1.1 新增：应用内更新检查（侧边栏版本号 / 启动自动检查）、macOS / Linux 下的 Key 等价保护（钥匙串 / 密钥环保存主密钥 + AES-256-GCM 加密落盘）；
-- 路线图：RAG 知识库管线、A2A 协议接入。
+- 当前版本 v0.1.2，处于快速迭代期，更新日志见 [Releases](https://github.com/Technicalflight/CCHarness/releases)；
+- v0.1.2：仓库公开开源（AGPL-3.0）；应用内更新检查开箱即用——移除设置页的 GitHub 访问令牌配置，匿名即可检查；
+- v0.1.1：应用内更新检查（侧边栏版本号 / 启动自动检查）、macOS / Linux 下的 Key 等价保护（钥匙串 / 密钥环保存主密钥 + AES-256-GCM 加密落盘）；
+- 路线图：RAG 知识库管线、A2A 协议接入、签名自动更新器。
 
 ## Built on open source
 

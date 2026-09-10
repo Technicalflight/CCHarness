@@ -58,8 +58,6 @@ export interface AppSettings {
   /** Goal-mode soft budget (USD, per session): reaching it turns the next
    *  auto-continue into a wrap-up nudge, then stops. Null = unlimited. */
   goal_budget_usd?: number | null;
-  /** GitHub token for the in-app update check (private repos). Sealed at rest. */
-  update_token?: string;
 }
 
 /** Result of an update check (backend `check_update`). */

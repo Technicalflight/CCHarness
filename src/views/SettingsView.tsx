@@ -186,20 +186,9 @@ export function SettingsView() {
               启动时自动检查更新（每 24 小时最多一次，仅提示、不自动下载）
             </span>
           </div>
-          <label style={{ fontSize: 12, color: "var(--text-dim)", display: "block", marginBottom: 8 }}>
-            GitHub 访问令牌（Releases 在私有仓库时检查更新需要；留空仅检查公开仓库）
-            <input
-              className="input mono"
-              type="password"
-              style={{ display: "block", marginTop: 4, width: "100%" }}
-              value={config.settings.update_token ?? ""}
-              placeholder="github_pat_… / ghp_…"
-              onChange={(e) => update({ update_token: e.target.value })}
-            />
-          </label>
           <div className="hint" style={{ marginBottom: 10 }}>
-            令牌仅用于读取 Releases 元数据，随 API Key 一同加密存储（macOS 钥匙串 / Linux
-            密钥环 / Windows DPAPI）。
+            更新数据来自公开仓库的 GitHub Releases，无需任何配置。发现新版本后会提示前往
+            Releases 页面手动下载安装。
           </div>
           <div className="row" style={{ gap: 8 }}>
             <button

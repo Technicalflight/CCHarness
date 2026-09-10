@@ -123,11 +123,6 @@ pub struct AppSettings {
     /// None = unlimited. Enforced frontend-side (cost data lives in records).
     #[serde(default)]
     pub goal_budget_usd: Option<f64>,
-    /// GitHub access token used only by the in-app update check — needed
-    /// when the releases live in a private repository. Sealed at rest like
-    /// API keys.
-    #[serde(default)]
-    pub update_token: String,
 }
 
 impl Default for AppSettings {
@@ -148,7 +143,6 @@ impl Default for AppSettings {
             guardrails: false,
             guardrails_extra: Vec::new(),
             goal_budget_usd: None,
-            update_token: String::new(),
         }
     }
 }
@@ -594,7 +588,6 @@ pub fn load(data_dir: &Path) -> AppConfig {
     for p in &mut cfg.providers {
         p.api_key = unprotect_api_key(&p.api_key);
     }
-    cfg.settings.update_token = unprotect_api_key(&cfg.settings.update_token);
     cfg
 }
 
@@ -605,7 +598,6 @@ pub fn save(data_dir: &Path, cfg: &AppConfig) {
     for p in &mut out.providers {
         p.api_key = protect_api_key(&p.api_key);
     }
-    out.settings.update_token = protect_api_key(&out.settings.update_token);
     // atomic-ish: write temp then rename
     let path = config_path(data_dir);
     let tmp = data_dir.join("config.json.tmp");

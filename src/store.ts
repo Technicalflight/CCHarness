@@ -348,8 +348,7 @@ export const useApp = create<AppState>((set, get) => ({
     set({ updateChecking: true });
     if (openDialog) set({ updateDialogOpen: true });
     try {
-      const token = get().config?.settings?.update_token ?? "";
-      const info = await api.checkUpdate(token);
+      const info = await api.checkUpdate();
       set({ updateInfo: info });
       if (info.update_available && !openDialog) {
         get().toast(
