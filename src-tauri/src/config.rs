@@ -433,22 +433,21 @@ pub fn protect_api_key(plain: &str) -> String {
 /// Unseal a stored key. Unrecognized (plaintext) values pass through, which
 /// transparently migrates pre-encryption configs on their next save.
 pub fn unprotect_api_key(stored: &str) -> String {
-    if let Some(rest) = stored.strip_prefix(KEY_MARK) {
+    match stored.strip_prefix(KEY_MARK) {
         #[cfg(windows)]
-        {
-            return hex::decode(rest)
-                .ok()
-                .and_then(|blob| dpapi_unprotect(&blob).ok())
-                .and_then(|b| String::from_utf8(b).ok())
-                .unwrap_or_else(|| {
-                    eprintln!("[config] api-key unseal failed; key must be re-entered");
-                    String::new()
-                });
-        }
-        #[allow(unreachable_code)]
-        return String::new();
+        Some(rest) => hex::decode(rest)
+            .ok()
+            .and_then(|blob| dpapi_unprotect(&blob).ok())
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_else(|| {
+                eprintln!("[config] api-key unseal failed; key must be re-entered");
+                String::new()
+            }),
+        // DPAPI blobs cannot be unsealed off-Windows; force re-entry.
+        #[cfg(not(windows))]
+        Some(_) => String::new(),
+        None => stored.to_string(),
     }
-    stored.to_string()
 }
 
 pub fn load(data_dir: &Path) -> AppConfig {
