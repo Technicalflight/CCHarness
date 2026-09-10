@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>工作流模式 | CCHarness 指南</title>
+  <meta name="description" content="CCHarness 六种工作流模式：智能体、规划、目标、深度推理、生图与自定义状态机——会话即工作流，一个下拉随时切换。" />
+  <link rel="icon" type="image/png" href="../logo.png" />
+  <script>(function(){var t;try{t=localStorage.getItem("cch-theme")}catch(e){}if(!t){t=window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"}document.documentElement.setAttribute("data-theme",t)})()</script>
+  <link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+
+  <header class="navbar">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">
+        <img src="../logo.png" alt="CCHarness logo" width="24" height="24" />
+        <b>CCHarness</b>
+      </a>
+      <nav class="nav-links">
+        <a href="../index.html">首页</a>
+        <a href="../index.html#features">特性</a>
+        <a href="../index.html#workflow">工作方式</a>
+        <a href="index.html" class="on">指南</a>
+        <a href="install.html">下载安装</a>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="nav-actions">
+        <button class="theme-toggle" id="themeToggle" aria-label="切换明暗主题">
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        </button>
+        <a class="btn btn-primary btn-sm nav-cta" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">免费下载</a>
+        <button class="nav-burger" id="navBurger" aria-label="打开菜单"><span></span><span></span><span></span></button>
+      </div>
+    </div>
+  </header>
+
+  <div class="docs">
+    <aside class="sidebar">
+      <div class="side-group">
+        <div class="side-label">介绍</div>
+        <a class="side-link" href="index.html">什么是 CCHarness</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">起步</div>
+        <a class="side-link" href="install.html">下载与安装</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">核心概念</div>
+        <a class="side-link active" href="workflows.html">工作流模式</a>
+        <a class="side-link" href="agents.html">智能体与工具</a>
+        <a class="side-link" href="cache.html">请求侧缓存工程</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">安全</div>
+        <a class="side-link" href="security.html">安全与隐私</a>
+      </div>
+    </aside>
+
+    <main class="doc">
+      <div class="crumb">指南 / 核心概念</div>
+      <h1>工作流模式</h1>
+      <p class="lead">
+        会话即工作流。输入框上方的下拉随时切换六种模式，
+        权限边界、指令注入与工具面随模式自动收敛——每种模式都只给它真正需要的。
+      </p>
+
+      <h2 id="overview">模式一览</h2>
+      <table>
+        <thead><tr><th>模式</th><th>行为</th></tr></thead>
+        <tbody>
+          <tr><td>🤖 智能体</td><td>完整工具面：读写文件、执行命令、委派子智能体</td></tr>
+          <tr><td>📋 规划</td><td>只读调研，输出方案卡；批准前不修改任何文件</td></tr>
+          <tr><td>🎯 目标</td><td>锁定目标与验收标准，逐轮输出可核验清单，自动延续直到全部达成</td></tr>
+          <tr><td>🧠 深度推理</td><td>思维树：三路候选方案并行生成，评审模型择优后执行</td></tr>
+          <tr><td>🎨 生图</td><td>独立的图像生成会话，走 <code>/images/generations</code> 端点</td></tr>
+          <tr><td>🔀 自定义状态机</td><td>可视化编排的声明式工作流：状态、指令、工具面与分支自定</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="agent">智能体</h2>
+      <p>
+        完整的 ReAct 循环：16+ 内置工具直接读写工作区、执行命令、抓取网页、调用 MCP。
+        写与改默认逐项审批；切换免审批档会弹出<strong>风险确认对话框</strong>，
+        列明可能删除文件、清空数据等行为，勾选责任条款才能启用，档位常驻红色警示。
+      </p>
+
+      <h2 id="plan">规划</h2>
+      <p>
+        先读后写：只读工具面先探索工作区，产出 <code>plan</code> 方案卡；
+        批准前不修改任何文件，批准后自动切回智能体模式执行。适合改动面大、需要先对齐思路的任务。
+      </p>
+
+      <h2 id="goal">目标</h2>
+      <p>对齐 Codex <code>/goal</code> 的完整状态机：</p>
+      <ul>
+        <li><b>五态生命周期</b>：<code>active → paused / achieved / unmet / budget_limited</code>，持久化进会话元数据，重启存活；</li>
+        <li><b>命令面</b>：<code>/goal &lt;目标&gt;</code> 创建 · <code>/goal</code> 查看摘要 · <code>/goal pause / resume / clear</code>；</li>
+        <li><b>工具化目标管理</b>：模型可调用 <code>get_goal / create_goal / update_goal</code> 自主推进目标，但只能标记达成/未达成——暂停、恢复、清除是用户专属权限；</li>
+        <li><b>证据审计</b>：完成判定必须附可核验证据（文件路径 / 命令输出 / 测试名），存疑即未达成；</li>
+        <li><b>预算软停止</b>：会话成本达到上限时，下一次自动继续变为一次性收尾指令，而非硬中断。</li>
+      </ul>
+
+      <h2 id="deep">深度推理</h2>
+      <p>
+        思维树（ToT）：对同一难题并行生成三路候选方案（稳妥 / 严谨 / 创意），
+        由评审模型打分择优后再进入执行。难题不再单点赌运气。
+      </p>
+
+      <h2 id="image">生图</h2>
+      <p>
+        走 <code>/images/generations</code> 端点的独立图像生成会话：
+        模型列表自动过滤出图像模型，结果内联渲染进对话，支持把返回的 URL 或 base64 直接显示。
+        图像模型与对话模型自动分流，不会互相串台。
+      </p>
+
+      <h2 id="sm">自定义状态机</h2>
+      <p>
+        可视化编辑的声明式工作流：每个状态拥有独立的指令注入、工具面（无工具 / 只读 / 全量）
+        与条件分支，支持并行扇出多个子智能体会师；位置持久化，重启可断点续跑。
+        模型每完成一轮自动按路由推进，你也可以手动跳转状态。
+      </p>
+      <div class="callout">
+        <b>工具面随模式收敛</b>
+        规划模式只有只读工具；目标模式额外注入目标管理工具；状态机按状态裁剪工具面——
+        模式即边界，不需要你手动开关。
+      </div>
+
+      <div class="pager">
+        <a href="install.html"><span>上一页</span><b>← 下载与安装</b></a>
+        <a class="next" href="agents.html"><span>下一页</span><b>智能体与工具 →</b></a>
+      </div>
+    </main>
+
+    <aside class="toc">
+      <div class="toc-title">本页目录</div>
+      <a href="#overview">模式一览</a>
+      <a href="#agent">智能体</a>
+      <a href="#plan">规划</a>
+      <a href="#goal">目标</a>
+      <a href="#deep">深度推理</a>
+      <a href="#image">生图</a>
+      <a href="#sm">自定义状态机</a>
+    </aside>
+  </div>
+
+  <footer class="footer">
+    <div class="wrap footer-grid">
+      <div class="footer-brand">
+        <img src="../logo.png" alt="" width="22" height="22" /><b>CCHarness</b>
+        <p>把多个大模型装进同一个桌面工作台。自带模型、缓存是一级指标、智能体干活，掌控在你。</p>
+      </div>
+      <div class="footer-col">
+        <h4>产品</h4>
+        <a href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">下载最新版</a>
+        <a href="install.html">下载与安装</a>
+        <a href="../index.html#features">核心特性</a>
+        <a href="cache.html">缓存工程</a>
+      </div>
+      <div class="footer-col">
+        <h4>指南</h4>
+        <a href="index.html">什么是 CCHarness</a>
+        <a href="workflows.html">工作流模式</a>
+        <a href="agents.html">智能体与工具</a>
+        <a href="security.html">安全与隐私</a>
+      </div>
+      <div class="footer-col">
+        <h4>项目</h4>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a href="https://github.com/Technicalflight/CCHarness/issues" target="_blank" rel="noopener">反馈 Issue</a>
+        <a href="https://github.com/Technicalflight/CCHarness/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/Technicalflight/CCHarness/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 License</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© <span id="cchYear">2026</span> CCHarness Authors · Built with Tauri + React + Rust</span>
+      <span>本站为纯静态页面，部署于 GitHub Pages</span>
+    </div>
+  </footer>
+
+  <script src="../main.js"></script>
+</body>
+</html>

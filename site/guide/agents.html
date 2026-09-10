@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>智能体与工具 | CCHarness 指南</title>
+  <meta name="description" content="CCHarness 的真实智能体循环：16+ 内置工具、逐项审批、快照留痕、Worktree 隔离与多智能体协作（竞技场 / 圆桌 / 子智能体 / 并行扇出）。" />
+  <link rel="icon" type="image/png" href="../logo.png" />
+  <script>(function(){var t;try{t=localStorage.getItem("cch-theme")}catch(e){}if(!t){t=window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"}document.documentElement.setAttribute("data-theme",t)})()</script>
+  <link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+
+  <header class="navbar">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">
+        <img src="../logo.png" alt="CCHarness logo" width="24" height="24" />
+        <b>CCHarness</b>
+      </a>
+      <nav class="nav-links">
+        <a href="../index.html">首页</a>
+        <a href="../index.html#features">特性</a>
+        <a href="../index.html#workflow">工作方式</a>
+        <a href="index.html" class="on">指南</a>
+        <a href="install.html">下载安装</a>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="nav-actions">
+        <button class="theme-toggle" id="themeToggle" aria-label="切换明暗主题">
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        </button>
+        <a class="btn btn-primary btn-sm nav-cta" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">免费下载</a>
+        <button class="nav-burger" id="navBurger" aria-label="打开菜单"><span></span><span></span><span></span></button>
+      </div>
+    </div>
+  </header>
+
+  <div class="docs">
+    <aside class="sidebar">
+      <div class="side-group">
+        <div class="side-label">介绍</div>
+        <a class="side-link" href="index.html">什么是 CCHarness</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">起步</div>
+        <a class="side-link" href="install.html">下载与安装</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">核心概念</div>
+        <a class="side-link" href="workflows.html">工作流模式</a>
+        <a class="side-link active" href="agents.html">智能体与工具</a>
+        <a class="side-link" href="cache.html">请求侧缓存工程</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">安全</div>
+        <a class="side-link" href="security.html">安全与隐私</a>
+      </div>
+    </aside>
+
+    <main class="doc">
+      <div class="crumb">指南 / 核心概念</div>
+      <h1>智能体与工具</h1>
+      <p class="lead">
+        CCHarness 的智能体不是「会聊天的搜索框」，而是一个真实的工具执行循环：
+        模型调用工具 → 观察结果 → 继续推理，直到任务完成——每一步都在你的掌控之下。
+      </p>
+
+      <h2 id="tools">内置工具面</h2>
+      <p>绑定工作区后，智能体模式拥有 16+ 内置工具，并可通过 MCP 继续扩展：</p>
+      <table>
+        <thead><tr><th>类别</th><th>工具</th></tr></thead>
+        <tbody>
+          <tr><td>文件</td><td>读 / 写 / 编辑 / 移动 / 删除、目录列表、文件搜索（glob / grep）</td></tr>
+          <tr><td>执行</td><td>终端命令执行（带超时与输出截断）</td></tr>
+          <tr><td>网页</td><td>网页抓取（经 SSRF 防护）、联网搜索</td></tr>
+          <tr><td>感知</td><td>屏幕截取、图片多模态输入</td></tr>
+          <tr><td>协作</td><td>子智能体委派（具名角色）、任务清单 <code>todo_write</code></td></tr>
+          <tr><td>记忆</td><td>向量记忆存取 <code>memory_save / memory_search</code></td></tr>
+          <tr><td>扩展</td><td>MCP 服务器工具、技能加载 <code>load_skill</code></td></tr>
+          <tr><td>目标</td><td><code>get_goal / create_goal / update_goal</code>（目标模式）</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="approval">审批与快照</h2>
+      <ul>
+        <li><b>逐项审批</b>：每次写 / 编辑弹出预览与行级 diff，批准或拒绝，120 秒超时自动拒绝（fail-closed）；</li>
+        <li><b>快照留痕</b>：每次写入保留前后快照，行级 diff 在审阅面板随时过目；</li>
+        <li><b>完整记录</b>：所有工具调用（含被拒绝的调用）可回溯，不丢现场。</li>
+      </ul>
+
+      <h2 id="worktree">Worktree 隔离</h2>
+      <p>
+        开启后，所有写操作重定向到 git worktree 工作树，主工作区在合并前不被触碰：
+        可查看完整 diff、整体合并回主区，或一键丢弃重来。适合让智能体放手尝试的高风险任务。
+      </p>
+      <pre><code>主工作区 main ──────────────── 不受影响
+     │
+     └─ worktree cch-a1b2 ─── 智能体在这里写
+              │
+        查看 diff / 合并 / 丢弃</code></pre>
+
+      <h2 id="multi">多智能体协作</h2>
+      <ul>
+        <li><b>竞技场</b>：一条提示词同时发给 N 个模型并行作答，泳道并排对比，逐轮 token / 缓存命中 / 成本一目了然；</li>
+        <li><b>圆桌群聊</b>：多成员顺序发言，主持人 LLM 负责调度发言顺序与话题收敛；</li>
+        <li><b>子智能体</b>：具名角色档案（独立 Provider / 模型 / 系统提示词），把独立调研子任务委派给后台——独立上下文、实时进度流式显示、完整过程落盘可查；</li>
+        <li><b>并行扇出</b>：状态机工作流可让同一状态同时驱动多个子智能体，完成后会师综合。</li>
+      </ul>
+
+      <h2 id="context">上下文工程</h2>
+      <p>
+        <code>AGENTS.md</code> 项目约定自动注入、<code>@</code> 文件引用补全、外部内容围栏包裹、
+        压缩上下文（70% 自动触发）——长会话不失焦，前缀字节稳定让缓存命中率不被上下文管理破坏。
+      </p>
+
+      <div class="pager">
+        <a href="workflows.html"><span>上一页</span><b>← 工作流模式</b></a>
+        <a class="next" href="cache.html"><span>下一页</span><b>请求侧缓存工程 →</b></a>
+      </div>
+    </main>
+
+    <aside class="toc">
+      <div class="toc-title">本页目录</div>
+      <a href="#tools">内置工具面</a>
+      <a href="#approval">审批与快照</a>
+      <a href="#worktree">Worktree 隔离</a>
+      <a href="#multi">多智能体协作</a>
+      <a href="#context">上下文工程</a>
+    </aside>
+  </div>
+
+  <footer class="footer">
+    <div class="wrap footer-grid">
+      <div class="footer-brand">
+        <img src="../logo.png" alt="" width="22" height="22" /><b>CCHarness</b>
+        <p>把多个大模型装进同一个桌面工作台。自带模型、缓存是一级指标、智能体干活，掌控在你。</p>
+      </div>
+      <div class="footer-col">
+        <h4>产品</h4>
+        <a href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">下载最新版</a>
+        <a href="install.html">下载与安装</a>
+        <a href="../index.html#features">核心特性</a>
+        <a href="cache.html">缓存工程</a>
+      </div>
+      <div class="footer-col">
+        <h4>指南</h4>
+        <a href="index.html">什么是 CCHarness</a>
+        <a href="workflows.html">工作流模式</a>
+        <a href="agents.html">智能体与工具</a>
+        <a href="security.html">安全与隐私</a>
+      </div>
+      <div class="footer-col">
+        <h4>项目</h4>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a href="https://github.com/Technicalflight/CCHarness/issues" target="_blank" rel="noopener">反馈 Issue</a>
+        <a href="https://github.com/Technicalflight/CCHarness/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/Technicalflight/CCHarness/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 License</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© <span id="cchYear">2026</span> CCHarness Authors · Built with Tauri + React + Rust</span>
+      <span>本站为纯静态页面，部署于 GitHub Pages</span>
+    </div>
+  </footer>
+
+  <script src="../main.js"></script>
+</body>
+</html>

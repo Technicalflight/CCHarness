@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>安全与隐私 | CCHarness 指南</title>
+  <meta name="description" content="CCHarness 的安全设计：三级权限档位、逐项审批、Worktree 隔离、注入防护、SSRF 防护与 Local-first 系统级 Key 加密。" />
+  <link rel="icon" type="image/png" href="../logo.png" />
+  <script>(function(){var t;try{t=localStorage.getItem("cch-theme")}catch(e){}if(!t){t=window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"}document.documentElement.setAttribute("data-theme",t)})()</script>
+  <link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+
+  <header class="navbar">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">
+        <img src="../logo.png" alt="CCHarness logo" width="24" height="24" />
+        <b>CCHarness</b>
+      </a>
+      <nav class="nav-links">
+        <a href="../index.html">首页</a>
+        <a href="../index.html#features">特性</a>
+        <a href="../index.html#workflow">工作方式</a>
+        <a href="index.html" class="on">指南</a>
+        <a href="install.html">下载安装</a>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="nav-actions">
+        <button class="theme-toggle" id="themeToggle" aria-label="切换明暗主题">
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        </button>
+        <a class="btn btn-primary btn-sm nav-cta" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">免费下载</a>
+        <button class="nav-burger" id="navBurger" aria-label="打开菜单"><span></span><span></span><span></span></button>
+      </div>
+    </div>
+  </header>
+
+  <div class="docs">
+    <aside class="sidebar">
+      <div class="side-group">
+        <div class="side-label">介绍</div>
+        <a class="side-link" href="index.html">什么是 CCHarness</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">起步</div>
+        <a class="side-link" href="install.html">下载与安装</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">核心概念</div>
+        <a class="side-link" href="workflows.html">工作流模式</a>
+        <a class="side-link" href="agents.html">智能体与工具</a>
+        <a class="side-link" href="cache.html">请求侧缓存工程</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">安全</div>
+        <a class="side-link active" href="security.html">安全与隐私</a>
+      </div>
+    </aside>
+
+    <main class="doc">
+      <div class="crumb">指南 / 安全</div>
+      <h1>安全与隐私</h1>
+      <p class="lead">
+        能给智能体多大的权力，取决于护栏有多可靠。CCHarness 的每一层能力都配有一条边界：
+        权限档位、审批门控、隔离运行、注入防护与传输防护，默认全部开启。
+      </p>
+
+      <h2 id="permission">权限档位</h2>
+      <table>
+        <thead><tr><th>档位</th><th>行为</th></tr></thead>
+        <tbody>
+          <tr><td>只读</td><td>智能体只能读不能写，适合调研与问答</td></tr>
+          <tr><td>需审批</td><td>写操作逐项审批（默认档），每次改动过目后落盘</td></tr>
+          <tr><td>自动写入</td><td>免逐项审批；开启前必须通过<strong>风险确认对话框</strong>（勾选责任条款），档位常驻红色警示</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="approval">审批卡</h2>
+      <p>
+        每次写操作弹出预览与 diff，120 秒超时即自动拒绝（fail-closed）。
+        被拒绝的调用同样计入完整工具记录，可随时回溯「模型想做什么、你拦下了什么」。
+      </p>
+
+      <h2 id="worktree">Worktree 隔离</h2>
+      <p>
+        写操作重定向到 git worktree 工作树，合并前主工作区零触碰：
+        查看 diff、整体合并或一键丢弃。即使开启自动写入，也能把爆炸半径锁在一棵可丢弃的工作树里。
+      </p>
+
+      <h2 id="injection">注入防护（Guardrails）</h2>
+      <ul>
+        <li>网页抓取、MCP 返回等<strong>外部内容</strong>默认经过注入检测 + 数据围栏包裹；</li>
+        <li>中英文注入短语库内置，可自定义扩充；</li>
+        <li>内容中伪造的围栏结束标记会被转义，防止外部内容伪装成可信指令。</li>
+      </ul>
+
+      <h2 id="ssrf">SSRF 防护</h2>
+      <p>
+        网页抓取默认拒绝环回、内网与链路本地地址；本地模型服务（如 Ollama）需要显式加入白名单才会放行。
+        智能体抓什么、连哪里，边界由你划定。
+      </p>
+
+      <h2 id="local-first">Local-first 存储</h2>
+      <table>
+        <thead><tr><th>数据</th><th>存储</th><th>保护</th></tr></thead>
+        <tbody>
+          <tr><td>会话</td><td>本机应用数据目录</td><td>原子写入（tmp + rename），损坏自动备份重建</td></tr>
+          <tr><td>API Key</td><td>本机应用数据目录</td><td>系统级加密落盘（见下节）</td></tr>
+          <tr><td>辅助调用缓存</td><td>L1 内存 LRU + L2 磁盘</td><td>工作区隔离、静态加密、8 MiB 有界</td></tr>
+          <tr><td>出站请求</td><td>直连你配置的 Provider</td><td>不经过任何第三方中转</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="keys">API Key 的系统级保护</h2>
+      <p>API Key 永不以明文落盘（密钥环不可用时才降级明文并明确提示）：</p>
+      <ul>
+        <li><b>Windows</b>：DPAPI 用户级加密；</li>
+        <li><b>macOS</b>：钥匙串保存 32 字节主密钥 + AES-256-GCM 加密落盘；</li>
+        <li><b>Linux</b>：Secret Service 密钥环（zbus 纯 Rust 实现）+ AES-256-GCM。</li>
+      </ul>
+
+      <div class="callout">
+        <b>一句话总结</b>
+        数据在你机器上、请求走你的路、密钥由系统保管、写入必须过目——能力越强，边界越清晰。
+      </div>
+
+      <div class="pager">
+        <a href="cache.html"><span>上一页</span><b>← 请求侧缓存工程</b></a>
+        <a class="next" href="../index.html"><span>返回</span><b>回到首页 ⌂</b></a>
+      </div>
+    </main>
+
+    <aside class="toc">
+      <div class="toc-title">本页目录</div>
+      <a href="#permission">权限档位</a>
+      <a href="#approval">审批卡</a>
+      <a href="#worktree">Worktree 隔离</a>
+      <a href="#injection">注入防护（Guardrails）</a>
+      <a href="#ssrf">SSRF 防护</a>
+      <a href="#local-first">Local-first 存储</a>
+      <a href="#keys">API Key 的系统级保护</a>
+    </aside>
+  </div>
+
+  <footer class="footer">
+    <div class="wrap footer-grid">
+      <div class="footer-brand">
+        <img src="../logo.png" alt="" width="22" height="22" /><b>CCHarness</b>
+        <p>把多个大模型装进同一个桌面工作台。自带模型、缓存是一级指标、智能体干活，掌控在你。</p>
+      </div>
+      <div class="footer-col">
+        <h4>产品</h4>
+        <a href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">下载最新版</a>
+        <a href="install.html">下载与安装</a>
+        <a href="../index.html#features">核心特性</a>
+        <a href="cache.html">缓存工程</a>
+      </div>
+      <div class="footer-col">
+        <h4>指南</h4>
+        <a href="index.html">什么是 CCHarness</a>
+        <a href="workflows.html">工作流模式</a>
+        <a href="agents.html">智能体与工具</a>
+        <a href="security.html">安全与隐私</a>
+      </div>
+      <div class="footer-col">
+        <h4>项目</h4>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a href="https://github.com/Technicalflight/CCHarness/issues" target="_blank" rel="noopener">反馈 Issue</a>
+        <a href="https://github.com/Technicalflight/CCHarness/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/Technicalflight/CCHarness/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 License</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© <span id="cchYear">2026</span> CCHarness Authors · Built with Tauri + React + Rust</span>
+      <span>本站为纯静态页面，部署于 GitHub Pages</span>
+    </div>
+  </footer>
+
+  <script src="../main.js"></script>
+</body>
+</html>

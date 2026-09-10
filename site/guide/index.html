@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>什么是 CCHarness | CCHarness 指南</title>
+  <meta name="description" content="CCHarness 是一个自带模型（BYOM）的桌面工作台：多模型管理、六种工作流、真实智能体循环、多智能体协作与请求侧缓存工程。" />
+  <link rel="icon" type="image/png" href="../logo.png" />
+  <script>(function(){var t;try{t=localStorage.getItem("cch-theme")}catch(e){}if(!t){t=window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"}document.documentElement.setAttribute("data-theme",t)})()</script>
+  <link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+
+  <header class="navbar">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">
+        <img src="../logo.png" alt="CCHarness logo" width="24" height="24" />
+        <b>CCHarness</b>
+      </a>
+      <nav class="nav-links">
+        <a href="../index.html">首页</a>
+        <a href="../index.html#features">特性</a>
+        <a href="../index.html#workflow">工作方式</a>
+        <a href="index.html" class="on">指南</a>
+        <a href="install.html">下载安装</a>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="nav-actions">
+        <button class="theme-toggle" id="themeToggle" aria-label="切换明暗主题">
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        </button>
+        <a class="btn btn-primary btn-sm nav-cta" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">免费下载</a>
+        <button class="nav-burger" id="navBurger" aria-label="打开菜单"><span></span><span></span><span></span></button>
+      </div>
+    </div>
+  </header>
+
+  <div class="docs">
+    <!-- ============ 左侧边栏 ============ -->
+    <aside class="sidebar">
+      <div class="side-group">
+        <div class="side-label">介绍</div>
+        <a class="side-link active" href="index.html">什么是 CCHarness</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">起步</div>
+        <a class="side-link" href="install.html">下载与安装</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">核心概念</div>
+        <a class="side-link" href="workflows.html">工作流模式</a>
+        <a class="side-link" href="agents.html">智能体与工具</a>
+        <a class="side-link" href="cache.html">请求侧缓存工程</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">安全</div>
+        <a class="side-link" href="security.html">安全与隐私</a>
+      </div>
+    </aside>
+
+    <!-- ============ 正文 ============ -->
+    <main class="doc">
+      <div class="crumb">指南 / 介绍</div>
+      <h1>什么是 CCHarness</h1>
+      <p class="lead">
+        CCHarness 是一个自带模型（BYOM）的桌面工作台：一个界面管理多家模型服务商，
+        流式多会话对话，六种工作流模式按任务切换，真实智能体循环直接读写你的工作区——
+        并且把<strong>前缀缓存命中率</strong>当作一级指标内置在遥测面板里。
+      </p>
+
+      <h2 id="capabilities">当前能力</h2>
+      <ul>
+        <li><b>多模型管理</b>：内置适配 DeepSeek、智谱 GLM、Kimi、OpenAI、Anthropic、Ollama 本地模型，以及任意 OpenAI 兼容端点；连接测试、一键获取模型列表、按模型配置定价与上下文窗口。</li>
+        <li><b>流式多会话</b>：置顶 / 归档分组、消息分支、外部会话导入、Markdown 导出、压缩上下文（70% 自动触发 + 手动）。</li>
+        <li><b>六种工作流模式</b>：智能体 / 规划 / 目标 / 深度推理 / 生图 / 自定义状态机，一个下拉随时切换。</li>
+        <li><b>真实智能体循环</b>：16+ 内置工具读写工作区、执行命令、查网页、调 MCP；写操作默认逐项审批，全程快照留痕。</li>
+        <li><b>多智能体协作</b>：竞技场并行对比、圆桌群聊、子智能体后台委派、状态机并行扇出。</li>
+        <li><b>记忆系统</b>：向量长期记忆 + 自动反思 + AuxMemo 辅助调用精确缓存。</li>
+        <li><b>遥测面板</b>：命中率曲线、逐请求账本、miss 归因、成本换算。</li>
+        <li><b>扩展生态</b>：MCP 服务器接入、Skills 技能市场、Guardrails 注入防护。</li>
+      </ul>
+
+      <h2 id="why-desktop">它与网页版聊天有什么不同</h2>
+      <table>
+        <thead><tr><th>能力</th><th>网页聊天</th><th>CCHarness</th></tr></thead>
+        <tbody>
+          <tr><td>模型</td><td>绑定单一厂商</td><td>多家 Provider 随意切换，含本地模型</td></tr>
+          <tr><td>工作区</td><td>手动上传文件</td><td>直接读写本机目录，<code>@</code> 引用补全</td></tr>
+          <tr><td>执行</td><td>只输出文字</td><td>真实工具循环：写文件 / 跑命令 / 查网页</td></tr>
+          <tr><td>成本</td><td>黑盒订阅</td><td>逐请求账本，缓存命中省钱看得见</td></tr>
+          <tr><td>数据</td><td>存在云端</td><td>全部留在本机，Key 系统级加密</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="audience">适合谁</h2>
+      <p>
+        CCHarness 适合希望<strong>自主管理数据、模型与成本</strong>的用户：
+        需要智能体真正操作本机项目的开发者，想对比多家模型又不愿被单一平台绑定的重度使用者，
+        以及在意 token 花费、想看清每一分钱去向的团队与个人。
+      </p>
+      <div class="callout">
+        <b>开箱即用</b>
+        应用内置更新检查：点击侧边栏底部版本号即可检查新版本，也可在设置页开启启动自动检查。
+      </div>
+
+      <h2 id="next">下一步</h2>
+      <p>前往 <a href="install.html">下载与安装</a> 获取三平台安装包，或先了解<a href="workflows.html">六种工作流模式</a>。</p>
+
+      <div class="pager">
+        <a class="next" href="install.html"><span>下一页</span><b>下载与安装 →</b></a>
+      </div>
+    </main>
+
+    <!-- ============ 右侧目录 ============ -->
+    <aside class="toc">
+      <div class="toc-title">本页目录</div>
+      <a href="#capabilities">当前能力</a>
+      <a href="#why-desktop">它与网页版聊天有什么不同</a>
+      <a href="#audience">适合谁</a>
+      <a href="#next">下一步</a>
+    </aside>
+  </div>
+
+  <!-- ======================= Footer ======================= -->
+  <footer class="footer">
+    <div class="wrap footer-grid">
+      <div class="footer-brand">
+        <img src="../logo.png" alt="" width="22" height="22" /><b>CCHarness</b>
+        <p>把多个大模型装进同一个桌面工作台。自带模型、缓存是一级指标、智能体干活，掌控在你。</p>
+      </div>
+      <div class="footer-col">
+        <h4>产品</h4>
+        <a href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">下载最新版</a>
+        <a href="install.html">下载与安装</a>
+        <a href="../index.html#features">核心特性</a>
+        <a href="cache.html">缓存工程</a>
+      </div>
+      <div class="footer-col">
+        <h4>指南</h4>
+        <a href="index.html">什么是 CCHarness</a>
+        <a href="workflows.html">工作流模式</a>
+        <a href="agents.html">智能体与工具</a>
+        <a href="security.html">安全与隐私</a>
+      </div>
+      <div class="footer-col">
+        <h4>项目</h4>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a href="https://github.com/Technicalflight/CCHarness/issues" target="_blank" rel="noopener">反馈 Issue</a>
+        <a href="https://github.com/Technicalflight/CCHarness/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/Technicalflight/CCHarness/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 License</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© <span id="cchYear">2026</span> CCHarness Authors · Built with Tauri + React + Rust</span>
+      <span>本站为纯静态页面，部署于 GitHub Pages</span>
+    </div>
+  </footer>
+
+  <script src="../main.js"></script>
+</body>
+</html>

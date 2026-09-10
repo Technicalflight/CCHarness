@@ -1,60 +1,61 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CCHarness — 把多个大模型装进同一个桌面工作台</title>
-  <meta name="description" content="CCHarness 是一款本地优先的多模型 AI 聊天桌面应用：六种工作流模式、多智能体协作、记忆系统，并把前缀缓存命中率当作一级指标。Windows / macOS / Linux，AGPL-3.0 开源。" />
+  <meta name="description" content="CCHarness 是一款本地优先的多模型 AI 桌面工作台：六种工作流模式、真实智能体循环、多智能体协作，并把前缀缓存命中率当作一级指标。Windows / macOS / Linux，AGPL-3.0 开源。" />
   <link rel="icon" type="image/png" href="./logo.png" />
+  <script>(function(){var t;try{t=localStorage.getItem("cch-theme")}catch(e){}if(!t){t=window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"}document.documentElement.setAttribute("data-theme",t)})()</script>
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
 
   <!-- ======================= 导航 ======================= -->
-  <nav class="nav">
+  <header class="navbar">
     <div class="nav-inner">
-      <a class="brand" href="#top">
-        <img src="./logo.png" alt="CCHarness logo" width="26" height="26" />
-        <span>CCHarness</span>
+      <a class="brand" href="index.html">
+        <img src="./logo.png" alt="CCHarness logo" width="24" height="24" />
+        <b>CCHarness</b>
       </a>
-      <div class="nav-links">
+      <nav class="nav-links">
+        <a href="index.html" class="on">首页</a>
         <a href="#features">特性</a>
-        <a href="#workflows">工作流</a>
-        <a href="#cache">缓存工程</a>
-        <a href="#download">下载</a>
+        <a href="#workflow">工作方式</a>
+        <a href="guide/index.html">指南</a>
+        <a href="guide/install.html">下载安装</a>
         <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="nav-actions">
+        <button class="theme-toggle" id="themeToggle" aria-label="切换明暗主题">
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        </button>
+        <a class="btn btn-primary btn-sm nav-cta" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">免费下载</a>
+        <button class="nav-burger" id="navBurger" aria-label="打开菜单"><span></span><span></span><span></span></button>
       </div>
-      <a class="btn btn-primary nav-cta" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        免费下载
-      </a>
     </div>
-  </nav>
+  </header>
 
   <!-- ======================= Hero ======================= -->
-  <header class="hero" id="top">
-    <div class="hero-inner">
+  <section class="hero-home">
+    <div class="hero-grid">
       <div class="hero-copy reveal">
-        <div class="hero-badges">
-          <span class="pill">v0.1.2</span>
-          <span class="pill pill-accent">Windows · macOS · Linux</span>
-          <span class="pill">AGPL-3.0 开源</span>
-        </div>
-        <h1>把多个大模型<br />装进<span class="grad">同一个桌面工作台</span></h1>
+        <div class="eyebrow">Local-first · Desktop AI Workbench</div>
+        <h1>让智能体在你的桌面上<br /><span class="grad">真正干活</span></h1>
         <p class="hero-sub">
-          自带模型 · 缓存是一级指标 · 智能体干活，掌控在你。<br />
-          六种工作流模式、多智能体协作、记忆系统——全部留在你的电脑上。
+          CCHarness 是一个自带模型（BYOM）的桌面工作台：一个界面管理多家模型服务商，
+          真实智能体循环直接读写你的工作区——并把前缀缓存命中率当作一级指标。
+          想法不只停在对话里，整理资料、推进任务、交付成果。
         </p>
         <div class="hero-cta">
           <a class="btn btn-primary btn-lg" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-            下载最新版
+            下载桌面版
           </a>
-          <a class="btn btn-ghost btn-lg" href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.55 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.76 2.69 1.25 3.35.96.1-.75.4-1.25.72-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.12 3.05.74.81 1.18 1.83 1.18 3.09 0 4.42-2.69 5.39-5.26 5.68.41.35.78 1.05.78 2.12 0 1.53-.01 2.76-.01 3.14 0 .3.2.67.8.55A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
-            查看源码
-          </a>
+          <a class="btn btn-ghost btn-lg" href="guide/index.html">看看它如何工作</a>
         </div>
+        <div class="hero-tagline">开源 · 本地运行 · 由你掌控</div>
         <div class="hero-note">免费 · 无需账号 · 请求直连你配置的模型服务商</div>
       </div>
 
@@ -63,7 +64,7 @@
         <div class="appwin">
           <div class="appwin-bar">
             <span class="dot d-r"></span><span class="dot d-y"></span><span class="dot d-g"></span>
-            <span class="appwin-title">CCHarness</span>
+            <span class="appwin-title">CCHarness — 智能体正在工作</span>
           </div>
           <div class="appwin-body">
             <div class="appwin-side">
@@ -75,22 +76,22 @@
               <div class="side-foot">v0.1.2 · 缓存 62%</div>
             </div>
             <div class="appwin-chat">
-              <div class="bubble user">@src/prefix.rs 帮我把三区指纹链的更新改为增量计算</div>
+              <div class="bubble user">@src/prefix.rs 把三区指纹链的更新改为增量计算</div>
               <div class="bubble ai">
                 <span class="ai-name">DeepSeek-R1</span>
-                已定位 <code>prefix.rs:118</code>，方案：复用上一条 Zone S 指纹，仅滚动计算 Zone T……
+                已定位 <code>prefix.rs:118</code>：复用上一条 Zone S 指纹，仅滚动计算 Zone T……
                 <span class="caret"></span>
               </div>
               <div class="toolcard">
                 <span class="tool-tag">edit_file</span>
-                <span class="tool-file">src/prefix.rs</span>
+                <span>src/prefix.rs</span>
                 <span class="tool-stat ok">+18</span>
                 <span class="tool-stat bad">−6</span>
               </div>
               <div class="composer">
                 <span class="c-pill">智能体</span>
                 <span class="c-pill c-model">GLM-4.7</span>
-                <span class="c-input">继续…</span>
+                <span>继续…</span>
               </div>
             </div>
             <div class="appwin-panel">
@@ -108,218 +109,253 @@
         </div>
       </div>
     </div>
-  </header>
-
-  <!-- ======================= 数据条 ======================= -->
-  <section class="stats reveal">
-    <div class="wrap stats-grid">
-      <div><b>6</b><span>工作流模式</span></div>
-      <div><b>16+</b><span>内置工具</span></div>
-      <div><b>12k+</b><span>Rust 代码行</span></div>
-      <div><b>82</b><span>后端单元测试</span></div>
+    <div class="chips reveal">
+      <span class="pill">本地上下文</span>
+      <span class="pill">工具执行</span>
+      <span class="pill">多模型</span>
+      <span class="pill">工作流引擎</span>
+      <span class="pill">审批留痕</span>
+      <span class="pill">缓存遥测</span>
     </div>
   </section>
 
-  <!-- ======================= 为什么 ======================= -->
-  <section class="section" id="features">
+  <!-- ======================= 一条连续的工作流 ======================= -->
+  <section class="section" id="workflow">
     <div class="wrap">
-      <h2 class="reveal">为什么选择 CCHarness？</h2>
-      <p class="section-sub reveal">不是又一个聊天网页套壳——一个真正尊重你数据、时间与成本的桌面工作台。</p>
-      <div class="grid-4">
-        <div class="card reveal">
-          <div class="card-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-          </div>
-          <h3>桌面优先</h3>
-          <p>原生桌面应用而非浏览器标签页：直接读写工作区文件、<code>@</code> 文件引用补全、系统级通知、命令面板，会话与配置全部留在本机。</p>
+      <div class="sec-head reveal">
+        <div class="eyebrow">One Continuous Workflow</div>
+        <h2>从一句话，到一个真正落地的结果。</h2>
+        <p class="sec-sub">许多 AI 产品止于答案；CCHarness 把上下文、行动与产物留在同一条任务线上。</p>
+      </div>
+      <div class="steps">
+        <div class="step reveal">
+          <div class="num">01</div>
+          <div class="lab">Intent</div>
+          <h3>说出要完成的事</h3>
+          <p>用自然语言发起任务，<code>@</code> 引用工作区文件、拖入图片多模态提问，不必先拆成一串提示词。</p>
         </div>
-        <div class="card reveal">
-          <div class="card-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>
-          </div>
-          <h3>缓存是一级指标</h3>
-          <p>上游前缀缓存命中 token 约 1/10 价格。CCHarness 在请求侧制造可缓存性：命中率曲线、逐请求账本、miss 归因，全部内置进遥测面板。</p>
+        <div class="step reveal">
+          <div class="num">02</div>
+          <div class="lab">Context</div>
+          <h3>带上正确的上下文</h3>
+          <p>按需绑定本机工作区，AGENTS.md 项目约定、代码与文档自动进入当前任务。</p>
         </div>
-        <div class="card reveal">
-          <div class="card-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="18" r="3"/><path d="M6 9v3a3 3 0 0 0 3 3h6"/><path d="M18 15V9a3 3 0 0 0-3-3h-3"/></svg>
-          </div>
-          <h3>工作流引擎</h3>
-          <p>智能体 / 规划 / 目标 / 深度推理 / 生图 / 自定义状态机——一个下拉切换，权限边界、指令注入、工具面随模式自动收敛。</p>
+        <div class="step reveal">
+          <div class="num">03</div>
+          <div class="lab">Action</div>
+          <h3>让工具真正行动</h3>
+          <p>16+ 内置工具与 MCP 扩展：读写文件、执行命令、查网页——写操作执行前先向你确认。</p>
         </div>
-        <div class="card reveal">
-          <div class="card-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-          </div>
-          <h3>Local-first 安全</h3>
-          <p>API Key 经系统级加密（DPAPI / 钥匙串 / 密钥环），写操作逐项审批留痕，SSRF 防护与注入护栏默认开启，请求不经过任何第三方中转。</p>
+        <div class="step reveal">
+          <div class="num">04</div>
+          <div class="lab">Artifact</div>
+          <h3>把结果留下来</h3>
+          <p>每次写入保留前后快照与行级 diff，完整调用记录可回溯，结果随时导出 Markdown。</p>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- ======================= 六种工作流 ======================= -->
-  <section class="section section-alt" id="workflows">
+  <!-- ======================= 围绕真实工作 ======================= -->
+  <section class="section section-alt" id="features">
     <div class="wrap">
-      <h2 class="reveal">六种工作流模式</h2>
-      <p class="section-sub reveal">一个下拉随时切换，每个模式都有自己的权限边界与指令注入。</p>
-      <div class="grid-3">
-        <div class="card reveal">
-          <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1"/></svg></div>
-          <h3>智能体</h3><p>完整 ReAct 循环：16+ 工具读写工作区、跑命令、查网页、调 MCP——写操作默认逐项审批。</p>
+      <div class="sec-head reveal">
+        <div class="eyebrow">Built Around Your Real Work</div>
+        <h2>不是更大的聊天框，<br />而是一张可以工作的桌子。</h2>
+        <p class="sec-sub">围绕真实工作设计的上下文、控制、扩展与反馈，而不是一组孤立的 AI 功能。</p>
+      </div>
+      <div class="bento">
+        <div class="b-card reveal">
+          <span class="b-tag">Directory Grants</span>
+          <h3>本地上下文，按需进入</h3>
+          <p>只读取你明确绑定的工作区；文档、代码与项目约定在授权后进入任务上下文。</p>
+          <div class="b-mini">
+            <div class="tree-row"><i></i>~/<b>MyProject</b>/</div>
+            <div class="tree-row"><i></i>src/</div>
+            <div class="tree-row grant"><i></i>✓ 已授权进入上下文</div>
+            <div class="tree-row"><i></i>docs/design/</div>
+          </div>
         </div>
-        <div class="card reveal">
-          <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></svg></div>
-          <h3>规划</h3><p>先读后写：只读工具面先探索工作区，产出方案再动手，避免上来就改文件。</p>
+        <div class="b-card reveal">
+          <span class="b-tag">Human in Control</span>
+          <h3>关键动作，由你确认</h3>
+          <p>每次写操作弹出预览与行级 diff，批准或逐项拒绝；超时未审阅自动拒绝。</p>
+          <div class="b-mini">
+            <div class="diff-row del">- let hit = cache.guess(sim);</div>
+            <div class="diff-row add">+ let hit = prefix.verify(chain);</div>
+            <div class="diff-row ctx">  awaiting approval · 120s</div>
+          </div>
         </div>
-        <div class="card reveal">
-          <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg></div>
-          <h3>目标</h3><p>对齐 Codex /goal：声明目标 + 验收清单 + 证据审计 + 预算软停，自动延续直到全部勾完。</p>
+        <div class="b-card reveal">
+          <span class="b-tag">Goal Mode</span>
+          <h3>目标锁定，自动延续</h3>
+          <p>声明目标与验收标准，每轮输出可核验清单，全部达成才停下。</p>
+          <div class="b-mini">
+            <div class="goal-row done"><span class="gk">✓</span>定位指纹链断裂点</div>
+            <div class="goal-row done"><span class="gk">✓</span>增量计算通过全部测试</div>
+            <div class="goal-row"><span class="gk"></span>遥测对比新旧命中率</div>
+          </div>
         </div>
-        <div class="card reveal">
-          <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg></div>
-          <h3>深度推理</h3><p>三方案并行生成 + LLM 评审择优（稳妥 / 严谨 / 创意），难题不再单点赌运气。</p>
+        <div class="b-card reveal">
+          <span class="b-tag">Visible Feedback</span>
+          <h3>忙碌看得见，省了多少钱也看得见</h3>
+          <p>命中率曲线、逐请求账本与 miss 归因，全部内置进遥测面板。</p>
+          <div class="b-mini">
+            <div class="kpi-line"><b>62.4%</b><span>本次会话前缀命中率 · ≈ 节省 71% 输入成本</span></div>
+            <div class="bars" style="height:40px">
+              <i style="--h:30%"></i><i style="--h:44%"></i><i style="--h:38%"></i><i style="--h:52%"></i><i style="--h:60%"></i><i style="--h:55%"></i><i style="--h:68%"></i>
+            </div>
+          </div>
         </div>
-        <div class="card reveal">
-          <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="M21 15l-5-5L5 21"/></svg></div>
-          <h3>生图</h3><p>直连 /images/generations 端点，结果内联渲染进对话，图像模型与对话模型自动分流。</p>
-        </div>
-        <div class="card reveal">
-          <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="12" r="3"/><path d="M8.5 7.5 15.5 11M8.5 16.5 15.5 13"/></svg></div>
-          <h3>自定义状态机</h3><p>可视化编排状态、指令与工具面（只读 / 全量），支持并行扇出与条件路由，重启续跑。</p>
+        <div class="b-card b-wide reveal">
+          <span class="b-tag">Models · Skills · MCP</span>
+          <h3>模型与工具，都不被锁死</h3>
+          <p>连接多个模型服务商，通过 Skills 市场与 MCP 服务器持续扩展能力面；品牌图标、定价与上下文窗口逐模型配置。</p>
+          <div class="b-mini">
+            <div class="model-chips">
+              <span class="hot">DeepSeek-R1</span><span class="hot">GLM-4.7</span><span>Kimi</span><span>GPT-5</span><span>Claude</span><span>Ollama 本地</span><span>+ 任意 OpenAI 兼容端点</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- ======================= 多智能体 / 记忆 / 安全 ======================= -->
+  <!-- ======================= 沉淀 ======================= -->
   <section class="section">
     <div class="wrap">
-      <h2 class="reveal">不止一个聊天窗口</h2>
-      <p class="section-sub reveal">多智能体、记忆与安全护栏，构成一个完整的桌面 Agent 基座。</p>
-      <div class="grid-3">
-        <div class="card card-tall reveal">
-          <h3>多智能体协作</h3>
-          <ul>
-            <li><b>竞技场</b>：多个模型同一问题并行作答，泳道对比</li>
-            <li><b>圆桌</b>：多模型顺序接力，前序发言注入上下文</li>
-            <li><b>子智能体</b>：独立上下文并行执行，具名角色可配置</li>
-            <li><b>并行扇出</b>：状态机一次状态同时驱动多个子任务</li>
-          </ul>
+      <div class="sec-head reveal">
+        <div class="eyebrow">From Action to Knowledge</div>
+        <h2>做完的事，也应该沉淀下来。</h2>
+        <p class="sec-sub">遥测、记忆与导出，把每一次会话变成可复用的资产。</p>
+      </div>
+      <div class="kv-list">
+        <div class="kv reveal">
+          <div class="num">01</div>
+          <h3>逐请求账本</h3>
+          <p>每个请求的命中 token、成本与耗时全部落账，miss 逐条归因到具体原因。</p>
         </div>
-        <div class="card card-tall reveal">
-          <h3>记忆系统</h3>
-          <ul>
-            <li><b>向量长期记忆</b>：embeddings + 余弦召回，每轮自动注入</li>
-            <li><b>自动反思</b>：回合结束自动提炼经验写入记忆</li>
-            <li><b>AuxMemo</b>：标题 / 优化等辅助调用精确缓存，不重复计费</li>
-            <li><b>上下文工程</b>：AGENTS.md、渐进披露、@ 文件引用</li>
-          </ul>
+        <div class="kv reveal">
+          <div class="num">02</div>
+          <h3>自动反思记忆</h3>
+          <p>回合结束自动提炼经验写入向量长期记忆，下次同类任务自动召回。</p>
         </div>
-        <div class="card card-tall reveal">
-          <h3>安全护栏</h3>
-          <ul>
-            <li><b>HITL 审批</b>：写操作变更预览 + 120 秒超时自动拒绝</li>
-            <li><b>Worktree 隔离</b>：所有写入重定向 git 工作树，可整体丢弃</li>
-            <li><b>Guardrails</b>：不可信内容围栏 + 注入短语检测</li>
-            <li><b>SSRF 防护</b>：web_fetch 拒绝本机与内网地址</li>
-          </ul>
+        <div class="kv reveal">
+          <div class="num">03</div>
+          <h3>会话可带走</h3>
+          <p>一键导出 Markdown、导入外部会话；分支与压缩不丢上下文脉络。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= 控制权 ======================= -->
+  <section class="section section-alt">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="eyebrow">Your Space, Your Rules</div>
+        <h2>能力向外延伸，<br />控制权始终向内收拢。</h2>
+        <p class="sec-sub">你决定目录、模型与工具如何进入工作流；CCHarness 负责让边界清晰可见。</p>
+      </div>
+      <div class="kv-list">
+        <div class="kv reveal">
+          <div class="num">01</div>
+          <h3>本地优先</h3>
+          <p>会话、API Key、记忆全部落在本机；Key 经系统级加密（DPAPI / 钥匙串 / 密钥环），出站请求直连你配置的 Provider。</p>
+        </div>
+        <div class="kv reveal">
+          <div class="num">02</div>
+          <h3>选择自由</h3>
+          <p>模型请求发送给你选择的服务商，能力不与单一模型或平台绑定；随时可加自建端点。</p>
+        </div>
+        <div class="kv reveal">
+          <div class="num">03</div>
+          <h3>开放可审视</h3>
+          <p>项目基于 AGPL-3.0 开源，可自行检查、部署并长期维护自己的工作空间。</p>
         </div>
       </div>
     </div>
   </section>
 
   <!-- ======================= 缓存工程 ======================= -->
-  <section class="section section-cache" id="cache">
-    <div class="wrap cache-grid">
-      <div class="cache-copy reveal">
-        <span class="pill pill-accent">差异化设计</span>
-        <h2>请求侧缓存工程</h2>
-        <p>
-          大模型厂商的前缀缓存按「请求前缀是否与历史一致」命中。CCHarness 把系统提示、工具定义、
-          会话历史拆成 <b>三区（Zone S / H / T）</b>，静态内容前移、动态内容后置，用 SHA-256
-          <b>指纹链</b>逐请求验证字节级稳定——命中率从运气变成可运营的指标。
-        </p>
-        <ul class="cache-list">
-          <li>逐请求命中账本 + 成本换算，miss 逐条归因（哪个 Zone 因为什么被打破）</li>
-          <li>会话重生 / 分支 / 导入全部保持字节稳定，重启零缓存损失</li>
-          <li> AuxMemo 缓存标题生成与提示词优化等辅助调用，同样的钱多干一倍的活</li>
-        </ul>
-      </div>
-      <div class="cache-visual reveal">
-        <div class="zone">
-          <div class="zone-row zs"><span>Zone S</span><em>系统提示 · 工具定义（字节稳定）</em></div>
-          <div class="zone-row zh"><span>Zone H</span><em>会话历史（追加式增长）</em></div>
-          <div class="zone-row zt"><span>Zone T</span><em>本轮消息 · 记忆注入（唯一变化点）</em></div>
-          <div class="zone-arrow">── 指纹链逐区验证，命中即省 90% 输入成本 ──</div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ======================= 下载 ======================= -->
-  <section class="section" id="download">
+  <section class="section" id="cache">
     <div class="wrap">
-      <h2 class="reveal">下载安装</h2>
-      <p class="section-sub reveal">v0.1.2 · 三平台构建 · 无需代码签名，首次运行按下方提示放行即可。</p>
-      <div class="grid-3">
-        <div class="card dl-card reveal">
-          <h3>Windows</h3>
-          <p class="dl-desc">x64 · NSIS 安装向导 / MSI</p>
-          <a class="btn btn-primary" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">下载 .exe</a>
-          <p class="dl-note">SmartScreen 提示时点「仍要运行」。</p>
-        </div>
-        <div class="card dl-card reveal">
-          <h3>macOS</h3>
-          <p class="dl-desc">Apple Silicon + Intel 通用二进制 .dmg</p>
-          <a class="btn btn-primary" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">下载 .dmg</a>
-          <p class="dl-note">首次打开在「隐私与安全性」中放行。</p>
-        </div>
-        <div class="card dl-card reveal">
-          <h3>Linux</h3>
-          <p class="dl-desc">.deb / .rpm / .AppImage</p>
-          <a class="btn btn-primary" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">下载安装包</a>
-          <p class="dl-note">AppImage 免安装直接运行。</p>
+      <div class="sec-head reveal">
+        <div class="eyebrow">Request-side Cache Engineering</div>
+        <h2>让缓存命中，从运气变成指标。</h2>
+        <p class="sec-sub">上游前缀缓存命中的 token 价格约为未命中的 1/10。CCHarness 在请求侧制造可缓存性，而不是在响应侧猜测相似性。</p>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr;gap:0;max-width:640px;margin:0 auto" class="reveal">
+        <div class="zone">
+          <div class="zone-row zs"><span>Zone S</span><em>系统提示 · 工具定义（字节永不变化）</em></div>
+          <div class="zone-row zh"><span>Zone H</span><em>会话历史（追加式稳定前缀）</em></div>
+          <div class="zone-row zt"><span>Zone T</span><em>本轮消息（唯一变化点，下一轮落入 H）</em></div>
+          <div class="zone-arrow">── SHA-256 指纹链逐区验证 · miss 逐条归因 ──</div>
         </div>
       </div>
-      <p class="dl-foot reveal">偏好命令行？<code>git clone git@github.com:Technicalflight/CCHarness.git</code> 从源码构建（Node ≥ 22、Rust ≥ 1.77）。</p>
+      <div class="hero-cta" style="justify-content:center;margin-top:26px" >
+        <a class="btn btn-ghost" href="guide/cache.html">阅读缓存工程指南 →</a>
+      </div>
     </div>
   </section>
 
-  <!-- ======================= CTA ======================= -->
-  <section class="section section-alt final-cta">
+  <!-- ======================= 最终 CTA ======================= -->
+  <section class="section-alt final-cta">
     <div class="wrap reveal">
-      <h2>现在，把所有模型装进你的工作台</h2>
-      <div class="hero-cta center">
-        <a class="btn btn-primary btn-lg" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">免费下载</a>
-        <a class="btn btn-ghost btn-lg" href="https://github.com/Technicalflight/CCHarness/issues" target="_blank" rel="noopener">反馈建议</a>
+      <div class="eyebrow">CCHarness Desktop</div>
+      <h2>从桌面开始，让智能体真正干活。</h2>
+      <p class="sec-sub">在自己的电脑上连接本地上下文、模型与工具，把一句话推进成看得见、带得走的结果。</p>
+      <div class="hero-cta">
+        <a class="btn btn-primary btn-lg" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          前往 GitHub Release
+        </a>
+        <a class="btn btn-ghost btn-lg" href="guide/install.html">下载与安装指南</a>
       </div>
+      <div class="platforms">
+        <span>Windows .exe / .msi</span>
+        <span>macOS .dmg（通用二进制）</span>
+        <span>Linux .deb / .rpm / .AppImage</span>
+      </div>
+      <div class="hero-tagline" style="margin-top:18px">开源 · 本地运行 · AGPL-3.0</div>
     </div>
   </section>
 
   <!-- ======================= Footer ======================= -->
   <footer class="footer">
-    <div class="wrap footer-inner">
+    <div class="wrap footer-grid">
       <div class="footer-brand">
-        <img src="./logo.png" alt="" width="20" height="20" />
-        <span>CCHarness</span>
+        <img src="./logo.png" alt="" width="22" height="22" /><b>CCHarness</b>
+        <p>把多个大模型装进同一个桌面工作台。自带模型、缓存是一级指标、智能体干活，掌控在你。</p>
       </div>
-      <div class="footer-meta">
-        <a href="https://github.com/Technicalflight/CCHarness/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0</a>
-        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub</a>
+      <div class="footer-col">
+        <h4>产品</h4>
+        <a href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">下载最新版</a>
+        <a href="guide/install.html">下载与安装</a>
+        <a href="index.html#features">核心特性</a>
+        <a href="index.html#cache">缓存工程</a>
+      </div>
+      <div class="footer-col">
+        <h4>指南</h4>
+        <a href="guide/index.html">什么是 CCHarness</a>
+        <a href="guide/workflows.html">工作流模式</a>
+        <a href="guide/agents.html">智能体与工具</a>
+        <a href="guide/security.html">安全与隐私</a>
+      </div>
+      <div class="footer-col">
+        <h4>项目</h4>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a href="https://github.com/Technicalflight/CCHarness/issues" target="_blank" rel="noopener">反馈 Issue</a>
         <a href="https://github.com/Technicalflight/CCHarness/releases" target="_blank" rel="noopener">Releases</a>
-        <span>© 2026 CCHarness Authors · Built with Tauri + React + Rust</span>
+        <a href="https://github.com/Technicalflight/CCHarness/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 License</a>
       </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© <span id="cchYear">2026</span> CCHarness Authors · Built with Tauri + React + Rust</span>
+      <span>本站为纯静态页面，部署于 GitHub Pages</span>
     </div>
   </footer>
 
-  <script>
-    // scroll reveal
-    const io = new IntersectionObserver(
-      (es) => es.forEach((e) => e.isIntersecting && e.target.classList.add("in")),
-      { threshold: 0.12 }
-    );
-    document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
-  </script>
+  <script src="./main.js"></script>
 </body>
 </html>

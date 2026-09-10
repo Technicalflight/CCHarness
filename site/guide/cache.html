@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>请求侧缓存工程 | CCHarness 指南</title>
+  <meta name="description" content="CCHarness 的差异化设计：把智能放在请求侧，制造可缓存性——Zone S/H/T 三区模型、SHA-256 指纹链、miss 归因与 AuxMemo 精确缓存。" />
+  <link rel="icon" type="image/png" href="../logo.png" />
+  <script>(function(){var t;try{t=localStorage.getItem("cch-theme")}catch(e){}if(!t){t=window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"}document.documentElement.setAttribute("data-theme",t)})()</script>
+  <link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+
+  <header class="navbar">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">
+        <img src="../logo.png" alt="CCHarness logo" width="24" height="24" />
+        <b>CCHarness</b>
+      </a>
+      <nav class="nav-links">
+        <a href="../index.html">首页</a>
+        <a href="../index.html#features">特性</a>
+        <a href="../index.html#workflow">工作方式</a>
+        <a href="index.html" class="on">指南</a>
+        <a href="install.html">下载安装</a>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="nav-actions">
+        <button class="theme-toggle" id="themeToggle" aria-label="切换明暗主题">
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        </button>
+        <a class="btn btn-primary btn-sm nav-cta" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">免费下载</a>
+        <button class="nav-burger" id="navBurger" aria-label="打开菜单"><span></span><span></span><span></span></button>
+      </div>
+    </div>
+  </header>
+
+  <div class="docs">
+    <aside class="sidebar">
+      <div class="side-group">
+        <div class="side-label">介绍</div>
+        <a class="side-link" href="index.html">什么是 CCHarness</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">起步</div>
+        <a class="side-link" href="install.html">下载与安装</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">核心概念</div>
+        <a class="side-link" href="workflows.html">工作流模式</a>
+        <a class="side-link" href="agents.html">智能体与工具</a>
+        <a class="side-link active" href="cache.html">请求侧缓存工程</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">安全</div>
+        <a class="side-link" href="security.html">安全与隐私</a>
+      </div>
+    </aside>
+
+    <main class="doc">
+      <div class="crumb">指南 / 核心概念</div>
+      <h1>请求侧缓存工程</h1>
+      <p class="lead">
+        上游前缀缓存命中的 token 价格约为未命中的 <strong>1/10</strong>。
+        大多数产品在响应侧「猜测相似性」；CCHarness 把智能放在<strong>请求侧</strong>——
+        主动制造可缓存性，把命中率从运气变成可运营的指标。
+      </p>
+
+      <h2 id="zones">三区模型</h2>
+      <p>每个出站请求按字节稳定性拆成三区，静态内容前移、动态内容后置：</p>
+      <pre><code>Zone S  冻结区   system prompt，会话内一次写定，字节永不变化
+Zone H  历史区   append-only：已发送内容以预序列化字节入史，任何组件不得改写
+Zone T  尾区     本轮新增（用户消息），下一轮落入 H 成为稳定前缀</code></pre>
+      <p>
+        请求体由<strong>预序列化片段按字节拼接</strong>组装，保证 provider 看到逐字节相同的前缀——
+        这正是上游前缀缓存命中的前提。
+      </p>
+
+      <h2 id="chain">指纹链与纪元</h2>
+      <ul>
+        <li><b>SHA-256 增量指纹链</b>逐请求跟踪前缀演化，任何字节级劣化都无所遁形；</li>
+        <li><b>纪元（Epoch）</b>：模型切换等事件开新纪元，遥测把「预期重建」与「意外劣化」分开统计，不让正常换模型背上缓存损失的锅；</li>
+        <li><b>重启零损失</b>：会话重生、分支、导入全部保持字节稳定，重启后前缀原样恢复。</li>
+      </ul>
+
+      <h2 id="attribution">miss 分歧定位</h2>
+      <p>
+        provider 报 0 命中而本地指纹链完整时，按请求形态自动归因——
+        链断裂 → 前缀回退 → 尾区过大 → 上游丢失，每条 miss 附处置建议，
+        而不是一句「缓存未命中」把你打发走。
+      </p>
+
+      <h2 id="auxmemo">AuxMemo 辅助调用精确缓存</h2>
+      <p>
+        标题生成、提示词优化等幂等辅助调用走 L1 内存 LRU + L2 加密磁盘双层缓存：
+        相同输入零 API 调用、零计费。同样的钱，多干一倍的活。
+      </p>
+
+      <h2 id="telemetry">遥测面板</h2>
+      <p>
+        命中率曲线、逐请求账本、成本换算、miss 归因全部内置——
+        你能看清每一个请求花了多少钱、省了多少钱、为什么没省。
+      </p>
+
+      <div class="callout warn">
+        <b>明确不做</b>
+        语义缓存、主循环响应重放、跨工作区共享。凡是可能改变语义或污染隐私边界的「省法」，一概不做。
+      </div>
+
+      <div class="pager">
+        <a href="agents.html"><span>上一页</span><b>← 智能体与工具</b></a>
+        <a class="next" href="security.html"><span>下一页</span><b>安全与隐私 →</b></a>
+      </div>
+    </main>
+
+    <aside class="toc">
+      <div class="toc-title">本页目录</div>
+      <a href="#zones">三区模型</a>
+      <a href="#chain">指纹链与纪元</a>
+      <a href="#attribution">miss 分歧定位</a>
+      <a href="#auxmemo">AuxMemo 辅助调用精确缓存</a>
+      <a href="#telemetry">遥测面板</a>
+    </aside>
+  </div>
+
+  <footer class="footer">
+    <div class="wrap footer-grid">
+      <div class="footer-brand">
+        <img src="../logo.png" alt="" width="22" height="22" /><b>CCHarness</b>
+        <p>把多个大模型装进同一个桌面工作台。自带模型、缓存是一级指标、智能体干活，掌控在你。</p>
+      </div>
+      <div class="footer-col">
+        <h4>产品</h4>
+        <a href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">下载最新版</a>
+        <a href="install.html">下载与安装</a>
+        <a href="../index.html#features">核心特性</a>
+        <a href="cache.html">缓存工程</a>
+      </div>
+      <div class="footer-col">
+        <h4>指南</h4>
+        <a href="index.html">什么是 CCHarness</a>
+        <a href="workflows.html">工作流模式</a>
+        <a href="agents.html">智能体与工具</a>
+        <a href="security.html">安全与隐私</a>
+      </div>
+      <div class="footer-col">
+        <h4>项目</h4>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a href="https://github.com/Technicalflight/CCHarness/issues" target="_blank" rel="noopener">反馈 Issue</a>
+        <a href="https://github.com/Technicalflight/CCHarness/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/Technicalflight/CCHarness/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 License</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© <span id="cchYear">2026</span> CCHarness Authors · Built with Tauri + React + Rust</span>
+      <span>本站为纯静态页面，部署于 GitHub Pages</span>
+    </div>
+  </footer>
+
+  <script src="../main.js"></script>
+</body>
+</html>

@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>下载与安装 | CCHarness 指南</title>
+  <meta name="description" content="下载 CCHarness：Windows .exe/.msi、macOS .dmg（通用二进制）、Linux .deb/.rpm/.AppImage，以及从源码构建的方法。" />
+  <link rel="icon" type="image/png" href="../logo.png" />
+  <script>(function(){var t;try{t=localStorage.getItem("cch-theme")}catch(e){}if(!t){t=window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"}document.documentElement.setAttribute("data-theme",t)})()</script>
+  <link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+
+  <header class="navbar">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">
+        <img src="../logo.png" alt="CCHarness logo" width="24" height="24" />
+        <b>CCHarness</b>
+      </a>
+      <nav class="nav-links">
+        <a href="../index.html">首页</a>
+        <a href="../index.html#features">特性</a>
+        <a href="../index.html#workflow">工作方式</a>
+        <a href="index.html" class="on">指南</a>
+        <a href="install.html">下载安装</a>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="nav-actions">
+        <button class="theme-toggle" id="themeToggle" aria-label="切换明暗主题">
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        </button>
+        <a class="btn btn-primary btn-sm nav-cta" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">免费下载</a>
+        <button class="nav-burger" id="navBurger" aria-label="打开菜单"><span></span><span></span><span></span></button>
+      </div>
+    </div>
+  </header>
+
+  <div class="docs">
+    <aside class="sidebar">
+      <div class="side-group">
+        <div class="side-label">介绍</div>
+        <a class="side-link" href="index.html">什么是 CCHarness</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">起步</div>
+        <a class="side-link active" href="install.html">下载与安装</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">核心概念</div>
+        <a class="side-link" href="workflows.html">工作流模式</a>
+        <a class="side-link" href="agents.html">智能体与工具</a>
+        <a class="side-link" href="cache.html">请求侧缓存工程</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">安全</div>
+        <a class="side-link" href="security.html">安全与隐私</a>
+      </div>
+    </aside>
+
+    <main class="doc">
+      <div class="crumb">指南 / 起步</div>
+      <h1>下载与安装</h1>
+      <p class="lead">
+        前往 <a href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">GitHub Releases</a>
+        下载对应平台的安装包，自 v0.1.0 起提供三平台构建。
+      </p>
+
+      <h2 id="packages">安装包</h2>
+      <table>
+        <thead><tr><th>平台</th><th>文件</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>Windows</td><td><code>.exe</code>（NSIS 安装向导）或 <code>.msi</code></td><td>x64</td></tr>
+          <tr><td>macOS</td><td><code>.dmg</code></td><td>Apple Silicon + Intel 通用二进制</td></tr>
+          <tr><td>Linux</td><td><code>.deb</code> / <code>.rpm</code> / <code>.AppImage</code></td><td>Debian 系 / 红帽系 / 免安装运行</td></tr>
+        </tbody>
+      </table>
+      <div class="callout warn">
+        <b>未做代码签名</b>
+        Windows 首次运行可能出现 SmartScreen 提示（点「仍要运行」）；macOS 首次打开需在
+        「系统设置 → 隐私与安全性」中放行。
+      </div>
+
+      <h2 id="update">应用内更新</h2>
+      <p>
+        CCHarness 内置更新检查，无需任何配置：
+      </p>
+      <ul>
+        <li><b>手动检查</b>：点击左侧侧边栏底部的版本号，即可检查并前往最新 Release；</li>
+        <li><b>自动检查</b>：在「设置 → 应用更新」开启启动自动检查（24 小时节流），发现新版本会在侧边栏显示更新徽标。</li>
+      </ul>
+
+      <h2 id="from-source">从源码构建</h2>
+      <p>偏好命令行？克隆仓库自行构建（环境要求：Node ≥ 22、Rust ≥ 1.77）：</p>
+      <pre><code>git clone git@github.com:Technicalflight/CCHarness.git
+cd CCHarness
+
+npm install          # 前端依赖
+npm run tauri dev    # 开发模式（自动起 vite + cargo）
+npm run tauri build  # 打包安装程序</code></pre>
+      <p>单独验证：</p>
+      <pre><code>npm run typecheck            # tsc --noEmit
+npm run build                # tsc + vite build
+cd src-tauri &amp;&amp; cargo test   # 后端单元测试</code></pre>
+
+      <h2 id="first-run">首次启动</h2>
+      <p>
+        启动后进入「模型管理」添加一个 Provider（填入 Base URL 与 API Key，可用连接测试验证），
+        即可在会话中选择模型开始对话。要启用智能体能力，在会话输入框处绑定本机工作区目录。
+      </p>
+
+      <div class="pager">
+        <a href="index.html"><span>上一页</span><b>← 什么是 CCHarness</b></a>
+        <a class="next" href="workflows.html"><span>下一页</span><b>工作流模式 →</b></a>
+      </div>
+    </main>
+
+    <aside class="toc">
+      <div class="toc-title">本页目录</div>
+      <a href="#packages">安装包</a>
+      <a href="#update">应用内更新</a>
+      <a href="#from-source">从源码构建</a>
+      <a href="#first-run">首次启动</a>
+    </aside>
+  </div>
+
+  <footer class="footer">
+    <div class="wrap footer-grid">
+      <div class="footer-brand">
+        <img src="../logo.png" alt="" width="22" height="22" /><b>CCHarness</b>
+        <p>把多个大模型装进同一个桌面工作台。自带模型、缓存是一级指标、智能体干活，掌控在你。</p>
+      </div>
+      <div class="footer-col">
+        <h4>产品</h4>
+        <a href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">下载最新版</a>
+        <a href="install.html">下载与安装</a>
+        <a href="../index.html#features">核心特性</a>
+        <a href="cache.html">缓存工程</a>
+      </div>
+      <div class="footer-col">
+        <h4>指南</h4>
+        <a href="index.html">什么是 CCHarness</a>
+        <a href="workflows.html">工作流模式</a>
+        <a href="agents.html">智能体与工具</a>
+        <a href="security.html">安全与隐私</a>
+      </div>
+      <div class="footer-col">
+        <h4>项目</h4>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a href="https://github.com/Technicalflight/CCHarness/issues" target="_blank" rel="noopener">反馈 Issue</a>
+        <a href="https://github.com/Technicalflight/CCHarness/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/Technicalflight/CCHarness/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 License</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© <span id="cchYear">2026</span> CCHarness Authors · Built with Tauri + React + Rust</span>
+      <span>本站为纯静态页面，部署于 GitHub Pages</span>
+    </div>
+  </footer>
+
+  <script src="../main.js"></script>
+</body>
+</html>
