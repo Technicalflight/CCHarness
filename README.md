@@ -150,7 +150,7 @@ flowchart LR
     CMD --> TELE["遥测与账本<br/>命中率 · 成本 · miss 归因"]
 ```
 
-技术栈：Tauri 2 + React 18 + TypeScript（strict）/ Rust 后端约 12,000 行 + 前端约 11,700 行，81 个后端单元测试覆盖前缀字节稳定性、SSRF、Git 面板、worktree 往返等核心链路。
+技术栈：Tauri 2 + React 18 + TypeScript（strict）/ Rust 后端约 12,000 行 + 前端约 11,700 行，97 个后端单元测试覆盖前缀字节稳定性、SSRF、Git 面板、worktree 往返等核心链路。
 
 ## 开发
 
