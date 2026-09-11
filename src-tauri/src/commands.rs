@@ -19,19 +19,6 @@ use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 use uuid::Uuid;
 
-/// Prefix state lives for the whole process — one window, one engine.
-/// Key: (session_id, lane).
-static PREFIXES: Mutex<Option<HashMap<(String, u32), LanePrefix>>> = Mutex::new(None);
-static SEQ: AtomicU64 = AtomicU64::new(1);
-static LAST_TS: AtomicU64 = AtomicU64::new(0);
-/// Pending write-tool approvals: approval_id → resolver. Dropped senders
-/// simply fail the await (deny, fail-closed).
-static APPROVALS: Mutex<Option<HashMap<String, tokio::sync::oneshot::Sender<bool>>>> = Mutex::new(None);
-/// Session-level grants: "session_id:tool" remembered via the approval card.
-static GRANTS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
-/// Last total sent bytes per lane for chain-continuity checks, with the
-/// epoch it belonged to (an epoch change is a legitimate rebuild).
-static LAST_SPAN: Mutex<Option<HashMap<(String, u32), (u32, usize)>>> = Mutex::new(None);
 /// Auto-compaction threshold: compact at a user boundary once the last
 /// request's input tokens reached this fraction of the context window.
 const COMPACT_AT_FRACTION: f64 = 0.7;
@@ -45,41 +32,18 @@ const COMPACT_MIN_MESSAGES: usize = 8;
 /// Character budget fed to the summarizer.
 const SUMMARIZE_INPUT_CAP: usize = 24_000;
 
-/// Session tool-permission mode: "readonly" (write tools not offered),
-/// "approve" (default — write tools gated by the approval card), "auto"
-/// (write tools run without per-execution approval, still workspace-bound).
-static PERMISSIONS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
-
 const VALID_MODES: &[&str] = &["readonly", "approve", "auto"];
 
-/// Session workflow gate: "agent" (default — direct execution) | "plan"
-/// (read-only research, then a frozen ```plan proposal that the user must
-/// approve before any write can happen) | "goal" (only the goal + acceptance
-/// criteria are locked; the agent picks its own path until all criteria pass,
-/// with dynamic re-planning) | "deep" (Tree-of-Thoughts rehearsal: parallel
-/// candidate approaches + judge, then the normal loop) | "review" (three
-/// read-only expert pre-reviews + the model as Lead publishing a deduped,
-/// graded findings table) | "sm:<def_id>:<state>" (declarative state machine,
-/// see SM_STATE).
-/// In-memory like PERMISSIONS, checkpointed onto SessionMeta.wf_gate so a
-/// restart resumes the same mode instead of falling back to agent.
-static WORKFLOW: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
-
-/// Declarative state-machine position per session: session_id → gate string
-/// "sm:<def_id>:<state_name>". Mirrored into WORKFLOW (the gate is the single
-/// source of truth for mode checks; SM_STATE marks that the session is
-/// actively running a state machine and remembers the resolved position for
-/// auto-advance). In-memory like WORKFLOW — a restart drops back to agent.
-static SM_STATE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
-
 /// Store an SM position and mirror it into the workflow gate.
-fn sm_put(session_id: &str, gate: &str) {
-    WORKFLOW
+fn sm_put(state: &AppState, session_id: &str, gate: &str) {
+    state
+        .workflow
         .lock()
         .unwrap()
         .get_or_insert_with(HashMap::new)
         .insert(session_id.to_string(), gate.to_string());
-    SM_STATE
+    state
+        .sm_state
         .lock()
         .unwrap()
         .get_or_insert_with(HashMap::new)
@@ -88,12 +52,14 @@ fn sm_put(session_id: &str, gate: &str) {
 
 /// Checkpoint the workflow gate onto the session meta (best-effort — a
 /// failed save leaves the in-memory gate in charge; it only matters across
-/// restarts).
-fn persist_gate(data_dir: &std::path::Path, session_id: &str, gate: Option<&str>) {
-    let store = SessionStore::new(data_dir);
-    if let Ok(mut sf) = store.load(session_id) {
+/// restarts). The meta write is a session-file read-modify-write: it goes
+/// through the save lock like every other session mutation, or a lane save
+/// landing mid-rewrite would be rolled back.
+async fn persist_gate(state: &AppState, session_id: &str, gate: Option<&str>) {
+    let _guard = state.save_lock.lock().await;
+    if let Ok(mut sf) = state.store.load(session_id) {
         sf.meta.wf_gate = gate.map(|g| g.to_string());
-        warn_save(session_id, "workflow gate", store.save(&sf));
+        warn_save(session_id, "workflow gate", state.store.save(&sf));
     }
 }
 
@@ -126,8 +92,9 @@ pub fn record_workflow_of(wf: &str) -> Option<String> {
 /// Resolve the active workflow gate. In-memory first; on a miss (fresh
 /// process) backfill from the persisted checkpoint on SessionMeta so a
 /// restart resumes the previous mode (断点续传). Falls back to "agent".
-fn workflow_of_in(session_id: &str, data_dir: &std::path::Path) -> String {
-    let cached = WORKFLOW
+fn workflow_of_in(state: &AppState, session_id: &str, data_dir: &std::path::Path) -> String {
+    let cached = state
+        .workflow
         .lock()
         .unwrap()
         .as_ref()
@@ -141,7 +108,8 @@ fn workflow_of_in(session_id: &str, data_dir: &std::path::Path) -> String {
             .and_then(|sf| sf.meta.wf_gate.clone())
         {
             Some(g) => {
-                WORKFLOW
+                state
+                    .workflow
                     .lock()
                     .unwrap()
                     .get_or_insert_with(HashMap::new)
@@ -163,17 +131,18 @@ fn workflow_of_in(session_id: &str, data_dir: &std::path::Path) -> String {
 }
 
 #[tauri::command]
-pub fn set_workflow_mode(
+pub async fn set_workflow_mode(
     state: State<'_, AppState>,
     session_id: String,
     mode: String,
 ) -> Result<(), String> {
     if matches!(mode.as_str(), "agent" | "plan" | "goal" | "deep" | "review" | "image") {
         // leaving (or never entering) a state machine — clear the SM position
-        if let Some(m) = SM_STATE.lock().unwrap().as_mut() {
+        if let Some(m) = state.sm_state.lock().unwrap().as_mut() {
             m.remove(&session_id);
         }
-        WORKFLOW
+        state
+            .workflow
             .lock()
             .unwrap()
             .get_or_insert_with(HashMap::new)
@@ -181,9 +150,9 @@ pub fn set_workflow_mode(
         // checkpoint: "agent" clears the persisted gate, everything else
         // persists so a restart resumes the same mode
         if mode == "agent" {
-            persist_gate(&state.data_dir, &session_id, None);
+            persist_gate(&state, &session_id, None).await;
         } else {
-            persist_gate(&state.data_dir, &session_id, Some(&mode));
+            persist_gate(&state, &session_id, Some(&mode)).await;
         }
         return Ok(());
     }
@@ -201,8 +170,8 @@ pub fn set_workflow_mode(
             .first()
             .ok_or_else(|| format!("工作流「{}」没有任何状态", def.name))?;
         let gate = format!("sm:{}:{}", def.id, first.name);
-        sm_put(&session_id, &gate);
-        persist_gate(&state.data_dir, &session_id, Some(&gate));
+        sm_put(&state, &session_id, &gate);
+        persist_gate(&state, &session_id, Some(&gate)).await;
         return Ok(());
     }
     Err(format!("未知工作流模式: {mode}"))
@@ -210,7 +179,7 @@ pub fn set_workflow_mode(
 
 #[tauri::command]
 pub fn get_workflow_mode(state: State<'_, AppState>, session_id: String) -> String {
-    workflow_of_in(&session_id, &state.data_dir)
+    workflow_of_in(&state, &session_id, &state.data_dir)
 }
 
 // ---- goal lifecycle (Codex /goal parity) ----
@@ -274,13 +243,15 @@ pub fn parse_goal_summary_ext(content: &str) -> (usize, usize, bool, usize) {
 
 /// Create/replace the session goal and activate the goal gate. Shared by
 /// the /goal command surface and the model's create_goal tool.
-fn set_goal_inner(
-    data_dir: &std::path::Path,
+/// The goal write is a session-file read-modify-write — it takes the save
+/// lock like every other session mutation.
+async fn set_goal_inner(
+    state: &AppState,
     session_id: &str,
     objective: String,
 ) -> Result<GoalState, String> {
-    let store = SessionStore::new(data_dir);
-    let mut sf = store.load(session_id)?;
+    let _guard = state.save_lock.lock().await;
+    let mut sf = state.store.load(session_id)?;
     let now = now_ms();
     let g = GoalState {
         objective,
@@ -291,23 +262,25 @@ fn set_goal_inner(
     sf.meta.goal = Some(g.clone());
     sf.meta.goal_rounds.clear();
     sf.meta.updated_at = now;
-    store.save(&sf)?;
+    state.store.save(&sf)?;
+    drop(_guard);
     // flip the workflow gate to goal (same map + persist as
     // set_workflow_mode) so the next turn runs under GOAL_DIRECTIVE
-    if let Some(m) = SM_STATE.lock().unwrap().as_mut() {
+    if let Some(m) = state.sm_state.lock().unwrap().as_mut() {
         m.remove(session_id);
     }
-    WORKFLOW
+    state
+        .workflow
         .lock()
         .unwrap()
         .get_or_insert_with(HashMap::new)
         .insert(session_id.to_string(), "goal".to_string());
-    persist_gate(data_dir, session_id, Some("goal"));
+    persist_gate(state, session_id, Some("goal")).await;
     Ok(g)
 }
 
 #[tauri::command]
-pub fn goal_set(
+pub async fn goal_set(
     state: State<'_, AppState>,
     session_id: String,
     objective: String,
@@ -319,7 +292,7 @@ pub fn goal_set(
     if objective.chars().count() > 4_000 {
         return Err("目标内容过长（上限 4000 字符）".into());
     }
-    set_goal_inner(&state.data_dir, &session_id, objective)
+    set_goal_inner(&state, &session_id, objective).await
 }
 
 /// Goal summary for the command surface and the summary bar: the persisted
@@ -358,7 +331,7 @@ pub fn goal_get(state: State<'_, AppState>, session_id: String) -> Result<GoalIn
 /// bookkeeping). Any whitelist status is allowed here — the restriction to
 /// achieved/unmet applies only to the model's update_goal tool.
 #[tauri::command]
-pub fn goal_status(
+pub async fn goal_status(
     state: State<'_, AppState>,
     session_id: String,
     status: String,
@@ -366,6 +339,8 @@ pub fn goal_status(
     if !GOAL_STATUSES.contains(&status.as_str()) {
         return Err(format!("未知目标状态: {status}"));
     }
+    // read-modify-write under the save lock
+    let _guard = state.save_lock.lock().await;
     let store = SessionStore::new(&state.data_dir);
     let mut sf = store.load(&session_id)?;
     let mut g = sf.meta.goal.clone().ok_or("该会话还没有目标")?;
@@ -379,10 +354,11 @@ pub fn goal_status(
 
 /// Remove the goal, returning the previous record (for the toast).
 #[tauri::command]
-pub fn goal_clear(
+pub async fn goal_clear(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<Option<GoalState>, String> {
+    let _guard = state.save_lock.lock().await;
     let store = SessionStore::new(&state.data_dir);
     let mut sf = store.load(&session_id)?;
     let prev = sf.meta.goal.take();
@@ -396,7 +372,7 @@ pub fn goal_clear(
 /// create_goal (create + flip the gate), update_goal (declare achieved /
 /// unmet only). Pausing, resuming and clearing are NOT reachable from the
 /// model — the same safety boundary Codex draws.
-fn handle_goal_tool(data_dir: &std::path::Path, session_id: &str, name: &str, args: &Value) -> String {
+async fn handle_goal_tool(state: &AppState, data_dir: &std::path::Path, session_id: &str, name: &str, args: &Value) -> String {
     let store = SessionStore::new(data_dir);
     match name {
         "get_goal" => {
@@ -438,7 +414,7 @@ fn handle_goal_tool(data_dir: &std::path::Path, session_id: &str, name: &str, ar
             if obj.chars().count() > 4_000 {
                 return "ERROR: objective 超过 4000 字符上限".into();
             }
-            match set_goal_inner(data_dir, session_id, obj) {
+            match set_goal_inner(state, session_id, obj).await {
                 Ok(_) => "OK: 目标已创建并进入目标模式。请按目标模式规则推进：每轮回复末尾输出 ```goal 验收清单（✅/⬜ + 证据），全部 ✅ 时输出 GOAL_DONE。".into(),
                 Err(e) => format!("ERROR: {e}"),
             }
@@ -448,19 +424,24 @@ fn handle_goal_tool(data_dir: &std::path::Path, session_id: &str, name: &str, ar
             if st != "achieved" && st != "unmet" {
                 return "ERROR: update_goal 仅允许 status=\"achieved\" 或 \"unmet\"（暂停/恢复/清除只能由用户操作）".into();
             }
-            let Ok(mut sf) = store.load(session_id) else {
-                return "ERROR: 会话不存在".into();
+            // the whole read-modify-write rides under the save lock
+            let outcome = {
+                let _guard = state.save_lock.lock().await;
+                let Ok(mut sf) = state.store.load(session_id) else {
+                    return "ERROR: 会话不存在".into();
+                };
+                let Some(g) = sf.meta.goal.as_mut() else {
+                    return "NONE: 当前会话尚未创建目标".into();
+                };
+                if g.status == "achieved" || g.status == "unmet" {
+                    return format!("ERROR: 目标已是终态（{}），不能再次变更", g.status);
+                }
+                g.status = st.to_string();
+                g.updated_at = now_ms();
+                sf.meta.updated_at = now_ms();
+                state.store.save(&sf)
             };
-            let Some(g) = sf.meta.goal.as_mut() else {
-                return "NONE: 当前会话尚未创建目标".into();
-            };
-            if g.status == "achieved" || g.status == "unmet" {
-                return format!("ERROR: 目标已是终态（{}），不能再次变更", g.status);
-            }
-            g.status = st.to_string();
-            g.updated_at = now_ms();
-            sf.meta.updated_at = now_ms();
-            if store.save(&sf).is_err() {
+            if outcome.is_err() {
                 return "ERROR: 目标状态保存失败".into();
             }
             format!("OK: 目标状态已更新为 {st}")
@@ -471,8 +452,9 @@ fn handle_goal_tool(data_dir: &std::path::Path, session_id: &str, name: &str, ar
 
 /// Current state-machine gate for a session: "sm:<def_id>:<state>" or "".
 #[tauri::command]
-pub fn sm_get(session_id: String) -> String {
-    SM_STATE
+pub fn sm_get(state: State<'_, AppState>, session_id: String) -> String {
+    state
+        .sm_state
         .lock()
         .unwrap()
         .as_ref()
@@ -485,7 +467,7 @@ pub fn sm_get(session_id: String) -> String {
 /// in the definition, then moves the session there. The next turn runs under
 /// the new state's directive and tool surface.
 #[tauri::command]
-pub fn sm_set(
+pub async fn sm_set(
     state: State<'_, AppState>,
     session_id: String,
     def_id: String,
@@ -501,13 +483,19 @@ pub fn sm_set(
         return Err(format!("工作流「{}」没有状态「{state_name}」", def.name));
     }
     let gate = format!("sm:{def_id}:{state_name}");
-    sm_put(&session_id, &gate);
-    persist_gate(&state.data_dir, &session_id, Some(&gate));
+    sm_put(&state, &session_id, &gate);
+    persist_gate(&state, &session_id, Some(&gate)).await;
     Ok(())
 }
 
-fn permission_of(session_id: &str) -> &'static str {
-    let m = PERMISSIONS.lock().unwrap().as_ref().and_then(|m| m.get(session_id)).cloned();
+fn permission_of(state: &AppState, session_id: &str) -> &'static str {
+    let m = state
+        .permissions
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(session_id))
+        .cloned();
     match m.as_deref() {
         Some("readonly") => "readonly",
         Some("auto") => "auto",
@@ -516,11 +504,16 @@ fn permission_of(session_id: &str) -> &'static str {
 }
 
 #[tauri::command]
-pub fn set_permission_mode(session_id: String, mode: String) -> Result<(), String> {
+pub fn set_permission_mode(
+    state: State<'_, AppState>,
+    session_id: String,
+    mode: String,
+) -> Result<(), String> {
     if !VALID_MODES.contains(&mode.as_str()) {
         return Err(format!("未知权限模式: {mode}"));
     }
-    PERMISSIONS
+    state
+        .permissions
         .lock()
         .unwrap()
         .get_or_insert_with(HashMap::new)
@@ -544,9 +537,10 @@ fn grant_key(session_id: &str, tool: &str) -> String {
 }
 
 /// Register a pending approval and return its receiver.
-fn open_approval(id: &str) -> tokio::sync::oneshot::Receiver<bool> {
+fn open_approval(state: &AppState, id: &str) -> tokio::sync::oneshot::Receiver<bool> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    APPROVALS
+    state
+        .approvals
         .lock()
         .unwrap()
         .get_or_insert_with(HashMap::new)
@@ -554,17 +548,18 @@ fn open_approval(id: &str) -> tokio::sync::oneshot::Receiver<bool> {
     rx
 }
 
-fn take_approval(id: &str) -> Option<tokio::sync::oneshot::Sender<bool>> {
-    APPROVALS.lock().unwrap().as_mut()?.remove(id)
+fn take_approval(state: &AppState, id: &str) -> Option<tokio::sync::oneshot::Sender<bool>> {
+    state.approvals.lock().unwrap().as_mut()?.remove(id)
 }
 
 /// Monotonic per-record timestamp: equal-ms records keep their order.
-fn next_record_ts() -> u64 {
+fn next_record_ts(state: &AppState) -> u64 {
     loop {
         let now = now_ms();
-        let prev = LAST_TS.load(Ordering::Relaxed);
+        let prev = state.last_ts.load(Ordering::Relaxed);
         let next = now.max(prev + 1);
-        if LAST_TS
+        if state
+            .last_ts
             .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
@@ -573,8 +568,10 @@ fn next_record_ts() -> u64 {
     }
 }
 
-fn prefixes_lock() -> std::sync::MutexGuard<'static, Option<HashMap<(String, u32), LanePrefix>>> {
-    PREFIXES.lock().unwrap()
+fn prefixes_lock(
+    state: &AppState,
+) -> std::sync::MutexGuard<'_, Option<HashMap<(String, u32), LanePrefix>>> {
+    state.prefixes.lock().unwrap()
 }
 
 /// Zone H empty (only the frozen system prompt, if any) — used to detect a
@@ -591,6 +588,40 @@ pub struct AppState {
     pub stops: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Serializes session-file read-modify-write across lanes.
     pub save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Lane prefix state — one window, one engine. Key: (session_id, lane).
+    pub prefixes: Mutex<Option<HashMap<(String, u32), LanePrefix>>>,
+    /// Monotonic request sequence, seeded from the highest seq already
+    /// recorded in any session file (old and new records must never share
+    /// numbers across restarts).
+    pub seq: AtomicU64,
+    /// Monotonic per-record timestamp base: equal-ms records keep order.
+    pub last_ts: AtomicU64,
+    /// Pending write-tool approvals: approval_id → resolver. Dropped
+    /// senders simply fail the await (deny, fail-closed).
+    pub approvals: Mutex<Option<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+    /// Session-level grants: "session_id:tool" remembered via the approval card.
+    pub grants: Mutex<Option<std::collections::HashSet<String>>>,
+    /// Last total sent bytes per lane for chain-continuity checks, with the
+    /// epoch it belonged to (an epoch change is a legitimate rebuild).
+    pub last_span: Mutex<Option<HashMap<(String, u32), (u32, usize)>>>,
+    /// Session tool-permission mode: "readonly" (write tools not offered),
+    /// "approve" (default — write tools gated by the approval card), "auto"
+    /// (write tools run without per-execution approval, still workspace-bound).
+    pub permissions: Mutex<Option<HashMap<String, String>>>,
+    /// Session workflow gate: "agent" (default) | "plan" | "goal" | "deep" |
+    /// "review" | "image" | "sm:<def_id>:<state>" (declarative state machine,
+    /// see sm_state). In-memory, checkpointed onto SessionMeta.wf_gate so a
+    /// restart resumes the same mode instead of falling back to agent.
+    pub workflow: Mutex<Option<HashMap<String, String>>>,
+    /// Declarative state-machine position per session: session_id → gate
+    /// string "sm:<def_id>:<state_name>". Mirrored into workflow (the gate is
+    /// the single source of truth for mode checks; sm_state marks that the
+    /// session is actively running a state machine and remembers the resolved
+    /// position for auto-advance). In-memory — a restart drops back to agent.
+    pub sm_state: Mutex<Option<HashMap<String, String>>>,
+    /// Set once the user confirmed a real exit (dialog / tray menu). The
+    /// CloseRequested handler lets the window close only when this is set.
+    pub force_quit: AtomicBool,
 }
 
 // ---------- task-list panel (todo_write tool) ----------
@@ -653,9 +684,9 @@ impl AppState {
         let boot_settings = config::load(&data_dir).settings;
         sync_sandbox_policy(&boot_settings);
         crate::privacy::set_custom_patterns(boot_settings.privacy_custom_patterns.clone());
-        // The request sequence must survive restarts: seed the global counter
-        // from the highest seq already recorded in any session file, or old
-        // and new records collide on the same numbers.
+        // The request sequence must survive restarts: seed the counter from
+        // the highest seq already recorded in any session file, or old and
+        // new records collide on the same numbers.
         let mut max_seq = 0u64;
         for meta in store.list() {
             if let Ok(sf) = store.load(&meta.id) {
@@ -666,13 +697,22 @@ impl AppState {
                 }
             }
         }
-        SEQ.store(max_seq + 1, Ordering::Relaxed);
         Self {
             store,
             data_dir,
             client,
             stops: Mutex::new(HashMap::new()),
             save_lock: Arc::new(tokio::sync::Mutex::new(())),
+            prefixes: Mutex::new(None),
+            seq: AtomicU64::new(max_seq + 1),
+            last_ts: AtomicU64::new(0),
+            approvals: Mutex::new(None),
+            grants: Mutex::new(None),
+            last_span: Mutex::new(None),
+            permissions: Mutex::new(None),
+            workflow: Mutex::new(None),
+            sm_state: Mutex::new(None),
+            force_quit: AtomicBool::new(false),
         }
     }
 }
@@ -1116,7 +1156,7 @@ pub fn create_session(
 
 #[tauri::command]
 pub fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
-    if let Some(map) = prefixes_lock().as_mut() {
+    if let Some(map) = prefixes_lock(&state).as_mut() {
         map.retain(|(sid, _), _| sid != &session_id);
     }
     state.store.delete(&session_id)
@@ -1551,17 +1591,15 @@ pub fn window_close(app: tauri::AppHandle) {
 
 // ---------- close-to-tray ----------
 
-/// Set once the user confirmed a real exit (dialog / tray menu). The
-/// CloseRequested handler lets the window close only when this is set.
-static FORCE_QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn is_force_quit() -> bool {
-    FORCE_QUIT.load(std::sync::atomic::Ordering::Relaxed)
+pub fn is_force_quit(state: &State<'_, AppState>) -> bool {
+    state.force_quit.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Mark exit-as-confirmed, then close the window for real.
 pub fn request_quit(app: &tauri::AppHandle) {
-    FORCE_QUIT.store(true, std::sync::atomic::Ordering::Relaxed);
+    app.state::<AppState>()
+        .force_quit
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(w) = main_window(app) {
         let _ = w.close();
     }
@@ -1701,6 +1739,7 @@ fn tools_hash(tools: Option<&Value>) -> Option<u64> {
 /// now, persist the record, invalidate the lane prefix (next request
 /// rebuilds from the compacted transcript — an expected epoch bump).
 async fn compact_now(
+    state: &AppState,
     client: &reqwest::Client,
     data_dir: &std::path::Path,
     save_lock: &tokio::sync::Mutex<()>,
@@ -1726,7 +1765,7 @@ async fn compact_now(
     let cfg = config::load(data_dir);
     let (dropped, stubs) = {
         let _guard = save_lock.lock().await;
-        elide_stale_tool_records(data_dir, session_id, cfg.settings.spill_max_chars, keep_from_ts)
+        elide_stale_tool_records(&state, data_dir, session_id, cfg.settings.spill_max_chars, keep_from_ts)
     };
     let sf = store.load(session_id)?;
     let prev_upto = sf.compaction.as_ref().map(|c| c.upto_ts).unwrap_or(0);
@@ -1754,7 +1793,7 @@ async fn compact_now(
     let folded_tokens =
         foldable.iter().map(|m| est_tokens(&m.content) + RECORD_OVERHEAD_TOKENS).sum::<u64>();
     let completed_turns = sf.messages.iter().filter(|m| m.role == "user").count() as u64;
-    let epoch_before = prefixes_lock()
+    let epoch_before = prefixes_lock(&state)
         .as_ref()
         .and_then(|m| m.get(&(session_id.to_string(), 0)))
         .map(|lp| lp.epoch)
@@ -1789,10 +1828,10 @@ async fn compact_now(
         sf.meta.updated_at = now_ms();
         store.save(&sf)?;
     }
-    if let Some(map) = prefixes_lock().as_mut() {
+    if let Some(map) = prefixes_lock(&state).as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
-    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
     Ok(())
@@ -1807,7 +1846,7 @@ pub async fn compact_session(state: State<'_, AppState>, session_id: String) -> 
     }
     let binding = sf.meta.bindings.first().cloned().ok_or("会话未绑定模型")?;
     let provider = resolve_provider(&cfg, &binding).cloned().ok_or("Provider 未配置")?;
-    compact_now(&state.client, &state.data_dir, &state.save_lock, &session_id, &provider, &binding.model, "manual").await?;
+    compact_now(&state, &state.client, &state.data_dir, &state.save_lock, &session_id, &provider, &binding.model, "manual").await?;
     Ok(sf.compaction.as_ref().map(|_| "已在旧摘要基础上再次压缩".to_string()).unwrap_or_else(|| "已压缩".into()))
 }
 
@@ -1908,10 +1947,10 @@ pub fn clear_session(state: State<'_, AppState>, session_id: String) -> Result<u
     sf.compaction = None;
     sf.meta.updated_at = now_ms();
     state.store.save(&sf)?;
-    if let Some(map) = prefixes_lock().as_mut() {
+    if let Some(map) = prefixes_lock(&state).as_mut() {
         map.remove(&(session_id.clone(), 0));
     }
-    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
         map.remove(&(session_id, 0));
     }
     Ok(removed)
@@ -2195,6 +2234,7 @@ fn render_memo(memo: &crate::types_rs::RollingMemo) -> Option<String> {
 }
 
 fn prune_oversized_tool_records(
+    state: &AppState,
     data_dir: &std::path::Path,
     session_id: &str,
     max_chars: usize,
@@ -2238,10 +2278,10 @@ fn prune_oversized_tool_records(
     }
     // expected rebuild: the next request re-creates the prefix from the
     // smaller transcript instead of judging the byte change an upstream miss
-    if let Some(map) = prefixes_lock().as_mut() {
+    if let Some(map) = prefixes_lock(&state).as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
-    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
     saved
@@ -2257,6 +2297,7 @@ fn prune_oversized_tool_records(
 /// tool_call_id, so call/result pairing survives (design invariant I1).
 /// Returns (saved tokens, stubs written); (0, 0) = nothing changed.
 fn elide_stale_tool_records(
+    state: &AppState,
     data_dir: &std::path::Path,
     session_id: &str,
     max_chars: usize,
@@ -2332,10 +2373,10 @@ fn elide_stale_tool_records(
     if store.save(&sf).is_err() {
         return (0, 0);
     }
-    if let Some(map) = prefixes_lock().as_mut() {
+    if let Some(map) = prefixes_lock(&state).as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
-    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
     (saved, stubs)
@@ -2432,7 +2473,7 @@ async fn maybe_auto_compact(
     // rolled back (the reviewer's lost-message scenario)
     let saved = {
         let _guard = state.save_lock.lock().await;
-        prune_oversized_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars)
+        prune_oversized_tool_records(&state, &state.data_dir, session_id, cfg.settings.spill_max_chars)
     };
     // free rung 2 (L6 §3): superseded stale tool outputs → stubs. The
     // recent window is everything from the last user turn onward.
@@ -2445,7 +2486,7 @@ async fn maybe_auto_compact(
         .unwrap_or(0);
     let (elided, _stubs) = {
         let _guard = state.save_lock.lock().await;
-        elide_stale_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars, recent_from)
+        elide_stale_tool_records(&state, &state.data_dir, session_id, cfg.settings.spill_max_chars, recent_from)
     };
     let saved = saved + elided;
     if saved > 0 {
@@ -2508,7 +2549,7 @@ async fn maybe_auto_compact(
                     recent_auto + 1
                 ),
                 reasoning: None,
-                ts: next_record_ts(),
+                ts: next_record_ts(&state),
                 model: None,
                 status: "ok".into(),
                 usage: None,
@@ -2525,7 +2566,7 @@ async fn maybe_auto_compact(
         }
     }
     let _ =
-        compact_now(&state.client, &state.data_dir, &state.save_lock, session_id, provider, &binding.model, "auto").await;
+        compact_now(&state, &state.client, &state.data_dir, &state.save_lock, session_id, provider, &binding.model, "auto").await;
 }
 
 #[tauri::command]
@@ -2557,12 +2598,13 @@ async fn wait_stopped(stop: &AtomicBool) {
 /// turn's bytes never went upstream, so the next turn's totals legitimately
 /// shrink and must not be judged against the stale span.
 async fn abort_lane_pre_stream(
+    state: &AppState,
     channel: &tauri::ipc::Channel<StreamEvent>,
     session_id: &str,
     lane: u32,
     message_id: &str,
 ) {
-    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
         map.remove(&(session_id.to_string(), lane));
     }
     let _ = channel.send(StreamEvent::Done {
@@ -2594,10 +2636,10 @@ pub async fn rollback_session(state: State<'_, AppState>, session_id: String, fr
     sf.telemetry.retain(|r| r.ts < from_ts);
     sf.meta.updated_at = now_ms();
     state.store.save(&sf)?;
-    if let Some(map) = prefixes_lock().as_mut() {
+    if let Some(map) = prefixes_lock(&state).as_mut() {
         map.remove(&(session_id.clone(), 0));
     }
-    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
         map.remove(&(session_id, 0));
     }
     Ok(removed)
@@ -2607,16 +2649,17 @@ pub async fn rollback_session(state: State<'_, AppState>, session_id: String, fr
 /// session-level grant for that tool (only a session — never global).
 #[tauri::command]
 pub fn resolve_approval(
+    state: State<'_, AppState>,
     approval_id: String,
     session_id: String,
     tool: String,
     approved: bool,
     remember: bool,
 ) -> Result<(), String> {
-    let tx = take_approval(&approval_id).ok_or("审批已不存在（可能已超时）")?;
+    let tx = take_approval(&state, &approval_id).ok_or("审批已不存在（可能已超时）")?;
     let _ = tx.send(approved);
     if approved && remember {
-        if let Some(set) = GRANTS.lock().unwrap().as_mut() {
+        if let Some(set) = state.grants.lock().unwrap().as_mut() {
             set.insert(grant_key(&session_id, &tool));
         }
     }
@@ -2625,6 +2668,7 @@ pub fn resolve_approval(
 
 #[tauri::command]
 pub async fn send_message(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     session_id: String,
     content: String,
@@ -2637,6 +2681,7 @@ pub async fn send_message(
         sf.meta.bindings.clone()
     };
     run_send(
+        app,
         &state,
         session_id,
         content,
@@ -2652,6 +2697,7 @@ pub async fn send_message(
 
 #[tauri::command]
 pub async fn arena_send(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     session_id: String,
     content: String,
@@ -2663,6 +2709,7 @@ pub async fn arena_send(
     // persist lanes first so they survive restarts
     state.store.set_bindings(&session_id, lanes.clone())?;
     run_send(
+        app,
         &state,
         session_id,
         content,
@@ -2687,6 +2734,7 @@ pub async fn arena_send(
 /// so far. Attached images ride only on the first member's turn.
 #[tauri::command]
 pub async fn group_send(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     session_id: String,
     content: String,
@@ -2720,6 +2768,7 @@ pub async fn group_send(
         // run_send awaits its (single) lane task internally, so this loop is
         // strictly sequential — each member sees all earlier replies.
         run_send(
+            app.clone(),
             &state,
             session_id.clone(),
             member_content,
@@ -2934,6 +2983,7 @@ const SUB_RESULT_CAP: usize = 4_000;
 /// text for the parent's tool-result message. Sub-sessions are kept on disk
 /// (inspectable) but excluded from sidebar lists by the frontend.
 async fn run_subagent(
+    state: &AppState,
     client: &reqwest::Client,
     data_dir: &std::path::Path,
     parent_session: &str,
@@ -2994,7 +3044,7 @@ async fn run_subagent(
         role: "user".into(),
         content: task.to_string(),
         reasoning: None,
-        ts: next_record_ts(),
+        ts: next_record_ts(&state),
         model: None,
         status: "ok".into(),
         usage: None,
@@ -3014,7 +3064,7 @@ async fn run_subagent(
 
     // prefix state for the sub lane (same static map, distinct key)
     let owned_prefix = {
-        let mut guard = prefixes_lock();
+        let mut guard = prefixes_lock(&state);
         let map = guard.get_or_insert_with(HashMap::new);
         let lp = map
             .entry((sub_id.clone(), 0u32))
@@ -3064,7 +3114,7 @@ async fn run_subagent(
         let usage = outcome.usage.clone();
         let cost = chat::cost_of(&usage, &provider, &model);
         let stat = RequestStat {
-            seq: SEQ.fetch_add(1, Ordering::Relaxed),
+            seq: state.seq.fetch_add(1, Ordering::Relaxed),
             ts: now_ms(),
             lane: 0,
             model: model.clone(),
@@ -3110,7 +3160,7 @@ async fn run_subagent(
             role: "assistant".into(),
             reasoning: if outcome.reasoning.is_empty() { None } else { Some(outcome.reasoning.clone()) },
             content: outcome.content.clone(),
-            ts: next_record_ts(),
+            ts: next_record_ts(&state),
             model: Some(model.clone()),
             status: outcome.status.clone(),
             usage: Some(usage),
@@ -3160,7 +3210,7 @@ async fn run_subagent(
                 role: "tool".into(),
                 content: result.clone(),
                 reasoning: None,
-                ts: next_record_ts(),
+                ts: next_record_ts(&state),
                 model: None,
                 status: "ok".into(),
                 usage: None,
@@ -3188,7 +3238,7 @@ async fn run_subagent(
 
     // fold the sub-turn into its lane's Zone H (mirrors run_send semantics)
     if turn_status != "error" {
-        let mut guard = prefixes_lock();
+        let mut guard = prefixes_lock(&state);
         if let Some(map) = guard.as_mut() {
             if let Some(lp) = map.get_mut(&(sub_id, 0)) {
                 for m in &sent_this_turn {
@@ -3248,6 +3298,7 @@ pub async fn wiki_generate(state: State<'_, AppState>, session_id: String) -> Re
 全文 500-900 字，全部基于实际读到的内容，禁止臆测；文件路径一律相对工作区根目录。只输出导读本身。";
     let channel = tauri::ipc::Channel::<StreamEvent>::new(|_| Ok(()));
     let text = run_subagent(
+        &state,
         &state.client,
         &data_dir,
         &session_id,
@@ -3525,6 +3576,7 @@ async fn run_review_rehearsal(
 }
 
 async fn run_send(
+    app: tauri::AppHandle,
     state: &State<'_, AppState>,
     session_id: String,
     content: String,
@@ -3570,7 +3622,7 @@ async fn run_send(
         role: "user".into(),
         content: content.clone(),
         reasoning: None,
-        ts: next_record_ts(),
+        ts: next_record_ts(&state),
         model: None,
         status: "ok".into(),
         usage: None,
@@ -3579,7 +3631,7 @@ async fn run_send(
         tool_calls: None,
         tool_call_id: None,
         skill_calls: if skill_calls.is_empty() { None } else { Some(skill_calls) },
-        workflow: record_workflow_of(&workflow_of_in(&session_id, &state.data_dir)),
+        workflow: record_workflow_of(&workflow_of_in(&state, &session_id, &state.data_dir)),
         images: image_names,
     };
     {
@@ -3613,8 +3665,12 @@ async fn run_send(
         let data_dir = state.data_dir.clone();
         let client = state.client.clone();
         let system = system.clone();
+        let app = app.clone();
 
         let handle = tauri::async_runtime::spawn(async move {
+            // the lane task outlives the borrow of `state` — re-resolve the
+            // managed state from the (moved, 'static) app handle instead
+            let state = app.state::<AppState>();
             let cfg = config::load(&data_dir);
             let provider = match resolve_provider(&cfg, &binding) {
                 Some(p) => p.clone(),
@@ -3644,7 +3700,7 @@ async fn run_send(
                     workspace = Some(wt.path);
                 }
             }
-            let perm_base = permission_of(&session_id);
+            let perm_base = permission_of(&state, &session_id);
             // sandbox: the risky "auto" write tier degrades to per-action
             // approval — fail-safe rather than convenient. 文件白名单的可信
             // 路径在自动模式下保持免审批（见写路径的 trusted 判定）。
@@ -3655,7 +3711,7 @@ async fn run_send(
             // goal gate: full surface, but more tool rounds per turn.
             // image gate: handled below via chat::image_generate — the turn
             // never enters the chat pipeline at all.
-            let wf = workflow_of_in(&session_id, &data_dir);
+            let wf = workflow_of_in(&state, &session_id, &data_dir);
             let plan_mode = wf == "plan";
             let goal_mode = wf == "goal";
             let deep_mode = wf == "deep";
@@ -3834,7 +3890,7 @@ async fn run_send(
                     role: "assistant".into(),
                     reasoning: None,
                     content: outcome.content.clone(),
-                    ts: next_record_ts(),
+                    ts: next_record_ts(&state),
                     model: Some(model.clone()),
                     status: outcome.status.clone(),
                     usage: None,
@@ -3864,7 +3920,7 @@ async fn run_send(
             }
 
             let (owned_prefix, system_injection, memo_injection) = {
-                let mut guard = prefixes_lock();
+                let mut guard = prefixes_lock(&state);
                 let map = guard.get_or_insert_with(HashMap::new);
                 let key = (session_id.clone(), lane);
                 let lp = map
@@ -4059,7 +4115,7 @@ async fn run_send(
                     // instead of being ignored until the first token
                     tokio::select! {
                         _ = wait_stopped(&stop) => {
-                            abort_lane_pre_stream(&channel, &session_id, lane, &first_message_id).await;
+                            abort_lane_pre_stream(&state, &channel, &session_id, lane, &first_message_id).await;
                             return;
                         }
                         mems = recall => {
@@ -4097,7 +4153,7 @@ async fn run_send(
                 });
                 tokio::select! {
                     _ = wait_stopped(&stop) => {
-                        abort_lane_pre_stream(&channel, &session_id, lane, &first_message_id).await;
+                        abort_lane_pre_stream(&state, &channel, &session_id, lane, &first_message_id).await;
                         return;
                     }
                     block = run_tot_rehearsal(&client, &provider, &model, &task_text) => {
@@ -4135,7 +4191,7 @@ async fn run_send(
                 // instead of being ignored until the first token
                 tokio::select! {
                     _ = wait_stopped(&stop) => {
-                        abort_lane_pre_stream(&channel, &session_id, lane, &first_message_id).await;
+                        abort_lane_pre_stream(&state, &channel, &session_id, lane, &first_message_id).await;
                         return;
                     }
                     block = run_review_rehearsal(&client, &provider, &model, &task_text, diff.as_deref(), &data_dir) => {
@@ -4152,7 +4208,7 @@ async fn run_send(
             // turn before any request goes upstream. Covers the race where a
             // phase future resolves before the 120ms stop poll notices.
             if stop.load(Ordering::Relaxed) {
-                abort_lane_pre_stream(&channel, &session_id, lane, &first_message_id).await;
+                abort_lane_pre_stream(&state, &channel, &session_id, lane, &first_message_id).await;
                 return;
             }
 
@@ -4175,7 +4231,7 @@ async fn run_send(
                 // monotonically (append-only) within an epoch; a new epoch is
                 // an expected rebuild, not a break
                 let chain_ok = {
-                    let mut guard = LAST_SPAN.lock().unwrap();
+                    let mut guard = state.last_span.lock().unwrap();
                     let map = guard.get_or_insert_with(HashMap::new);
                     let prev = map.insert((session_id.clone(), lane), (owned_prefix.epoch, total_bytes));
                     match prev {
@@ -4222,7 +4278,7 @@ async fn run_send(
                 let usage = outcome.usage.clone();
                 let cost = chat::cost_of(&usage, &provider, &model);
                 let mut stat = RequestStat {
-                    seq: SEQ.fetch_add(1, Ordering::Relaxed),
+                    seq: state.seq.fetch_add(1, Ordering::Relaxed),
                     ts: now_ms(),
                     lane,
                     model: model.clone(),
@@ -4344,7 +4400,7 @@ async fn run_send(
                     role: "assistant".into(),
                     reasoning: restored_reasoning,
                     content: restored_content,
-                    ts: next_record_ts(),
+                    ts: next_record_ts(&state),
                     model: Some(model.clone()),
                     status: outcome.status.clone(),
                     usage: Some(usage),
@@ -4387,7 +4443,7 @@ async fn run_send(
                                     hint
                                 ),
                                 reasoning: None,
-                                ts: next_record_ts(),
+                                ts: next_record_ts(&state),
                                 model: None,
                                 status: "ok".into(),
                                 usage: None,
@@ -4456,6 +4512,7 @@ async fn run_send(
                     let mut futs = Vec::new();
                     for (cid, task) in &fan_tasks {
                         futs.push(run_subagent(
+                            &state,
                             &client,
                             &data_dir,
                             &session_id,
@@ -4504,7 +4561,7 @@ async fn run_send(
                             role: "tool".into(),
                             content: result.clone(),
                             reasoning: None,
-                            ts: next_record_ts(),
+                            ts: next_record_ts(&state),
                             model: None,
                             status: "ok".into(),
                             usage: None,
@@ -4574,6 +4631,7 @@ async fn run_send(
                     for (cid, task) in &sub_calls {
                         sub_slots.insert(cid.clone(), futs.len());
                         futs.push(run_subagent(
+                            &state,
                             &client,
                             &data_dir,
                             &session_id,
@@ -4622,7 +4680,7 @@ async fn run_send(
                                             Err(e) => Err(format!("参数不是合法 JSON: {e}")),
                                             Ok(args) => {
                                                 let approval_id = Uuid::new_v4().to_string();
-                                                let rx = open_approval(&approval_id);
+                                                let rx = open_approval(&state, &approval_id);
                                                 let _ = channel.send(StreamEvent::ApprovalRequest {
                                                     lane,
                                                     approval_id,
@@ -4795,7 +4853,8 @@ async fn run_send(
                                     // fail-closed approval gate as write
                                     // tools (auto/grant bypasses the card).
                                     let granted = perm_mode == "auto"
-                                        || GRANTS
+                                        || state
+                                            .grants
                                             .lock()
                                             .unwrap()
                                             .as_ref()
@@ -4806,7 +4865,7 @@ async fn run_send(
                                         true
                                     } else {
                                         let approval_id = Uuid::new_v4().to_string();
-                                        let rx = open_approval(&approval_id);
+                                        let rx = open_approval(&state, &approval_id);
                                         let _ = channel.send(StreamEvent::ApprovalRequest {
                                             lane,
                                             approval_id: approval_id.clone(),
@@ -4859,7 +4918,7 @@ async fn run_send(
                                         "get_goal" | "create_goal" | "update_goal"
                                     )
                                 {
-                                    handle_goal_tool(&data_dir, &session_id, &tc.name, &args)
+                                    handle_goal_tool(&state, &data_dir, &session_id, &tc.name, &args).await
                                 } else if !crate::agent_tools::is_write_tool(&tc.name) {
                                     // sandbox policy: read tools may be refused
                                     // (delete-class rules don't apply here, but
@@ -4903,7 +4962,8 @@ async fn run_send(
                                     let granted = trusted
                                         || (verdict != crate::agent_tools::SandboxVerdict::ForceAsk
                                             && (perm_mode == "auto"
-                                                || GRANTS
+                                                || state
+                                                    .grants
                                                     .lock()
                                                     .unwrap()
                                                     .as_ref()
@@ -4921,7 +4981,7 @@ async fn run_send(
                                             .or_else(|| exec_args.get("from").and_then(|f| f.as_str()))
                                             .unwrap_or("?")
                                             .to_string();
-                                        let rx = open_approval(&approval_id);
+                                        let rx = open_approval(&state, &approval_id);
                                         let _ = channel.send(StreamEvent::ApprovalRequest {
                                             lane,
                                             approval_id: approval_id.clone(),
@@ -4987,7 +5047,7 @@ async fn run_send(
                                         if exec.starts_with("OK") && !rel.is_empty() {
                                             let after = abs.as_ref().and_then(|p| snap(p));
                                             let log = crate::types_rs::WriteLog {
-                                                ts: next_record_ts(),
+                                                ts: next_record_ts(&state),
                                                 tool: tc.name.clone(),
                                                 path: rel,
                                                 before,
@@ -5091,7 +5151,7 @@ async fn run_send(
                         role: "tool".into(),
                         content: result.clone(),
                         reasoning: None,
-                        ts: next_record_ts(),
+                        ts: next_record_ts(&state),
                         model: None,
                         status: "ok".into(),
                         usage: None,
@@ -5136,7 +5196,7 @@ async fn run_send(
             if turn_status != "error" {
                 let mut warm_slot: Option<crate::warmer::WarmSlot> = None;
                 {
-                    let mut guard = prefixes_lock();
+                    let mut guard = prefixes_lock(&state);
                     if let Some(map) = guard.as_mut() {
                         if let Some(lp) = map.get_mut(&(session_id.clone(), lane)) {
                             for m in &sent_this_turn {
@@ -5169,7 +5229,7 @@ async fn run_send(
                 // an errored turn's tail never enters Zone H — drop the
                 // span marker so the next request isn't judged against bytes
                 // we deliberately discarded
-                if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+                if let Some(map) = state.last_span.lock().unwrap().as_mut() {
                     map.remove(&(session_id.clone(), lane));
                 }
             }
@@ -5216,10 +5276,10 @@ async fn run_send(
                             if let Some(nx) = target {
                                 if def.states.iter().any(|s| s.name == nx) {
                                     let gate = format!("sm:{def_id}:{nx}");
-                                    sm_put(&session_id, &gate);
+                                    sm_put(&state, &session_id, &gate);
                                     // checkpoint so a restart resumes the
                                     // machine at the auto-advanced state
-                                    persist_gate(&data_dir, &session_id, Some(&gate));
+                                    persist_gate(&state, &session_id, Some(&gate)).await;
                                 }
                             }
                         }
@@ -5340,7 +5400,9 @@ async fn run_send(
         let data_dir = state.data_dir.clone();
         let sid = session_id.clone();
         let save_lock = state.save_lock.clone();
+        let app = app.clone();
         tauri::async_runtime::spawn(async move {
+            let state = app.state::<AppState>();
             let store = SessionStore::new(&data_dir);
             let Ok(sf) = store.load(&sid) else { return };
             if sf.meta.title != "新会话" || sf.messages.len() < 2 {
@@ -5348,7 +5410,7 @@ async fn run_send(
             }
             // image sessions: the binding is an image model — chat title-gen
             // would call chat/completions with it; derive from the prompt
-            if workflow_of_in(&sid, &data_dir) == "image" {
+            if workflow_of_in(&state, &sid, &data_dir) == "image" {
                 let t: String = sf
                     .messages
                     .iter()
@@ -5914,6 +5976,26 @@ mod memo_tests {
         let dir = std::env::temp_dir().join(format!("ccharness-elide-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // struct literal, NOT AppState::new(): the constructor runs global
+        // one-time init (spill root OnceLock, privacy log) that would poison
+        // other tests in the same process
+        let state = AppState {
+            data_dir: dir.clone(),
+            store: SessionStore::new(&dir),
+            client: reqwest::Client::new(),
+            stops: Mutex::new(HashMap::new()),
+            save_lock: Arc::new(tokio::sync::Mutex::new(())),
+            prefixes: Mutex::new(None),
+            seq: AtomicU64::new(1),
+            last_ts: AtomicU64::new(0),
+            approvals: Mutex::new(None),
+            grants: Mutex::new(None),
+            last_span: Mutex::new(None),
+            permissions: Mutex::new(None),
+            workflow: Mutex::new(None),
+            sm_state: Mutex::new(None),
+            force_quit: AtomicBool::new(false),
+        };
         let store = SessionStore::new(&dir);
         let sf = store.create("chat", vec![crate::types_rs::SessionBinding {
             provider_id: "p".into(),
@@ -5970,7 +6052,7 @@ mod memo_tests {
         s.messages.push(rec(0, "user", "第二轮", 9));
         store.save(&s).unwrap();
 
-        let (saved, stubs) = elide_stale_tool_records(&dir, &sid, 24_000, 9);
+        let (saved, stubs) = elide_stale_tool_records(&state, &dir, &sid, 24_000, 9);
         // token-unit accounting: 40k ASCII chars ≈ 10k tokens, stub ≈ 30
         assert!(saved > 10_000 - 500, "{saved}");
         assert_eq!(stubs, 1);
@@ -5984,7 +6066,7 @@ mod memo_tests {
         let kept = s2.messages.iter().find(|m| m.tool_call_id.as_deref() == Some("c3")).unwrap();
         assert_eq!(kept.content, big_keep);
         // idempotent: second run saves nothing
-        assert_eq!(elide_stale_tool_records(&dir, &sid, 24_000, 9), (0, 0));
+        assert_eq!(elide_stale_tool_records(&state, &dir, &sid, 24_000, 9), (0, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -52,7 +52,7 @@ fn main() {
         //   "ask" (default) → intercept and let the frontend dialog decide.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if commands::is_force_quit() {
+                if commands::is_force_quit(&window.app_handle().state::<commands::AppState>()) {
                     return; // user already confirmed a real exit
                 }
                 let app = window.app_handle();
