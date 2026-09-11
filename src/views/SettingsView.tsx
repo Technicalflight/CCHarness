@@ -327,6 +327,23 @@ export function SettingsView() {
         </div>
 
         <div className="card">
+          <h3>写后自动验证</h3>
+          <label style={{ fontSize: 12, color: "var(--text-dim)", display: "block", marginTop: 10 }}>
+            验证命令（留空关闭）
+            <input
+              className="input mono"
+              style={{ display: "block", marginTop: 4, width: "100%" }}
+              value={config.settings.post_write_command ?? ""}
+              placeholder="例如：npm run build 或 cargo check（在工作区根目录执行）"
+              onChange={(e) => update({ post_write_command: e.target.value.trim() === "" ? null : e.target.value })}
+            />
+          </label>
+          <div className="hint" style={{ marginTop: 8 }}>
+            每次写 / 改 / 补丁 / 删除 / 移动工具成功后，自动在工作区根目录运行该命令（90 秒上限），退出码与输出会追加进工具结果——模型当轮就能看到编译或测试是否通过，形成「写入 → 验证 → 自纠」反馈闭环，无需依赖模型自觉。
+          </div>
+        </div>
+
+        <div className="card">
           <h3>系统通知</h3>
           <div className="row" style={{ gap: 8 }}>
             <button

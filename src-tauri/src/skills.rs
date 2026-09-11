@@ -162,7 +162,11 @@ pub fn zone_section(workspace: Option<&str>) -> String {
             }
         })
         .collect();
-    let mut section = String::from("## 可用技能\n");
+    let mut section = String::from(
+        "## 可用技能\n技能路由阶梯：任务命中任一技能描述（含 Use when/触发场景）→ 先用已装技能；\
+         已装技能不满足 → 看是否有可配置项可调；都没有 → 与其凭空自创流程，不如向用户说明并建议新建技能。\
+         优先复用，避免重复造轮子。\n",
+    );
     if !parts.is_empty() {
         section.push_str(&parts.join("\n\n"));
         section.push('\n');

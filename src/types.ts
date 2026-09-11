@@ -58,6 +58,10 @@ export interface AppSettings {
   /** Goal-mode soft budget (USD, per session): reaching it turns the next
    *  auto-continue into a wrap-up nudge, then stops. Null = unlimited. */
   goal_budget_usd?: number | null;
+  /** Post-write verification hook: run this command at the workspace root
+   *  after every successful file-mutating tool and append its output to the
+   *  tool result. Null/empty = disabled. */
+  post_write_command?: string | null;
 }
 
 /** Result of an update check (backend `check_update`). */
@@ -86,6 +90,8 @@ export interface GoalInfo {
   checklist_done: number;
   checklist_total: number;
   checklist_all_met: boolean;
+  /** ✅ rows with no inline evidence (claimed, not verified). */
+  checklist_claimed: number;
 }
 
 /** Miss-divergence localization entry (see divergence.rs). */

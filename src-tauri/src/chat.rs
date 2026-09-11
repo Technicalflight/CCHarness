@@ -669,7 +669,7 @@ pub const SUBAGENT_DIRECTIVE: &str = "你是被父任务委派的子智能体，
 pub const GOAL_DIRECTIVE: &str = "当前处于【目标模式】。用户只锁定目标与验收标准，路径由你自主决定。请严格遵守：\n\
 1. 直接使用可用工具推进目标（写入操作仍按当前权限档位的审批规则执行）；\n\
 2. 每轮回复的末尾输出一个 ```goal 围栏代码块：逐条列出验收标准，已满足的标准前标 ✅，未满足的标 ⬜，并附一句当前进展说明；\n\
-3. 完成审计：每条 ✅ 必须附上可核验的证据——具体文件路径、命令及其输出摘要、或测试名；「已完成」「已实现」等空泛表述不构成证据；测试通过、代码写完、清单打满这类辅助信号本身不能单独作为完成依据；\n\
+3. 完成审计：每条 ✅ 必须在该行内附上可核验的证据——用反引号标注具体文件路径、命令及输出摘要或测试名（如 `src/prefix.rs`、`cargo test 12 通过`），或用全角括注（…）说明证据来源；「已完成」「已实现」等空泛表述不构成证据，行内无证据标注的 ✅ 会被审计为未验证声明；测试通过、代码写完、清单打满这类辅助信号本身不能单独作为完成依据；\n\
 4. 存疑即未完成：任一验收标准无法给出可核验证据时，保持 ⬜ 并继续验证或继续工作——宁可多跑一轮，不可虚标 ✅；\n\
 5. 当且仅当全部验收标准都为 ✅ 时，在该 ```goal 块的最后一行单独输出 GOAL_DONE；\n\
 6. 动态重规划：每轮开始时重新评估目标与环境现状——若事实、障碍或外部条件发生变化，允许修订未完成(⬜)验收标准的表述（在该行尾标注「（修订：<原因>）」），但已满足(✅)的标准不得删除或放宽；\n\
@@ -684,6 +684,17 @@ pub const GOAL_DIRECTIVE: &str = "当前处于【目标模式】。用户只锁�
 pub const DEEP_DIRECTIVE: &str = "当前处于【深度推理模式】。本轮采用 Tree-of-Thoughts 式方案预演：系统已针对该任务并行生成多个候选方案并完成评审，评审结论以「[深度推理 · 方案预演]」附在本条消息之后。请严格遵守：\n\
 1. 优先按选定方案推进；除非执行中发现明显更优路径，可简要说明理由后调整；\n\
 2. 关键决策点先给出理由再行动。\n\n";
+
+/// Review directive (better-harness style findings reconciliation): three
+/// mutually-exclusive read-only experts pre-review in parallel and their raw
+/// findings ride on the user message; the model itself acts as the Lead —
+/// the only role allowed to dedupe, grade and publish the final table.
+pub const REVIEW_DIRECTIVE: &str = "当前处于【审阅模式】。本轮采用三专家并行预审：正确性、安全边界、可维护性三个只读视角的原始发现以「[三专家审阅预演]」附在本条消息之后。请作为汇合评审（Lead）严格遵守：\n\
+1. 你只有只读工具——先用工具核实每条发现的文件、行号与根因，再决定是否采纳，不要修改任何文件；\n\
+2. 去重合并三份发现（同一位置同一根因只保留一条），按严重度排序（严重 > 主要 > 次要）；\n\
+3. 输出最终发现表（Markdown 表格，列：| # | 严重度 | 后果 | 根因 | 位置 | 修复与验证 |）；位置用 `文件:行号` 反引号格式；每条「修复与验证」给出最小修复动作与验证方式；\n\
+4. 无法核实的条目在严重度列标注「待核」，不要删除也不要臆断；专家列表之外你自己用只读工具新发现的同样入表；\n\
+5. 没有发现时明确说明「本次审阅无发现」，不要为了凑数输出风格类噪声。\n\n";
 
 /// Text of the deterministic synthetic user message that carries a tool
 /// result's images (OpenAI tool-role content must stay a plain string, so
@@ -826,6 +837,7 @@ pub fn transcript_for_lane(
             ("user", _, Some(w)) if w == "plan" => format!("{PLAN_DIRECTIVE}{}", m.content),
             ("user", _, Some(w)) if w == "goal" => format!("{GOAL_DIRECTIVE}{}", m.content),
             ("user", _, Some(w)) if w == "deep" => format!("{DEEP_DIRECTIVE}{}", m.content),
+            ("user", _, Some(w)) if w == "review" => format!("{REVIEW_DIRECTIVE}{}", m.content),
             ("user", _, Some(w)) if w == "subagent" => format!("{SUBAGENT_DIRECTIVE}{}", m.content),
             // declarative state machine: the gate rides as "sm:<def>:<state>"
             // on the user record; the state's directive is injected verbatim

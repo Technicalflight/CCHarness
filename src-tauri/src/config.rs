@@ -123,6 +123,13 @@ pub struct AppSettings {
     /// None = unlimited. Enforced frontend-side (cost data lives in records).
     #[serde(default)]
     pub goal_budget_usd: Option<f64>,
+    /// Post-write verification hook (better-harness style feedback loop):
+    /// after every successful file-mutating tool (write/edit/apply_patch/
+    /// delete/move) the main lane runs this command at the workspace root
+    /// and appends its output to the tool result, so the model sees the
+    /// verification immediately. None/empty = disabled.
+    #[serde(default)]
+    pub post_write_command: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -143,6 +150,7 @@ impl Default for AppSettings {
             guardrails: false,
             guardrails_extra: Vec::new(),
             goal_budget_usd: None,
+            post_write_command: None,
         }
     }
 }

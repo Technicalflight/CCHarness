@@ -318,6 +318,7 @@ function GoalSummaryBar({
     running && info.checklist_total > 0
       ? ` ${info.checklist_done}/${info.checklist_total}`
       : "";
+  const claimed = info.checklist_claimed ?? 0;
   return (
     <div className={`goal-summary ${s.cls}`}>
       <Icon name="target" size={13} />
@@ -325,6 +326,14 @@ function GoalSummaryBar({
         目标{s.label}
         {progress}
       </span>
+      {claimed > 0 && (
+        <span
+          className="gs-budget over"
+          title="这些 ✅ 行内缺少可核验证据（反引号路径/命令/测试名或括注），按完成审计规则视为未验证声明"
+        >
+          {claimed} 项证据待补
+        </span>
+      )}
       {budgetUsd != null && costUsd != null && (
         <span
           className={`gs-budget ${overBudget ? "over" : ""}`}
@@ -484,13 +493,14 @@ function ModelDivider({ model }: { model: string }) {
 }
 
 /** Builtin workflow-gate display names for the floating capsule. */
-const WF_LABEL: Record<string, string> = { agent: "智能体", plan: "规划", goal: "目标", deep: "深度", image: "生图" };
+const WF_LABEL: Record<string, string> = { agent: "智能体", plan: "规划", goal: "目标", deep: "深度", review: "审阅", image: "生图" };
 /** wf-btn icon follows the active gate (custom SM workflows keep "branch"). */
 const WF_ICON: Record<string, IconName> = {
   agent: "robot",
   plan: "clipboard",
   goal: "target",
   deep: "cpu",
+  review: "scan",
   image: "image",
 };
 
@@ -1476,6 +1486,7 @@ export function ChatView() {
                         { value: "plan", icon: "clipboard", label: "规划", hint: "只读调研 + ```plan 方案，批准前不改文件" },
                         { value: "goal", icon: "target", label: "目标", hint: "只锁目标与验收标准，路径自选" },
                         { value: "deep", icon: "cpu", label: "深度推理", hint: "ToT 预演：三方案并行生成 + 评审选优后作答" },
+                        { value: "review", icon: "scan", label: "审阅", hint: "三专家并行预审（只读），汇合去重定级输出发现表" },
                       ] as const
                     ).map((o) => {
                       const cur = wfMode === o.value;

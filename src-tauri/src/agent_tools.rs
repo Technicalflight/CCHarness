@@ -704,6 +704,26 @@ fn run_command(workspace: &str, command: &str, timeout_secs: u64) -> Result<Stri
     Ok(format!("{head}{body}"))
 }
 
+/// Post-write verification hook (better-harness style feedback loop): run the
+/// user-configured command once at the workspace root right after a
+/// successful file-mutating tool, and return a bounded report block to append
+/// to the tool result so the model sees the verification result immediately.
+/// Returns None when the hook is disabled or there is no workspace.
+pub fn post_write_verify(workspace: &str, command: &str) -> Option<String> {
+    let cmd = command.trim();
+    if cmd.is_empty() || workspace.is_empty() {
+        return None;
+    }
+    // 90s ceiling: verification loops (build/test/lint) can be slow, but this
+    // runs inline inside the tool loop and must not stall the turn.
+    match run_command(workspace, cmd, 90) {
+        Ok(body) => Some(format!("\n\n## 写后自动验证（post_write_command）\n{body}")),
+        Err(e) => Some(format!(
+            "\n\n## 写后自动验证（post_write_command）\nERROR: {e}"
+        )),
+    }
+}
+
 /// Fetch a public URL and return readable plain text. Runs on a dedicated
 /// thread (reqwest blocking + join) because tool execution is sync inside an
 /// async command. SSRF: the same urlguard policy as provider endpoints, plus

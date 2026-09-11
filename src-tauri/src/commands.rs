@@ -52,8 +52,10 @@ const VALID_MODES: &[&str] = &["readonly", "approve", "auto"];
 /// approve before any write can happen) | "goal" (only the goal + acceptance
 /// criteria are locked; the agent picks its own path until all criteria pass,
 /// with dynamic re-planning) | "deep" (Tree-of-Thoughts rehearsal: parallel
-/// candidate approaches + judge, then the normal loop) | "sm:<def_id>:<state>"
-/// (declarative state machine, see SM_STATE).
+/// candidate approaches + judge, then the normal loop) | "review" (three
+/// read-only expert pre-reviews + the model as Lead publishing a deduped,
+/// graded findings table) | "sm:<def_id>:<state>" (declarative state machine,
+/// see SM_STATE).
 /// In-memory like PERMISSIONS, checkpointed onto SessionMeta.wf_gate so a
 /// restart resumes the same mode instead of falling back to agent.
 static WORKFLOW: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
@@ -122,6 +124,7 @@ fn workflow_of_in(session_id: &str, data_dir: &std::path::Path) -> String {
         Some("plan") => "plan".to_string(),
         Some("goal") => "goal".to_string(),
         Some("deep") => "deep".to_string(),
+        Some("review") => "review".to_string(),
         Some("image") => "image".to_string(),
         Some(w) if w.starts_with("sm:") => w.to_string(),
         _ => "agent".to_string(),
@@ -134,7 +137,7 @@ pub fn set_workflow_mode(
     session_id: String,
     mode: String,
 ) -> Result<(), String> {
-    if matches!(mode.as_str(), "agent" | "plan" | "goal" | "deep" | "image") {
+    if matches!(mode.as_str(), "agent" | "plan" | "goal" | "deep" | "review" | "image") {
         // leaving (or never entering) a state machine — clear the SM position
         if let Some(m) = SM_STATE.lock().unwrap().as_mut() {
             m.remove(&session_id);
@@ -191,6 +194,16 @@ const GOAL_STATUSES: &[&str] = &["active", "paused", "achieved", "unmet", "budge
 /// Lines without a ✅/⬜ marker (progress notes, replan remarks) are not
 /// counted as criteria.
 pub fn parse_goal_summary(content: &str) -> (usize, usize, bool) {
+    let (ok, total, done, _) = parse_goal_summary_ext(content);
+    (ok, total, done)
+}
+
+/// Extended parse (better-harness "claimed vs exercised" grading): also
+/// counts ✅ criteria whose line carries NO inline evidence — no backtick
+/// span (`path` / `cmd` / test name) and no （…） bracket note. A ✅ without
+/// evidence is a *claim*, not a verified completion; surfaces use this to
+/// warn instead of trusting the checkmark.
+pub fn parse_goal_summary_ext(content: &str) -> (usize, usize, bool, usize) {
     let mut block: Option<&str> = None;
     let mut rest = content;
     while let Some(pos) = rest.find("```goal") {
@@ -207,21 +220,30 @@ pub fn parse_goal_summary(content: &str) -> (usize, usize, bool) {
         }
     }
     let Some(body) = block else {
-        return (0, 0, false);
+        return (0, 0, false, 0);
     };
     let done = body.contains("GOAL_DONE");
     let mut ok = 0usize;
     let mut total = 0usize;
+    let mut claimed = 0usize;
     for line in body.lines() {
         let t = line.trim_start();
         if t.starts_with("✅") {
             ok += 1;
             total += 1;
+            let has_backtick = t.contains('`');
+            let has_bracket = match t.find('（') {
+                Some(i) => t[i + '（'.len_utf8()..].contains('）'),
+                None => false,
+            };
+            if !has_backtick && !has_bracket {
+                claimed += 1;
+            }
         } else if t.starts_with("⬜") {
             total += 1;
         }
     }
-    (ok, total, done)
+    (ok, total, done, claimed)
 }
 
 /// Create/replace the session goal and activate the goal gate. Shared by
@@ -292,13 +314,15 @@ pub fn goal_get(state: State<'_, AppState>, session_id: String) -> Result<GoalIn
             last_assistant = m.content.clone();
         }
     }
-    let (checklist_done, checklist_total, checklist_all_met) = parse_goal_summary(&last_assistant);
+    let (checklist_done, checklist_total, checklist_all_met, checklist_claimed) =
+        parse_goal_summary_ext(&last_assistant);
     Ok(GoalInfo {
         goal,
         cost_usd: if has_cost { Some(cost) } else { None },
         checklist_done,
         checklist_total,
         checklist_all_met,
+        checklist_claimed,
     })
 }
 
@@ -360,13 +384,15 @@ fn handle_goal_tool(data_dir: &std::path::Path, session_id: &str, name: &str, ar
                 .find(|m| m.role == "assistant")
                 .map(|m| m.content.clone())
                 .unwrap_or_default();
-            let (ok, total, all_met) = parse_goal_summary(&last);
+            let (ok, total, all_met, claimed) = parse_goal_summary_ext(&last);
             let info = serde_json::json!({
                 "objective": g.objective,
                 "status": g.status,
                 "checklist_done": ok,
                 "checklist_total": total,
                 "checklist_all_met": all_met,
+                "checklist_claimed_no_evidence": claimed,
+                "hint": if claimed > 0 { format!("{claimed} 条 ✅ 行内缺少反引号或（…）证据标注——按完成审计规则补上可核验证据，否则降回 ⬜") } else { String::new() },
             });
             format!("OK:{info}")
         }
@@ -2162,6 +2188,74 @@ async fn run_tot_rehearsal(
     Some(block)
 }
 
+/// Garnish cap per review expert (chars).
+const REVIEW_EXPERT_CAP: usize = 1_500;
+
+/// Review mode (better-harness style findings pre-review): three
+/// mutually-exclusive read-only experts review in parallel — correctness,
+/// security boundaries, maintainability/test gaps — each emitting one-line
+/// findings (severity / consequence / root cause / location / verifier).
+/// The model later acts as the Lead (dedupe + grade + publish), so there is
+/// deliberately NO judge call here. Returns a text block to append to the
+/// user message actually SENT this turn (same garnish mechanism as ToT).
+/// Any failure returns None: review mode must never block a normal send.
+async fn run_review_rehearsal(
+    client: &reqwest::Client,
+    provider: &crate::config::Provider,
+    model: &str,
+    task: &str,
+    diff: Option<&str>,
+) -> Option<String> {
+    let clip = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    let experts = [
+        ("A", "正确性与逻辑缺陷：边界条件、错误处理、并发/时序、空值与溢出"),
+        ("B", "安全边界：注入、SSRF、密钥泄露、越权访问、不可信输入未校验"),
+        ("C", "可维护性与测试缺口：重复逻辑、复杂度失控、命名误导、缺失测试"),
+    ];
+    let subject = match diff {
+        Some(d) => format!(
+            "{}\n\n--- 待审阅的未提交变更（git diff HEAD）---\n{}",
+            clip(task, 1_200),
+            d
+        ),
+        None => clip(task, 6_000),
+    };
+    let prompts: Vec<String> = experts
+        .iter()
+        .map(|(_tag, lens)| {
+            format!(
+                "你是代码审阅专家（只读视角，只负责：{lens}）。针对待审阅内容逐条输出发现，每条一行，格式严格为：\n- [严重度] 后果 ← 根因 @ 位置 → 验证方式\n其中严重度 ∈ 严重/主要/次要；位置写 文件:行号（无文件上下文时写 任务级）；验证方式一句话说明如何证实或复现。只输出本视角的发现，不要涉及其他视角，不要寒暄；没有发现则只输出「无发现」。"
+            )
+        })
+        .collect();
+    let mut futs = Vec::new();
+    for p in &prompts {
+        futs.push(chat::ask_once(client, provider, model, p, &subject, 800));
+    }
+    let results = futures_util::future::join_all(futs).await;
+    let mut block = String::from("\n\n[三专家审阅预演 — 并行只读评审，待汇合定级]\n");
+    let mut any = false;
+    for ((tag, lens), r) in experts.iter().zip(results) {
+        let text = r.ok().map(|s| s.trim().to_string()).unwrap_or_default();
+        if text.is_empty() {
+            continue;
+        }
+        any = true;
+        block.push_str(&format!(
+            "专家{tag}（{}）：{}\n\n",
+            lens.split('：').next().unwrap_or(lens),
+            clip(&text, REVIEW_EXPERT_CAP)
+        ));
+    }
+    if !any {
+        return None;
+    }
+    block.push_str(
+        "请按审阅模式规则汇合：先用只读工具核实，再输出去重定级后的最终发现表；无法核实的条目标注「待核」。",
+    );
+    Some(block)
+}
+
 async fn run_send(
     state: &State<'_, AppState>,
     session_id: String,
@@ -2298,6 +2392,7 @@ async fn run_send(
             let plan_mode = wf == "plan";
             let goal_mode = wf == "goal";
             let deep_mode = wf == "deep";
+            let review_mode = wf == "review";
             let image_mode = wf == "image";
             // declarative state machine: resolve the current state (if the
             // def was deleted or redefined since the gate was set, degrade
@@ -2315,13 +2410,14 @@ async fn run_send(
             let tools_on = cfg.settings.agent_tools && workspace.is_some() && !sm_no_tools;
             let mcp_enabled = cfg.settings.agent_tools
                 && !plan_mode
+                && !review_mode
                 && !sm_no_tools
                 && !sm_ro_tools
                 && cfg.mcp_servers.iter().any(|s| s.enabled);
             let mut schema_all: Vec<Value> = Vec::new();
             if tools_on {
                 schema_all.extend(
-                    match perm_mode == "readonly" || plan_mode || sm_ro_tools {
+                    match perm_mode == "readonly" || plan_mode || review_mode || sm_ro_tools {
                         true => crate::agent_tools::schema_readonly().as_array().cloned().unwrap_or_default(),
                         false => crate::agent_tools::schema().as_array().cloned().unwrap_or_default(),
                     },
@@ -2579,6 +2675,28 @@ async fn run_send(
             if deep_mode && !sent_this_turn.is_empty() {
                 let task_text = sent_this_turn[0].content.clone();
                 if let Some(block) = run_tot_rehearsal(&client, &provider, &model, &task_text).await {
+                    if let Some(first) = sent_this_turn.first_mut() {
+                        first.content.push_str(&block);
+                    }
+                }
+            }
+
+            // Review mode (better-harness style): three mutually-exclusive
+            // read-only experts pre-review in parallel (correctness / security
+            // / maintainability); the model itself reconciles their findings
+            // into the final graded table. Same garnish mechanism as ToT.
+            if review_mode && !sent_this_turn.is_empty() {
+                let task_text = sent_this_turn[0].content.clone();
+                let diff = workspace.as_deref().and_then(|ws| {
+                    crate::worktree::git(std::path::Path::new(ws), &["diff", "HEAD"])
+                        .ok()
+                        .map(|d| d.chars().take(6_000).collect::<String>())
+                        .filter(|d| !d.trim().is_empty())
+                });
+                if let Some(block) =
+                    run_review_rehearsal(&client, &provider, &model, &task_text, diff.as_deref())
+                        .await
+                {
                     if let Some(first) = sent_this_turn.first_mut() {
                         first.content.push_str(&block);
                     }
@@ -3265,7 +3383,7 @@ async fn run_send(
                                             })
                                         };
                                         let before = abs.as_ref().and_then(|p| snap(p));
-                                        let exec = crate::agent_tools::execute_write(
+                                        let mut exec = crate::agent_tools::execute_write(
                                             workspace.as_deref().unwrap_or(""),
                                             &tc.name,
                                             &args,
@@ -3287,6 +3405,31 @@ async fn run_send(
                                                 }
                                                 sf.meta.updated_at = now_ms();
                                                 let _ = store.save(&sf);
+                                            }
+                                        }
+                                        // post-write verification hook: run the
+                                        // configured command and append its
+                                        // report so the model sees verification
+                                        // output in this very tool result
+                                        if exec.starts_with("OK")
+                                            && matches!(
+                                                tc.name.as_str(),
+                                                "write_file"
+                                                    | "edit_file"
+                                                    | "apply_patch"
+                                                    | "delete_file"
+                                                    | "move_path"
+                                            )
+                                        {
+                                            if let (Some(ws), Some(cmd)) = (
+                                                workspace.as_deref(),
+                                                cfg.settings.post_write_command.as_deref(),
+                                            ) {
+                                                if let Some(report) =
+                                                    crate::agent_tools::post_write_verify(ws, cmd)
+                                                {
+                                                    exec.push_str(&report);
+                                                }
                                             }
                                         }
                                         exec
@@ -3792,7 +3935,7 @@ pub fn get_aux_stats(state: State<'_, AppState>) -> crate::auxmemo::AuxStats {
 
 #[cfg(test)]
 mod goal_tests {
-    use super::parse_goal_summary;
+    use super::{parse_goal_summary, parse_goal_summary_ext};
 
     #[test]
     fn parses_last_goal_block_only() {
@@ -3824,5 +3967,20 @@ mod goal_tests {
         // 无 ✅/⬜ 前缀的进展说明行不计入总数。
         let content = "```goal\n已完成编译检查\n测试全部通过\n```";
         assert_eq!(parse_goal_summary(content), (0, 0, false));
+    }
+
+    #[test]
+    fn claimed_counts_ok_rows_without_inline_evidence() {
+        // ✅ 行内无反引号且无（…）括注 = claimed（未验证声明）。
+        let content = "```goal\n✅ 实现增量计算\n✅ 通过测试 `cargo test 12 通过`\n✅ 覆盖边界（见 src/prefix.rs）\n⬜ 剩余项\n```";
+        assert_eq!(parse_goal_summary(content), (3, 4, false));
+        let (ok, total, done, claimed) = parse_goal_summary_ext(content);
+        assert_eq!((ok, total, done, claimed), (3, 4, false, 1));
+    }
+
+    #[test]
+    fn claimed_zero_when_all_rows_evidenced() {
+        let content = "```goal\n✅ 修复断裂 `git diff --check`\n✅ 复跑通过（cargo test 全绿）\nGOAL_DONE\n```";
+        assert_eq!(parse_goal_summary_ext(content), (2, 2, true, 0));
     }
 }

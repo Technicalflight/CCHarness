@@ -55,6 +55,7 @@ const WORKFLOW_OPTIONS = [
   { value: "plan", label: <><Icon name="clipboard" size={13} /> 规划</> },
   { value: "goal", label: <><Icon name="target" size={13} /> 目标</> },
   { value: "deep", label: <><Icon name="cpu" size={13} /> 深度</> },
+  { value: "review", label: <><Icon name="scan" size={13} /> 审阅</> },
 ];
 
 /** An image staged for the next send (base64 + instant preview URI). */

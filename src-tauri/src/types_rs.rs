@@ -83,6 +83,10 @@ pub struct GoalInfo {
     pub checklist_total: usize,
     /// Whether the last checklist declared GOAL_DONE.
     pub checklist_all_met: bool,
+    /// ✅ rows whose line carries NO inline evidence (no backtick span and no
+    /// （…） bracket note) — better-harness "claimed vs exercised" grading:
+    /// these completions are asserted without verifiable proof.
+    pub checklist_claimed: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
