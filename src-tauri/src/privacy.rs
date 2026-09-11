@@ -58,6 +58,40 @@ pub fn init_log(dir: &Path) {
     let _ = LOG_PATH.set(dir.join("privacy_log.jsonl"));
 }
 
+// ---------- 自定义脱敏规则（正则，用户在设置页维护）--------------------
+//
+// 内置检测覆盖不了的自由文本敏感信息（中文姓名、内部代号、项目专名等）
+// 由用户用正则自行补充：命中统一替换为 [匿名-xxxxxxxx]（确定性，可还原，
+// 照常进映射日志）。规则在启动与每次保存配置时重新编译加载。
+
+fn custom_lock() -> std::sync::MutexGuard<'static, Vec<Regex>> {
+    static CUSTOM: Mutex<Vec<Regex>> = Mutex::new(Vec::new());
+    CUSTOM.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Load user-defined scrub patterns (called at startup / config save).
+/// Uncompilable patterns are skipped with a stderr note (never panic).
+pub fn set_custom_patterns(patterns: Vec<String>) {
+    let compiled: Vec<Regex> = patterns
+        .iter()
+        .take(64)
+        .filter_map(|p| {
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            match Regex::new(trimmed) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    eprintln!("[privacy] 自定义规则编译失败，已跳过 ({e}): {trimmed}");
+                    None
+                }
+            }
+        })
+        .collect();
+    *custom_lock() = compiled;
+}
+
 fn trim_log(path: &Path) {
     let Ok(md) = std::fs::metadata(path) else { return };
     if md.len() <= LOG_MAX_BYTES {
@@ -192,12 +226,14 @@ fn shape_surrogate(seed: &[u8; 32], kind: &str, original: &str) -> String {
     out
 }
 
-/// 11-digit CN phone: keep the 3-digit segment prefix, replace the rest.
+/// 11-digit CN phone: keep the 3-char head (segment prefix, or a "+86"
+/// country prefix), replace the rest. Byte index wraps so prefixed numbers
+/// (more than 8 trailing digits) derive fine too.
 fn phone_surrogate(seed: &[u8; 32], original: &str) -> String {
     let bytes = derive(seed, "phone", original, 8);
     let mut out: String = original.chars().take(3).collect();
     for (i, _) in original.chars().skip(3).enumerate() {
-        out.push((b'0' + (bytes[i] % 10)) as char);
+        out.push((b'0' + (bytes[i % bytes.len()] % 10)) as char);
     }
     out
 }
@@ -412,8 +448,18 @@ fn detect(seed: &[u8; 32], text: &str) -> Vec<Hit> {
         }
     }
     // CN mobile: 1[3-9] + 9 digits, boundary-guarded
-    let phone_re = Regex::new(r"\b1[3-9][0-9]{9}\b").unwrap();
+    // CN mobile: 1[3-9] + 9 digits, optionally with a +86 / 86 country
+    // prefix. The regex crate has no lookbehind/lookahead, so matches glued
+    // into longer digit runs (bank-card candidates, truncated numbers) are
+    // rejected with manual boundary checks.
+    let phone_re = Regex::new(r"(?:\+?86)?1[3-9][0-9]{9}").unwrap();
     for m in phone_re.find_iter(text) {
+        let head_digit = m.start() > 0 && text[..m.start()].ends_with(|c: char| c.is_ascii_digit());
+        let tail_digit =
+            m.end() < text.len() && text[m.end()..].starts_with(|c: char| c.is_ascii_digit());
+        if head_digit || tail_digit {
+            continue;
+        }
         push(m.start(), m.end(), "phone", phone_surrogate(seed, m.as_str()));
     }
     // generic high-entropy secret assignments (token = "…", password: '…')
@@ -428,6 +474,16 @@ fn detect(seed: &[u8; 32], text: &str) -> Vec<Hit> {
         let s = m.as_str();
         if s.split('.').all(|o| o.parse::<u16>().map(|v| v <= 255).unwrap_or(false)) {
             push(m.start(), m.end(), "ipv4", ipv4_surrogate(seed, s));
+        }
+    }
+    // user-defined custom patterns (设置页·自定义脱敏规则): run LAST so the
+    // built-in typed detectors win overlapping spans; deterministic
+    // [匿名-xxxxxxxx] replacement keeps restore + the mapping log working.
+    for re in custom_lock().iter() {
+        for m in re.find_iter(text) {
+            let bytes = derive(seed, "custom", m.as_str(), 4);
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            push(m.start(), m.end(), "custom", format!("[匿名-{hex}]"));
         }
     }
     hits.sort_by_key(|h| h.start);
@@ -622,5 +678,35 @@ mod tests {
         let s = seed();
         let text = "今天天气不错，我们在写一个 Rust 项目，函数 foo() 返回 42。";
         assert_eq!(outbound("t10", &s, text), text);
+    }
+
+    #[test]
+    fn phone_with_country_prefix() {
+        let s = seed();
+        // +86 前缀（此前是检测盲区：6 紧贴 1 导致 11 位正则失配）
+        let out = outbound("t11", &s, "帮我查一下 +8613027666495 是谁的");
+        assert!(!out.contains("13027666495"), "got: {out}");
+        assert!(out.contains("+86"), "prefix kept: {out}");
+        // 86 无加号（整串 13 位数字，Luhn 不过才会落到手机号检测）
+        let out2 = outbound("t11", &s, "号码 8613027666495");
+        assert!(!out2.contains("8613027666495"), "got: {out2}");
+        // 更长的数字串不被误判（13 位数字贴着更多数字时跳过）
+        let out3 = outbound("t11", &s, "订单号 986130276664951");
+        assert!(out3.contains("986130276664951"), "longer run untouched: {out3}");
+    }
+
+    #[test]
+    fn custom_patterns_scrub_restore_and_log_kind() {
+        set_custom_patterns(vec!["张三".into(), r"\bProjectX\b".into()]);
+        let s = seed();
+        let original = "张三在 ProjectX 项目里";
+        let scrubbed = outbound("t12", &s, original);
+        assert!(!scrubbed.contains("张三"), "got: {scrubbed}");
+        assert!(!scrubbed.contains("ProjectX"), "got: {scrubbed}");
+        assert!(scrubbed.contains("[匿名-"), "got: {scrubbed}");
+        // 确定性 + 可还原
+        assert_eq!(outbound("t12", &s, original), scrubbed);
+        assert_eq!(restore("t12", &scrubbed), original);
+        set_custom_patterns(Vec::new());
     }
 }

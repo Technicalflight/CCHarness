@@ -136,6 +136,11 @@ pub struct AppSettings {
     /// 还原。映射表只存在本机。可能影响模型结果；并非 100% 安全。默认关。
     #[serde(default)]
     pub privacy_mode: bool,
+    /// 伪匿名化·自定义脱敏规则（正则，UI 每行一条）：内置检测覆盖不了的
+    /// 自由文本敏感信息（中文姓名、内部代号等）由用户自行补充，命中统一
+    /// 替换为 [匿名-xxxxxxxx]，照常进映射日志、可还原。
+    #[serde(default)]
+    pub privacy_custom_patterns: Vec<String>,
     /// 沙箱模式总开关（默认关）：开启后下列子策略才生效。被拦截的操作
     /// 会以 ERROR 返回给模型——可能影响任务完成度。
     #[serde(default)]
@@ -224,6 +229,7 @@ impl Default for AppSettings {
             goal_budget_usd: None,
             post_write_command: None,
             privacy_mode: false,
+            privacy_custom_patterns: Vec::new(),
             sandbox_mode: false,
             sandbox_files: true,
             sandbox_commands: true,

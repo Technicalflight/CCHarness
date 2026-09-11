@@ -150,6 +150,7 @@ const KIND_LABELS: Record<string, string> = {
   phone: "手机号",
   secret: "密钥",
   ipv4: "IP 地址",
+  custom: "自定义",
 };
 
 export function PrivacyLogDialog(props: {

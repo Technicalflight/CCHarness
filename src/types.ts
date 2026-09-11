@@ -64,6 +64,8 @@ export interface AppSettings {
   post_write_command?: string | null;
   /** 伪匿名化安全模式：出站文本类型一致替代（默认关）。 */
   privacy_mode: boolean;
+  /** 伪匿名化·自定义脱敏规则（正则，每行一条，命中替换为 [匿名-xxxxxxxx]）。 */
+  privacy_custom_patterns: string[];
   /** 沙箱模式总开关（默认关），以下子策略仅在总开关开启时生效。 */
   sandbox_mode: boolean;
   sandbox_files: boolean;

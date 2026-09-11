@@ -617,7 +617,9 @@ impl AppState {
             .expect("http client");
         let store = SessionStore::new(&data_dir);
         // mirror the sandbox policy into the tool guard before any turn runs
-        sync_sandbox_policy(&config::load(&data_dir).settings);
+        let boot_settings = config::load(&data_dir).settings;
+        sync_sandbox_policy(&boot_settings);
+        crate::privacy::set_custom_patterns(boot_settings.privacy_custom_patterns.clone());
         // The request sequence must survive restarts: seed the global counter
         // from the highest seq already recorded in any session file, or old
         // and new records collide on the same numbers.
@@ -687,6 +689,7 @@ pub fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<(), 
     }
     config::save(&state.data_dir, &config);
     sync_sandbox_policy(&config.settings);
+    crate::privacy::set_custom_patterns(config.settings.privacy_custom_patterns.clone());
     Ok(())
 }
 

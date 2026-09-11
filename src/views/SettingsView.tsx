@@ -451,6 +451,33 @@ export function SettingsView() {
             替代值按会话确定性生成（同一会话内同一原文永远映射同一替身，跨会话隔离），映射表只存在于本机
             data_dir 下，不会上传。
           </div>
+          <label
+            style={{
+              display: "grid",
+              gap: 6,
+              marginTop: 10,
+              fontSize: 12,
+              color: "var(--text-dim)",
+            }}
+          >
+            自定义脱敏规则（每行一个正则）—— 内置检测覆盖不了的信息（如中文姓名、内部代号）在这里补充，
+            命中统一替换为 <code>[匿名-xxxxxxxx]</code>，照常进映射日志、可还原。例：{' '}
+            <code>张三|李四</code>、<code>内部项目-[A-Z0-9]+</code>
+            <textarea
+              className="input"
+              rows={3}
+              placeholder={"张三|李四\n内部项目-[A-Z0-9]+"}
+              value={(config.settings.privacy_custom_patterns ?? []).join("\n")}
+              onChange={(e) =>
+                update({
+                  privacy_custom_patterns: e.target.value
+                    .split("\n")
+                    .map((l) => l.trim())
+                    .filter((l) => l.length > 0),
+                })
+              }
+            />
+          </label>
           <div className="row" style={{ marginTop: 10, marginBottom: 0 }}>
             <button className="btn small ghost" onClick={() => setLogDlg(true)}>
               查看映射日志
