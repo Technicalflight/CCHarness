@@ -31,11 +31,11 @@ export function App() {
     void bootstrap();
   }, [bootstrap]);
 
-  // silent startup update check, throttled to once per 60 minutes; a found
+  // silent startup update check, throttled to once per day; a found
   // update only lights the sidebar badge + a toast (manual download by design)
   useEffect(() => {
     if (localStorage.getItem("cc.autoUpdateCheck") === "off") return;
-    const CHECK_INTERVAL = 60 * 60 * 1000;
+    const CHECK_INTERVAL = 24 * 60 * 60 * 1000;
     const last = Number(localStorage.getItem("cc.lastUpdateCheck") ?? 0);
     if (Date.now() - last < CHECK_INTERVAL) return;
     localStorage.setItem("cc.lastUpdateCheck", String(Date.now()));
