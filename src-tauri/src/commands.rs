@@ -35,6 +35,11 @@ static LAST_SPAN: Mutex<Option<HashMap<(String, u32), (u32, usize)>>> = Mutex::n
 /// Auto-compaction threshold: compact at a user boundary once the last
 /// request's input tokens reached this fraction of the context window.
 const COMPACT_AT_FRACTION: f64 = 0.7;
+/// Hysteresis target: free rungs (prune / elision) count as "rescued" only
+/// when they push the projected input back BELOW this fraction — landing
+/// between the two lines prevents immediate re-triggering (0.70 trigger →
+/// 0.55 target leaves a 15% headroom band).
+const COMPACT_TARGET_FRACTION: f64 = 0.55;
 /// Don't bother compacting tiny conversations.
 const COMPACT_MIN_MESSAGES: usize = 8;
 /// Character budget fed to the summarizer.
@@ -1610,20 +1615,15 @@ pub fn compact_estimate(
     let summary_tokens: u64 = 800; // 600-char summary cap ≈ 600–900 CJK tokens
 
     let pricing = provider.pricing.get(&model);
-    let (rewrite_cost_usd, save_per_turn_usd, payback_turns) = match pricing {
+    let (rewrite_cost_usd, save_per_turn_usd, payback) = match pricing {
         Some(pr) => {
             let spread = (pr.input_per_m - pr.cached_per_m).max(0.0);
             let rewrite = summary_tokens as f64 / 1e6 * spread;
             let save = folded_tokens as f64 / 1e6 * pr.cached_per_m;
-            let payback = if save > 0.0 && rewrite > 0.0 {
-                Some((rewrite / save).ceil() as u64)
-            } else {
-                None
-            };
             (
                 Some((rewrite * 10000.0).round() / 10000.0),
                 Some((save * 10000.0).round() / 10000.0),
-                payback,
+                payback_turns(folded_tokens, summary_tokens, pr),
             )
         }
         None => (None, None, None),
@@ -1633,7 +1633,7 @@ pub fn compact_estimate(
         summary_tokens,
         rewrite_cost_usd,
         save_per_turn_usd,
-        payback_turns,
+        payback_turns: payback,
     })
 }
 
@@ -1865,6 +1865,49 @@ fn prune_oversized_tool_records(
     saved
 }
 
+/// Payback math shared by the manual estimate UI and the automatic gate
+/// (single source so the two never drift): how many turns of cached-read
+/// savings it takes to amortize one summary rewrite. None = economics
+/// undefined (no savings because cached reads are free, or no spread).
+fn payback_turns(
+    folded_tokens: u64,
+    summary_tokens: u64,
+    pr: &crate::config::Pricing,
+) -> Option<u64> {
+    let spread = (pr.input_per_m - pr.cached_per_m).max(0.0);
+    let rewrite = summary_tokens as f64 / 1e6 * spread;
+    let save = folded_tokens as f64 / 1e6 * pr.cached_per_m;
+    if save > 0.0 && rewrite > 0.0 {
+        Some((rewrite / save).ceil() as u64)
+    } else {
+        None
+    }
+}
+
+/// Automatic-compaction payback gate (L6 §2): a summary is only worth its
+/// rewrite cost when the session is expected to live long enough to
+/// amortize it. Remaining life heuristic: max(8, half of the completed
+/// user turns) — fresh sessions are assumed short-lived, long sessions
+/// have proven longevity. No pricing data ⇒ pressure-only (gate open);
+/// cached reads free ⇒ folding saves nothing (gate closed).
+fn auto_compact_payback_ok(
+    pricing: Option<&crate::config::Pricing>,
+    folded_tokens: u64,
+    summary_tokens: u64,
+    completed_turns: u64,
+) -> bool {
+    let Some(pr) = pricing else { return true };
+    let save = folded_tokens as f64 / 1e6 * pr.cached_per_m;
+    if save <= 0.0 {
+        return false;
+    }
+    match payback_turns(folded_tokens, summary_tokens, pr) {
+        // spread = 0 ⇒ the rewrite itself is free, folding always wins
+        None => true,
+        Some(payback) => payback <= (completed_turns / 2).max(8),
+    }
+}
+
 /// Auto boundary compaction: called at the user boundary inside run_send.
 async fn maybe_auto_compact(
     state: &State<'_, AppState>,
@@ -1903,9 +1946,33 @@ async fn maybe_auto_compact(
     let saved = prune_oversized_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars);
     if saved > 0 {
         let projected = last_input - (saved as f64 / 4.0);
-        if projected < window * COMPACT_AT_FRACTION {
+        // hysteresis: free rungs count as "rescued" only below the TARGET
+        // line, not merely back under the trigger — otherwise the session
+        // sits a hair under 0.70 and re-triggers every turn
+        if projected < window * COMPACT_TARGET_FRACTION {
             return;
         }
+    }
+    // payback gate (L6 §2): only summarize when the session's expected
+    // remaining life amortizes the rewrite cost. No pricing data ⇒ the
+    // gate stays open (pressure-only, previous behavior).
+    let folded_tokens = {
+        let bytes: usize = sf
+            .messages
+            .iter()
+            .filter(|m| m.role == "user" || m.role == "assistant" || m.role == "tool")
+            .map(|m| m.content.len() + 96)
+            .sum();
+        (bytes as u64) / 4
+    };
+    let completed_turns = sf.messages.iter().filter(|m| m.role == "user").count() as u64;
+    if !auto_compact_payback_ok(
+        provider.pricing.get(&binding.model),
+        folded_tokens,
+        800,
+        completed_turns,
+    ) {
+        return;
     }
     let _ = compact_now(&state.client, &state.data_dir, session_id, provider, &binding.model).await;
 }
@@ -5050,5 +5117,56 @@ mod goal_tests {
     fn claimed_zero_when_all_rows_evidenced() {
         let content = "```goal\n✅ 修复断裂 `git diff --check`\n✅ 复跑通过（cargo test 全绿）\nGOAL_DONE\n```";
         assert_eq!(pgs(content), (2, 2, true, 0));
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    fn pr(input: f64, cached: f64) -> crate::config::Pricing {
+        crate::config::Pricing { input_per_m: input, cached_per_m: cached, output_per_m: 10.0 }
+    }
+
+    #[test]
+    fn payback_math_matches_estimate_ui() {
+        // DeepSeek-ish: input 4, cached 0.5 → spread 3.5
+        let p = pr(4.0, 0.5);
+        // 100k folded: rewrite 0.0028 vs save 0.05/turn → 1 turn
+        assert_eq!(payback_turns(100_000, 800, &p), Some(1));
+        // 10k folded: save 0.005 → 0.56 → 1 turn
+        assert_eq!(payback_turns(10_000, 800, &p), Some(1));
+        // 1600 folded: save 0.0008 → ratio 3.5 → 4 turns
+        assert_eq!(payback_turns(1600, 800, &p), Some(4));
+    }
+
+    #[test]
+    fn payback_none_when_no_spread_or_no_savings() {
+        // cached == input → spread 0 → rewrite free → economics undefined
+        assert_eq!(payback_turns(100_000, 800, &pr(2.0, 2.0)), None);
+        // cached 0 → save 0 → nothing to amortize against
+        assert_eq!(payback_turns(100_000, 800, &pr(4.0, 0.0)), None);
+    }
+
+    #[test]
+    fn gate_opens_without_pricing() {
+        assert!(auto_compact_payback_ok(None, 100_000, 800, 4));
+    }
+
+    #[test]
+    fn gate_blocks_when_folding_saves_nothing() {
+        // cached price 0 → every turn saves nothing → never summarize
+        assert!(!auto_compact_payback_ok(Some(&pr(4.0, 0.0)), 100_000, 800, 100));
+    }
+
+    #[test]
+    fn gate_blocks_when_payback_exceeds_expected_life() {
+        let p = pr(4.0, 0.5);
+        // fresh session (8 turns): life = max(4, 8) = 8
+        assert!(auto_compact_payback_ok(Some(&p), 1600, 800, 8));
+        // slow payback (19 turns) exceeds fresh-session life
+        assert!(!auto_compact_payback_ok(Some(&p), 300, 800, 8));
+        // long-lived session (40 turns → life 20) amortizes it
+        assert!(auto_compact_payback_ok(Some(&p), 300, 800, 40));
     }
 }
