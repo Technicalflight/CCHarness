@@ -451,3 +451,54 @@ pub enum StreamEvent {
         preview: String,
     },
 }
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    /// Forward-compat gold sample: metadata written by an OLDER build (no
+    /// RollingMemo / CompactionStat / boost fields) must keep loading —
+    /// `#[serde(default)]` on every newly added field is a hard upgrade
+    /// invariant, or a new binary would brick every existing session file.
+    #[test]
+    fn old_meta_json_still_loads() {
+        let raw = r#"{
+            "id": "abc123",
+            "title": "旧会话",
+            "kind": "chat",
+            "created_at": 100,
+            "updated_at": 200,
+            "bindings": [{ "provider_id": "p", "model": "m" }]
+        }"#;
+        let meta: SessionMeta = serde_json::from_str(raw).expect("旧版 JSON 必须可加载");
+        assert_eq!(meta.bindings[0].model, "m");
+        assert!(meta.rolling_memo.is_none());
+        assert_eq!(meta.rolling_memo_rev, 0);
+        assert_eq!(meta.rolling_memo_injected_rev, 0);
+        assert!(meta.compactions.is_empty());
+        assert_eq!(meta.compact_boost_until_turn, 0);
+        assert!(meta.wf_gate.is_none());
+        // round-trip keeps the required fields and stays re-loadable
+        let out = serde_json::to_string(&meta).unwrap();
+        let back: SessionMeta = serde_json::from_str(&out).unwrap();
+        assert_eq!(back.id, "abc123");
+    }
+
+    /// The full-file shape: a session file with messages survives a
+    /// round-trip with byte-stable semantics on the fields that feed the
+    /// request rebuild (role/lane/ts/content are the byte chain inputs).
+    #[test]
+    fn message_record_roundtrip_keeps_chain_fields() {
+        let raw = r#"{
+            "id": "m1", "lane": 0, "role": "user", "content": "你好",
+            "ts": 42, "status": "ok", "images": []
+        }"#;
+        let m: MessageRecord = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.ts, 42);
+        assert!(m.tool_calls.is_none());
+        let out = serde_json::to_string(&m).unwrap();
+        let back: MessageRecord = serde_json::from_str(&out).unwrap();
+        assert_eq!(back.content, "你好");
+        assert_eq!(back.lane, 0);
+    }
+}

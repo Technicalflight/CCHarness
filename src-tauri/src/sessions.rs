@@ -389,3 +389,90 @@ pub fn export_markdown(sf: &SessionFile) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types_rs::{CompactionRecord, MessageRecord, SessionBinding};
+
+    fn tmp_store(tag: &str) -> (SessionStore, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("cch-sess-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (SessionStore::new(&dir), dir)
+    }
+
+    fn msg(role: &str, content: &str, ts: u64) -> MessageRecord {
+        MessageRecord {
+            id: format!("m{ts}"),
+            lane: 0,
+            role: role.into(),
+            content: content.into(),
+            reasoning: None,
+            ts,
+            model: None,
+            status: "ok".into(),
+            usage: None,
+            cost_usd: None,
+            confidence: None,
+            tool_calls: None,
+            tool_call_id: None,
+            skill_calls: None,
+            workflow: None,
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn create_save_load_roundtrip() {
+        let (store, dir) = tmp_store("roundtrip");
+        let sf = store
+            .create("chat", vec![SessionBinding { provider_id: "p1".into(), model: "m1".into() }], "往返")
+            .unwrap();
+        assert_eq!(sf.meta.kind, "chat");
+        let mut s = store.load(&sf.meta.id).unwrap();
+        s.messages.push(msg("user", "你好", 1));
+        s.messages.push(msg("assistant", "你好！", 2));
+        store.save(&s).unwrap();
+        let reloaded = store.load(&sf.meta.id).unwrap();
+        assert_eq!(reloaded.messages.len(), 2);
+        assert_eq!(reloaded.messages[1].content, "你好！");
+        assert!(store.list().iter().any(|m| m.id == sf.meta.id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_removes_the_file() {
+        let (store, dir) = tmp_store("delete");
+        let sf = store.create("chat", vec![], "t").unwrap();
+        let id = sf.meta.id.clone();
+        assert!(store.load(&id).is_ok());
+        store.delete(&id).unwrap();
+        assert!(store.load(&id).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn branch_copies_prefix_and_drops_stale_compaction() {
+        let (store, dir) = tmp_store("branch");
+        let sf = store.create("chat", vec![], "t").unwrap();
+        let id = sf.meta.id.clone();
+        let mut s = store.load(&id).unwrap();
+        s.messages.push(msg("user", "第一轮", 1));
+        s.messages.push(msg("assistant", "答", 2));
+        s.messages.push(msg("user", "第二轮", 3));
+        s.compaction = Some(CompactionRecord {
+            summary: "旧摘要".into(),
+            upto_ts: 10,
+            created_at: 5,
+        });
+        store.save(&s).unwrap();
+        let fork = store.branch(&id, 2).unwrap();
+        let tss: Vec<u64> = fork.messages.iter().map(|m| m.ts).collect();
+        assert_eq!(tss, vec![1, 2]);
+        // the summary covers history past the branch point → must not leak in
+        assert!(fork.compaction.is_none(), "折叠边界越过分支点时摘要必须失效");
+        assert!(fork.meta.title.starts_with("↳"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
