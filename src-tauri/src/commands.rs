@@ -1814,6 +1814,152 @@ async fn ensure_mcp_servers(data_dir: &std::path::Path, stop: &AtomicBool) {
 /// idempotent (marker guard), so Zone H replay and restart rebuilds stay
 /// byte-identical. Returns the recovered character count (0 = nothing pruned
 /// or the save failed).
+/// Best-effort target extraction from a tool call's arguments JSON: the
+/// first present string among common path/url/command keys (capped). Empty
+/// when the tool has no meaningful target — the record then never elides.
+fn extract_tool_target(arguments: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return String::new();
+    };
+    for key in ["path", "file_path", "url", "target", "command"] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            return s.chars().take(120).collect();
+        }
+    }
+    String::new()
+}
+
+/// Render budget for the memo block (L6 §4.1).
+const MEMO_CAP_CHARS: usize = 1200;
+
+/// User-correction heuristics for the decisions bucket (§4.2). Deliberately
+/// narrow: only file/number facts are recorded, never guessed semantics.
+const MEMO_CORRECTION_KEYS: [&str; 6] = ["不对", "改成", "还是用", "换成", "不是这个", "回退"];
+
+/// Rule-based memo update from one finished turn (L6 §4.2): file targets
+/// (last action wins), user corrections, and error→fix pairs within the
+/// turn. Pure function over the wire messages; returns whether anything
+/// changed. Idempotent on replay — the same turn applied twice is a no-op.
+fn rolling_memo_apply(memo: &mut crate::types_rs::RollingMemo, turn: &[ChatMessage]) -> bool {
+    let mut changed = false;
+    if let Some(user) = turn.iter().find(|m| m.role == "user") {
+        let text = user.content.trim();
+        if text.chars().count() > 4 && MEMO_CORRECTION_KEYS.iter().any(|k| text.contains(k)) {
+            let excerpt: String = text.chars().take(80).collect();
+            if !memo.decisions.iter().any(|d| d == &excerpt) {
+                memo.decisions.push(excerpt);
+                if memo.decisions.len() > 12 {
+                    memo.decisions.remove(0);
+                }
+                changed = true;
+            }
+        }
+    }
+    // collect (target, tool, errored) in call order, joining results by id
+    let mut seq: Vec<(String, String, bool)> = Vec::new();
+    for m in turn.iter() {
+        let Some(calls) = m.tool_calls.as_ref().and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for call in calls {
+            let id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let fname =
+                call.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+            let args = call
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if id.is_empty() || fname.is_empty() {
+                continue;
+            }
+            let Some(result) = turn
+                .iter()
+                .find(|r| r.role == "tool" && r.tool_call_id.as_deref() == Some(id))
+            else {
+                continue;
+            };
+            let errored = result.content.starts_with("ERROR");
+            seq.push((extract_tool_target(args), fname.to_string(), errored));
+        }
+    }
+    // last action per target wins
+    for (target, fname, errored) in &seq {
+        if target.is_empty() {
+            continue;
+        }
+        let entry = format!("{fname}{}", if *errored { "（失败）" } else { "" });
+        if memo.files.get(target).map(|v| v.as_str()) != Some(entry.as_str()) {
+            memo.files.insert(target.clone(), entry);
+            changed = true;
+        }
+    }
+    // error→fix: last result for a target is ok, an earlier one errored
+    let mut counted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for i in (0..seq.len()).rev() {
+        let (target, fname, errored) = &seq[i];
+        if *errored || target.is_empty() || !counted.insert(target.clone()) {
+            continue;
+        }
+        if seq[..i].iter().any(|(t2, _, e2)| t2 == target && *e2) {
+            let item = format!("{target}（{fname}）");
+            if !memo.errors_fixed.iter().any(|x| x == &item) {
+                memo.errors_fixed.push(item);
+                if memo.errors_fixed.len() > 8 {
+                    memo.errors_fixed.remove(0);
+                }
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Deterministic memo render (L6 §4.1): fixed section order, BTreeMap file
+/// ordering, hard char cap with a truncation marker. None when nothing has
+/// been extracted yet.
+fn render_memo(memo: &crate::types_rs::RollingMemo) -> Option<String> {
+    let has_goal = memo.goal.as_deref().is_some_and(|g| !g.trim().is_empty());
+    if !has_goal
+        && memo.decisions.is_empty()
+        && memo.files.is_empty()
+        && memo.errors_fixed.is_empty()
+        && memo.open_items.is_empty()
+    {
+        return None;
+    }
+    let mut out = String::from("[会话备忘·自动维护]\n");
+    if let Some(goal) = memo.goal.as_deref().filter(|g| !g.trim().is_empty()) {
+        out.push_str(&format!("goal: {goal}\n"));
+    }
+    let sections: Vec<(&str, Vec<String>)> = vec![
+        ("decisions", memo.decisions.clone()),
+        (
+            "files",
+            memo.files.iter().map(|(k, v)| format!("{k} ← {v}")).collect(),
+        ),
+        ("errors_fixed", memo.errors_fixed.clone()),
+        ("open_items", memo.open_items.clone()),
+    ];
+    for (title, items) in sections {
+        if items.is_empty() {
+            continue;
+        }
+        let mut block = format!("{title}:\n");
+        for it in items {
+            let line = format!("- {it}\n");
+            if out.chars().count() + block.chars().count() + line.chars().count() > MEMO_CAP_CHARS
+            {
+                block.push_str("- …[截断]\n");
+                break;
+            }
+            block.push_str(&line);
+        }
+        out.push_str(&block);
+    }
+    Some(out)
+}
+
 fn prune_oversized_tool_records(
     data_dir: &std::path::Path,
     session_id: &str,
@@ -1856,6 +2002,97 @@ fn prune_oversized_tool_records(
     }
     // expected rebuild: the next request re-creates the prefix from the
     // smaller transcript instead of judging the byte change an upstream miss
+    if let Some(map) = prefixes_lock().as_mut() {
+        map.remove(&(session_id.to_string(), 0));
+    }
+    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+        map.remove(&(session_id.to_string(), 0));
+    }
+    saved
+}
+
+/// Free rung 2 (L6 §3): downgrade stale oversized tool outputs to one-line
+/// stubs. A tool record is elidable when it is big, older than the recent
+/// window (`keep_from_ts`), and SUPERSEDED — a later tool record for the
+/// same (tool, target) exists, so the stub loses nothing current. Same
+/// materialized-rewrite pattern as `prune_oversized_tool_records`: the
+/// persisted record is rewritten once, the live prefix is dropped, and
+/// restart rebuilds read the rewritten bytes. The stub keeps role=tool +
+/// tool_call_id, so call/result pairing survives (design invariant I1).
+/// Returns the saved char count (0 = nothing changed).
+fn elide_stale_tool_records(
+    data_dir: &std::path::Path,
+    session_id: &str,
+    max_chars: usize,
+    keep_from_ts: u64,
+) -> usize {
+    if max_chars == 0 {
+        return 0;
+    }
+    let store = SessionStore::new(data_dir);
+    let Ok(mut sf) = store.load(session_id) else {
+        return 0;
+    };
+    let min_chars = (max_chars / 2).max(1);
+    // tool_call_id → (tool name, target) from the assistant batches
+    let mut call_meta: HashMap<String, (String, String)> = HashMap::new();
+    for m in &sf.messages {
+        if let Some(calls) = &m.tool_calls {
+            for c in calls {
+                let target = extract_tool_target(&c.arguments);
+                if !target.is_empty() {
+                    call_meta.insert(c.id.clone(), (c.name.clone(), target));
+                }
+            }
+        }
+    }
+    // newest ts per (tool, target): the latest read/write stays verbatim
+    let mut latest: HashMap<(String, String), u64> = HashMap::new();
+    for m in sf.messages.iter().filter(|m| m.role == "tool") {
+        if let Some(id) = &m.tool_call_id {
+            if let Some((name, target)) = call_meta.get(id) {
+                let entry = latest.entry((name.clone(), target.clone())).or_insert(0);
+                if m.ts > *entry {
+                    *entry = m.ts;
+                }
+            }
+        }
+    }
+    let mut saved = 0usize;
+    let mut changed = false;
+    for m in sf.messages.iter_mut() {
+        if m.role != "tool" || m.ts >= keep_from_ts {
+            continue;
+        }
+        if m.content.chars().count() <= min_chars {
+            continue;
+        }
+        let Some(id) = &m.tool_call_id else { continue };
+        let Some((name, target)) = call_meta.get(id) else { continue };
+        match latest.get(&(name.clone(), target.clone())) {
+            Some(latest_ts) if *latest_ts > m.ts => {}
+            _ => continue,
+        }
+        let stub = format!(
+            "[已降级] {name} {target} @ts={}。原输出 {} 字符已过时；如需当前内容请重新读取。",
+            m.ts,
+            m.content.chars().count()
+        );
+        let before = m.content.chars().count();
+        let after = stub.chars().count();
+        if after < before {
+            saved += before - after;
+            m.content = stub;
+            changed = true;
+        }
+    }
+    if !changed {
+        return 0;
+    }
+    sf.meta.updated_at = now_ms();
+    if store.save(&sf).is_err() {
+        return 0;
+    }
     if let Some(map) = prefixes_lock().as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
@@ -1944,6 +2181,17 @@ async fn maybe_auto_compact(
     // back under the compaction line, skip the summary entirely; otherwise
     // fall through and let the summarizer read the now-smaller input.
     let saved = prune_oversized_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars);
+    // free rung 2 (L6 §3): superseded stale tool outputs → stubs. The
+    // recent window is everything from the last user turn onward.
+    let recent_from = sf
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.ts)
+        .unwrap_or(0);
+    let saved = saved
+        + elide_stale_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars, recent_from);
     if saved > 0 {
         let projected = last_input - (saved as f64 / 4.0);
         // hysteresis: free rungs count as "rescued" only below the TARGET
@@ -3312,7 +3560,7 @@ async fn run_send(
                 return;
             }
 
-            let (owned_prefix, system_injection) = {
+            let (owned_prefix, system_injection, memo_injection) = {
                 let mut guard = prefixes_lock();
                 let map = guard.get_or_insert_with(HashMap::new);
                 let key = (session_id.clone(), lane);
@@ -3372,8 +3620,40 @@ async fn run_send(
                         lp.rebuild(&system_full, &hist[..hist.len() - 1]);
                     }
                 }
-                (lp.clone(), system_injection)
+                // RollingMemo injection (L6 §4.3): after a rebuild the
+                // re-created Zone H carries no memo messages, so re-inject
+                // once; otherwise inject when the memo changed since the
+                // last injection (rev watermark). The message is not
+                // persisted — it falls into Zone H at turn end, and a
+                // restart re-injects via the rebuild branch above. Privacy
+                // mode scrubs the rendered block like any outbound text.
+                let memo_injection = if lane == 0 {
+                    let rev = sf_snapshot.meta.rolling_memo_rev;
+                    let injected = sf_snapshot.meta.rolling_memo_injected_rev;
+                    match sf_snapshot.meta.rolling_memo.as_ref().and_then(render_memo) {
+                        Some(text) if needs_rebuild || rev > injected => Some(if privacy_on {
+                            crate::privacy::outbound(&session_id, &pseed, &text)
+                        } else {
+                            text
+                        }),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                (lp.clone(), system_injection, memo_injection)
             };
+            // advance the injection watermark when a memo block went out,
+            // so the same revision never injects twice (a later rebuild
+            // re-injects via the needs_rebuild branch regardless)
+            if memo_injection.is_some() {
+                let _guard = save_lock.lock().await;
+                if let Ok(mut s) = store.load(&session_id) {
+                    s.meta.rolling_memo_injected_rev = s.meta.rolling_memo_rev;
+                    s.meta.updated_at = now_ms();
+                    let _ = store.save(&s);
+                }
+            }
 
             let mut transcript = chat::transcript_for_lane(&sf_snapshot, lane, &cfg.workflows, &data_dir);
             scrub_outbound(&mut transcript);
@@ -3385,6 +3665,13 @@ async fn run_send(
             // Everything sent beyond Zone H this turn, in order. The next
             // request replays it verbatim; at turn end it falls into Zone H.
             let mut sent_this_turn: Vec<ChatMessage> = vec![transcript.last().unwrap().clone()];
+            // RollingMemo rides ahead of the user turn (L6 §4.3). Inserted
+            // BEFORE the system update below so the fixed wire order is
+            // [system update, memo, user] — deterministic across replays.
+            // Not persisted; falls into Zone H at turn end via the append.
+            if let Some(text) = &memo_injection {
+                sent_this_turn.insert(0, ChatMessage::plain("system", text.clone()));
+            }
             // in-history system update: the new system text rides ahead of
             // the user turn. The message is NOT persisted — restarts rebuild
             // Zone S from the current settings instead — and it falls into
@@ -4584,6 +4871,24 @@ async fn run_send(
                 }
             }
 
+            // RollingMemo (L6 §4.2): rule-based durable-fact extraction from
+            // this finished turn — file targets (last action wins), user
+            // corrections, error→fix pairs. Pure functions, zero model
+            // calls; the memo reaches the context via the injection path on
+            // a later turn (rev watermark + rebuild branch).
+            if lane == 0 && turn_status == "ok" {
+                let _guard = save_lock.lock().await;
+                if let Ok(mut s) = store.load(&session_id) {
+                    let mut memo = s.meta.rolling_memo.clone().unwrap_or_default();
+                    if rolling_memo_apply(&mut memo, &sent_this_turn) {
+                        s.meta.rolling_memo = Some(memo);
+                        s.meta.rolling_memo_rev += 1;
+                        s.meta.updated_at = now_ms();
+                        let _ = store.save(&s);
+                    }
+                }
+            }
+
             // State-machine auto-advance: only lane 0 (the shared user lane —
             // arena side-lanes must not move the machine), only on a fully ok
             // turn, and only from the state this turn actually ran under.
@@ -5168,5 +5473,208 @@ mod compact_tests {
         assert!(!auto_compact_payback_ok(Some(&p), 300, 800, 8));
         // long-lived session (40 turns → life 20) amortizes it
         assert!(auto_compact_payback_ok(Some(&p), 300, 800, 40));
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    use crate::types_rs::{MessageRecord, RollingMemo, ToolCallWire};
+
+    fn call(id: &str, name: &str, path: &str) -> serde_json::Value {
+        serde_json::json!([
+            {"id": id, "type": "function",
+             "function": {"name": name, "arguments": format!("{{\"path\":\"{path}\"}}")}}
+        ])
+    }
+
+    fn rec(lane: u32, role: &str, content: &str, ts: u64) -> MessageRecord {
+        MessageRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            lane,
+            role: role.into(),
+            content: content.into(),
+            reasoning: None,
+            ts,
+            model: None,
+            status: "ok".into(),
+            usage: None,
+            cost_usd: None,
+            confidence: None,
+            tool_calls: None,
+            tool_call_id: None,
+            skill_calls: None,
+            workflow: None,
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn memo_extracts_files_decisions_and_error_fix() {
+        let mut memo = RollingMemo::default();
+        let turn = vec![
+            ChatMessage::plain("user", "这个不对，改成用 tokio 实现"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(call("c1", "read_file", "/a/b.rs")),
+                tool_call_id: None,
+                images: Vec::new(),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: "fn main() {}".into(),
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+                images: Vec::new(),
+            },
+        ];
+        assert!(rolling_memo_apply(&mut memo, &turn));
+        assert_eq!(memo.files.get("/a/b.rs").map(String::as_str), Some("read_file"));
+        assert!(memo.decisions.iter().any(|d| d.contains("改成用 tokio")));
+        // idempotent on replay
+        let mut memo2 = memo.clone();
+        assert!(!rolling_memo_apply(&mut memo2, &turn));
+        assert_eq!(memo, memo2);
+    }
+
+    #[test]
+    fn memo_records_error_then_fix_in_same_turn() {
+        let mut memo = RollingMemo::default();
+        let turn = vec![
+            ChatMessage::plain("user", "继续"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(call("c2", "write_file", "/a/c.txt")),
+                tool_call_id: None,
+                images: Vec::new(),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: "ERROR: 权限拒绝".into(),
+                tool_calls: None,
+                tool_call_id: Some("c2".into()),
+                images: Vec::new(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(call("c3", "write_file", "/a/c.txt")),
+                tool_call_id: None,
+                images: Vec::new(),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: "written".into(),
+                tool_calls: None,
+                tool_call_id: Some("c3".into()),
+                images: Vec::new(),
+            },
+        ];
+        assert!(rolling_memo_apply(&mut memo, &turn));
+        // last action wins, no failure tag on the final entry
+        assert_eq!(memo.files.get("/a/c.txt").map(String::as_str), Some("write_file"));
+        assert!(memo.errors_fixed.iter().any(|x| x == "/a/c.txt（write_file）"));
+    }
+
+    #[test]
+    fn memo_render_is_deterministic_and_capped() {
+        assert!(render_memo(&RollingMemo::default()).is_none());
+        let mut memo = RollingMemo::default();
+        memo.goal = Some("完成 L6".into());
+        memo.decisions.push("改用 tokio".into());
+        memo.files.insert("/a/b.rs".into(), "read_file".into());
+        let r1 = render_memo(&memo).unwrap();
+        let r2 = render_memo(&memo).unwrap();
+        assert_eq!(r1, r2);
+        assert!(r1.contains("[会话备忘·自动维护]"));
+        assert!(r1.contains("goal: 完成 L6"));
+        assert!(r1.contains("- /a/b.rs ← read_file"));
+        // cap: 12 fat decisions must not blow the budget
+        let mut big = RollingMemo::default();
+        for i in 0..12 {
+            big.decisions.push(format!("决定{i}:{}", "很长的决定内容".repeat(40)));
+        }
+        let rendered = render_memo(&big).unwrap();
+        assert!(rendered.chars().count() < MEMO_CAP_CHARS + 60);
+        assert!(rendered.contains("…[截断]"));
+    }
+
+    #[test]
+    fn elide_stubs_superseded_stale_outputs_only() {
+        let dir = std::env::temp_dir().join(format!("ccharness-elide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SessionStore::new(&dir);
+        let sf = store.create("chat", vec![crate::types_rs::SessionBinding {
+            provider_id: "p".into(),
+            model: "m".into(),
+        }], "elide test")
+        .unwrap();
+        let sid = sf.meta.id.clone();
+        let big_old = "x".repeat(40_000);
+        let big_keep = "y".repeat(30_000);
+        let mut s = store.load(&sid).unwrap();
+        // old big read of /big.txt (superseded below) → elidable
+        s.messages.push(rec(0, "user", "第一轮", 1));
+        s.messages.push(MessageRecord {
+            tool_calls: Some(vec![ToolCallWire {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: "{\"path\":\"/big.txt\"}".into(),
+            }]),
+            ..rec(0, "assistant", "", 2)
+        });
+        s.messages.push(MessageRecord {
+            tool_call_id: Some("c1".into()),
+            ..rec(0, "tool", &big_old, 3)
+        });
+        // big read of /keep.txt — never superseded → must stay verbatim
+        s.messages.push(MessageRecord {
+            tool_calls: Some(vec![ToolCallWire {
+                id: "c3".into(),
+                name: "read_file".into(),
+                arguments: "{\"path\":\"/keep.txt\"}".into(),
+            }]),
+            ..rec(0, "assistant", "", 4)
+        });
+        s.messages.push(MessageRecord {
+            tool_call_id: Some("c3".into()),
+            ..rec(0, "tool", &big_keep, 5)
+        });
+        // superseding re-read of /big.txt: newer same-target record makes
+        // the ts=3 output stale
+        s.messages.push(MessageRecord {
+            tool_calls: Some(vec![ToolCallWire {
+                id: "c2".into(),
+                name: "read_file".into(),
+                arguments: "{\"path\":\"/big.txt\"}".into(),
+            }]),
+            ..rec(0, "assistant", "", 6)
+        });
+        s.messages.push(MessageRecord {
+            tool_call_id: Some("c2".into()),
+            ..rec(0, "tool", "new content", 7)
+        });
+        // recent window: last user turn from ts=9 onward
+        s.messages.push(rec(0, "assistant", "新一轮开始", 8));
+        s.messages.push(rec(0, "user", "第二轮", 9));
+        store.save(&s).unwrap();
+
+        let saved = elide_stale_tool_records(&dir, &sid, 24_000, 9);
+        assert!(saved > 40_000 - 200);
+
+        let s2 = store.load(&sid).unwrap();
+        let stubbed = s2.messages.iter().find(|m| m.tool_call_id.as_deref() == Some("c1")).unwrap();
+        assert!(stubbed.content.starts_with("[已降级] read_file /big.txt @ts=3"));
+        assert!(stubbed.content.contains("原输出 40000 字符已过时"));
+        // pairing survives (I1): still a tool record on the same call id
+        assert_eq!(stubbed.role, "tool");
+        let kept = s2.messages.iter().find(|m| m.tool_call_id.as_deref() == Some("c3")).unwrap();
+        assert_eq!(kept.content, big_keep);
+        // idempotent: second run saves nothing
+        assert_eq!(elide_stale_tool_records(&dir, &sid, 24_000, 9), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

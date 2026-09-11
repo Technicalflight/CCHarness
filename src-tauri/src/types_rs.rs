@@ -55,6 +55,45 @@ pub struct SessionMeta {
     /// the last 60 entries; cleared with the goal.
     #[serde(default)]
     pub goal_rounds: Vec<GoalRound>,
+    /// RollingMemo (L6 §4): rule-extracted durable session facts that let
+    /// history folding lose less. Distinct from AuxMemo (the response-side
+    /// exact cache) — this block rides INSIDE the context as an in-history
+    /// system message.
+    #[serde(default)]
+    pub rolling_memo: Option<RollingMemo>,
+    /// Bumped on every memo mutation; the injection watermark compares
+    /// against it so a changed memo injects exactly once per change.
+    #[serde(default)]
+    pub rolling_memo_rev: u64,
+    /// Last memo revision injected into the context. A rebuilt epoch
+    /// re-injects regardless (the rebuilt Zone H carries no memo messages).
+    #[serde(default)]
+    pub rolling_memo_injected_rev: u64,
+}
+
+/// RollingMemo (L6 §4): session-internal rolling state block, rule-extracted
+/// (zero model calls). Render order is fixed and capped — see
+/// `render_memo` in commands.rs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RollingMemo {
+    /// Session goal (goal mode only).
+    #[serde(default)]
+    pub goal: Option<String>,
+    /// User corrections / binding decisions (FIFO, cap 12).
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    /// Target path → last action (tool name). BTreeMap keeps the render
+    /// order deterministic across restarts.
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, String>,
+    /// Target that errored earlier and succeeded later in the same turn
+    /// (FIFO, cap 8).
+    #[serde(default)]
+    pub errors_fixed: Vec<String>,
+    /// Explicit open TODOs (v1 keeps the slot so the render shape is
+    /// stable; not yet populated).
+    #[serde(default)]
+    pub open_items: Vec<String>,
 }
 
 /// One goal-mode round snapshot (ZCode-style iteration timeline): recorded

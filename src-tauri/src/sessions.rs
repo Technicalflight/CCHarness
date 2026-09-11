@@ -87,6 +87,9 @@ impl SessionStore {
             wf_gate: None,
             goal: None,
             goal_rounds: Vec::new(),
+            rolling_memo: None,
+            rolling_memo_rev: 0,
+            rolling_memo_injected_rev: 0,
         };
         let sf = SessionFile {
             meta,
