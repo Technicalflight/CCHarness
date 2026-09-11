@@ -400,35 +400,45 @@ export function Composer({
     return out;
   };
 
+  // in-flight lock: the busy flag only flips when onSend lands in the store,
+  // so the await inside submit (expandAtRefs) is a re-entry window where a
+  // second Enter would double-send before text state clears
+  const submittingRef = useRef(false);
   const submit = async () => {
     const t = text.trim();
+    if (submittingRef.current) return;
     if ((!t && pendingImages.length === 0) || busy || disabled) return;
-    const expanded = await expandAtRefs(t);
-    let content = "";
-    if (skillChips.length > 0) {
-      content +=
-        skillChips
-          .map((s) => `[调用技能 /${s.name}${s.description ? ` — ${s.description}` : ""}]\n\n${s.body}`)
-          .join("\n\n") + "\n\n";
+    submittingRef.current = true;
+    try {
+      const expanded = await expandAtRefs(t);
+      let content = "";
+      if (skillChips.length > 0) {
+        content +=
+          skillChips
+            .map((s) => `[调用技能 /${s.name}${s.description ? ` — ${s.description}` : ""}]\n\n${s.body}`)
+            .join("\n\n") + "\n\n";
+      }
+      content += expanded;
+      if (attachments.length > 0) {
+        const blocks = attachments
+          .map(
+            (a, i) =>
+              `\n\n---\n📎 附件 ${i + 1}/${attachments.length}: ${a.name}（${a.size} B）\n\`\`\`\n${a.text}\n\`\`\``
+          )
+          .join("");
+        content += blocks;
+      }
+      const images: ChatImage[] = pendingImages.map(({ mime, b64 }) => ({ mime, b64 }));
+      setText("");
+      setAttachments([]);
+      setPendingImages([]);
+      setAtMenu(null);
+      const names = skillChips.map((c) => c.name);
+      setSkillChips([]);
+      onSend(content, names, images);
+    } finally {
+      submittingRef.current = false;
     }
-    content += expanded;
-    if (attachments.length > 0) {
-      const blocks = attachments
-        .map(
-          (a, i) =>
-            `\n\n---\n📎 附件 ${i + 1}/${attachments.length}: ${a.name}（${a.size} B）\n\`\`\`\n${a.text}\n\`\`\``
-        )
-        .join("");
-      content += blocks;
-    }
-    const images: ChatImage[] = pendingImages.map(({ mime, b64 }) => ({ mime, b64 }));
-    setText("");
-    setAttachments([]);
-    setPendingImages([]);
-    setAtMenu(null);
-    const names = skillChips.map((c) => c.name);
-    setSkillChips([]);
-    onSend(content, names, images);
   };
 
   const setPerm = (mode: string) => {
@@ -799,9 +809,13 @@ export function Composer({
                 return;
               }
             }
-            if (e.key === "Enter" && !e.shiftKey && sendOnEnter) {
+            // plain Enter (sendOnEnter) must exclude Ctrl/Meta — otherwise a
+            // Ctrl+Enter keydown matches both branches below and fires
+            // submit() twice (one direct send + one queued)
+            if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey && sendOnEnter) {
               e.preventDefault();
               submit();
+              return;
             }
             if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
               e.preventDefault();

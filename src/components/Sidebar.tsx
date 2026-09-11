@@ -30,6 +30,7 @@ function SessionRow({
   s,
   active,
   confirmDel,
+  onArmDel,
   onConfirmDel,
   onCancelDel,
   onSelect,
@@ -39,6 +40,7 @@ function SessionRow({
   s: SessionMeta;
   active: boolean;
   confirmDel: boolean;
+  onArmDel: () => void;
   onConfirmDel: () => void;
   onCancelDel: () => void;
   onSelect: () => void;
@@ -101,8 +103,9 @@ function SessionRow({
               title="删除会话"
               onClick={(e) => {
                 e.stopPropagation();
-                onCancelDel();
-                setTimeout(onConfirmDel, 2500);
+                // arm the inline confirm (✓ / ✗ replace the row actions);
+                // deletion happens only via onConfirmDel
+                onArmDel();
               }}
             >
               <Icon name="x" size={13} />
@@ -134,6 +137,15 @@ export function Sidebar() {
     setUpdateDialogOpen,
   } = useApp();
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  // auto-dismiss timer for the armed delete confirm; cleared on unmount so
+  // a pending timeout can never fire after the sidebar goes away
+  const delTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (delTimer.current != null) window.clearTimeout(delTimer.current);
+    },
+    []
+  );
   const [showArchived, setShowArchived] = useState(false);
   // app version from tauri.conf.json (single source of truth), rendered in
   // the footer; clicking it runs an update check
@@ -225,11 +237,20 @@ export function Sidebar() {
       s={s}
       active={activeSessionId === s.id}
       confirmDel={confirmDel === s.id}
+      onArmDel={() => {
+        if (delTimer.current != null) window.clearTimeout(delTimer.current);
+        setConfirmDel(s.id);
+        delTimer.current = window.setTimeout(() => setConfirmDel((c) => (c === s.id ? null : c)), 4000);
+      }}
       onConfirmDel={() => {
+        if (delTimer.current != null) window.clearTimeout(delTimer.current);
         setConfirmDel(null);
         void deleteSession(s.id);
       }}
-      onCancelDel={() => setConfirmDel((c) => (c === s.id ? null : c))}
+      onCancelDel={() => {
+        if (delTimer.current != null) window.clearTimeout(delTimer.current);
+        setConfirmDel((c) => (c === s.id ? null : c));
+      }}
       onSelect={() => void selectSession(s.id)}
       onTogglePin={() => void togglePin(s)}
       onToggleArchive={() => void toggleArchive(s)}

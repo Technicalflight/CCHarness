@@ -242,7 +242,11 @@ export function ArenaView() {
           binding={undefined}
           compact
           filter={isChatModel}
-          onPick={(b) => void updateBindings(meta.id, [...lanes, b])}
+          onPick={(b) => {
+            // lane React keys are provider:model — refuse duplicates
+            if (lanes.some((l) => l.provider_id === b.provider_id && l.model === b.model)) return;
+            void updateBindings(meta.id, [...lanes, b]);
+          }}
         />
       </Composer>
     </>
