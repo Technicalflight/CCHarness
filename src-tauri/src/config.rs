@@ -701,6 +701,32 @@ fn aes_unseal(sealed: &str, master: &[u8; 32]) -> Result<String, String> {
     String::from_utf8(pt).map_err(|e| format!("bad utf8: {e}"))
 }
 
+/// Prefix marking a renderer-side "unchanged" key placeholder. The UI never
+/// receives real keys — only `****<last4>` masks — and a save carrying a
+/// value with this prefix restores the stored key instead.
+pub const KEY_MASK_PREFIX: &str = "****";
+
+/// Renderer-safe mask: keeps only the last 4 chars. Empty stays empty.
+pub fn mask_key(key: &str) -> String {
+    if key.is_empty() {
+        return String::new();
+    }
+    let last4: String = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{KEY_MASK_PREFIX}{last4}")
+}
+
+/// True when the value is a mask placeholder from the renderer.
+pub fn is_masked_key(key: &str) -> bool {
+    key.starts_with(KEY_MASK_PREFIX)
+}
+
 /// Seal a plaintext key for disk storage. Already-sealed and empty keys pass
 /// through; on seal failure the plaintext is kept (fail open — losing the
 /// key would be worse than storing it).
@@ -790,6 +816,7 @@ pub fn load(data_dir: &Path) -> AppConfig {
     for p in &mut cfg.providers {
         p.api_key = unprotect_api_key(&p.api_key);
     }
+    cfg.settings.embeddings_key = unprotect_api_key(&cfg.settings.embeddings_key);
     cfg
 }
 
@@ -800,6 +827,7 @@ pub fn save(data_dir: &Path, cfg: &AppConfig) {
     for p in &mut out.providers {
         p.api_key = protect_api_key(&p.api_key);
     }
+    out.settings.embeddings_key = protect_api_key(&out.settings.embeddings_key);
     // atomic-ish: write temp then rename
     let path = config_path(data_dir);
     let tmp = data_dir.join("config.json.tmp");
@@ -821,6 +849,32 @@ mod tests {
         // already-sealed values of either mark are never double-sealed
         assert_eq!(protect_api_key("dpapi:v1:aa"), "dpapi:v1:aa");
         assert_eq!(protect_api_key("enc:v1:aa"), "enc:v1:aa");
+    }
+
+    #[test]
+    fn mask_hides_everything_but_last4() {
+        assert_eq!(mask_key(""), "");
+        let m = mask_key("sk-abcdef123456");
+        assert!(m.starts_with(KEY_MASK_PREFIX));
+        assert!(m.ends_with("3456"));
+        assert!(!m.contains("abcdef"));
+        assert!(is_masked_key(&m));
+        assert!(!is_masked_key("sk-abcdef123456"));
+    }
+
+    #[test]
+    fn embeddings_key_sealed_like_provider_keys() {
+        let dir = std::env::temp_dir().join(format!("cch_cfg_emb_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.settings.embeddings_key = "ek-plain-98765".into();
+        save(&dir, &cfg);
+        let raw = fs::read_to_string(dir.join("config.json")).unwrap();
+        assert!(!raw.contains("ek-plain-98765"), "embeddings key stored in plaintext");
+        let loaded = load(&dir);
+        assert_eq!(loaded.settings.embeddings_key, "ek-plain-98765");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

@@ -682,16 +682,40 @@ pub fn resolve_in_workspace(workspace: &str, rel: &str) -> Result<PathBuf, Strin
         return Ok(PathBuf::from(workspace));
     }
     let candidate = Path::new(rel_trim);
+    let has_parent = candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir));
     if candidate.is_absolute() {
+        // `..` is refused before any prefix comparison: starts_with is a
+        // component-level lexical check, so "C:/ws/../../x" would pass a
+        // naive prefix test while the OS still resolves the ParentDirs
+        // outside the workspace when the path is actually opened.
+        if has_parent {
+            return Err("拒绝包含 .. 的路径".into());
+        }
+        // an empty workspace has no boundary to compare against — any
+        // absolute path would trivially "start with" the empty prefix
+        if workspace.trim().is_empty() {
+            return Err(format!("拒绝绝对路径 {rel_trim}：未设置工作区"));
+        }
         // allow a path that is literally inside the workspace
         let ws_norm = normalize_plain(Path::new(workspace));
         let c_norm = normalize_plain(candidate);
         if c_norm.starts_with(&ws_norm) {
+            // canonical re-check closes the symlink escape: when both sides
+            // resolve on disk, the real location must remain inside.
+            if let (Ok(ws_canon), Ok(c_canon)) =
+                (fs::canonicalize(&ws_norm), fs::canonicalize(&c_norm))
+            {
+                if !c_canon.starts_with(&ws_canon) {
+                    return Err(format!("路径 {rel_trim} 经符号链接越出工作区边界"));
+                }
+            }
             return Ok(c_norm);
         }
         return Err(format!("拒绝绝对路径 {rel_trim}：请使用相对工作区的路径"));
     }
-    if rel_trim.split(['/', '\\']).any(|seg| seg == "..") {
+    if has_parent {
         return Err("拒绝包含 .. 的路径".into());
     }
     let joined = normalize_plain(&Path::new(workspace).join(candidate));
@@ -1784,9 +1808,34 @@ mod tests {
 
     #[test]
     fn rejects_escape_paths() {
-        assert!(resolve_in_workspace("C:/tmp/ws", "../outside.txt").is_err());
-        assert!(resolve_in_workspace("C:/tmp/ws", "a/../../b").is_err());
-        assert!(resolve_in_workspace("C:/tmp/ws", "C:/Windows/win.ini").is_err());
+        // platform-neutral: these guards must hold on every filesystem
+        let (ws, outside) = if cfg!(windows) {
+            ("C:/tmp/ws", "C:/Windows/win.ini")
+        } else {
+            ("/tmp/ws", "/etc/passwd")
+        };
+        assert!(resolve_in_workspace(ws, "../outside.txt").is_err());
+        assert!(resolve_in_workspace(ws, "a/../../b").is_err());
+        assert!(resolve_in_workspace(ws, outside).is_err());
+    }
+
+    #[test]
+    fn rejects_absolute_parent_escape() {
+        // lexical prefix matches the workspace, but the OS resolves the
+        // ParentDirs outside — a component-level starts_with alone must
+        // never wave this through (P0: absolute `..` traversal)
+        let (ws, escape, outside) = if cfg!(windows) {
+            (
+                "C:/tmp/ws",
+                "C:/tmp/ws/../../Users/x/.ssh/id_rsa",
+                "C:/Windows/win.ini",
+            )
+        } else {
+            ("/tmp/ws", "/tmp/ws/../../etc/shadow", "/etc/passwd")
+        };
+        assert!(resolve_in_workspace(ws, escape).is_err());
+        // empty workspace: absolute candidates have no boundary → refuse
+        assert!(resolve_in_workspace("", outside).is_err());
     }
 
     #[test]
