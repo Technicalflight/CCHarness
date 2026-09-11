@@ -8,7 +8,27 @@ use std::path::{Path, PathBuf};
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     OpenaiCompatible,
+    /// OpenAI Responses protocol (`POST {base}/responses`) — GPT-5.x / o
+    /// series native interface (pi adapter matrix). Bearer auth.
+    OpenaiResponses,
+    /// Azure OpenAI v1 data-plane surface in Responses shape: base URL
+    /// `https://<resource>.openai.azure.com/openai/v1`, endpoint
+    /// `{base}/responses`, `api-key` header instead of Bearer.
+    AzureResponses,
     Anthropic,
+}
+
+/// Cache TTL tier (pi retention alignment): Long keeps cached prefixes
+/// alive for the extended window (Anthropic 1h via `ttl:"1h"`, OpenAI 24h
+/// via `prompt_cache_retention`), Short is the protocol default window
+/// (Anthropic 5m ephemeral, OpenAI ~5-10min), None sends no cache marks at
+/// all (no prompt_cache_key / cache_control — safest for strict gateways).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheTier {
+    Short,
+    Long,
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -61,13 +81,35 @@ pub struct Provider {
     /// Per-model behavior overrides, keyed by model name (like `pricing`).
     #[serde(default)]
     pub behavior: std::collections::BTreeMap<String, ModelBehavior>,
-    /// OpenAI extended prompt-cache retention: send
-    /// `prompt_cache_retention:"24h"` on chat completions (supported by
-    /// GPT-5.x / 4.1 families). Off by default — strict OpenAI-compatible
-    /// gateways reject the unknown argument, so only enable for endpoints
-    /// known to accept it.
+    /// Cache TTL tier override (see [`CacheTier`]). None = follow the kind
+    /// default via [`Provider::cache_tier`].
     #[serde(default)]
-    pub cache_retention_24h: bool,
+    pub cache_tier: Option<CacheTier>,
+    /// Legacy v0.1.5 flag, kept only for backward-compatible config loading:
+    /// `true` maps to the Long tier in [`Provider::cache_tier`]. New configs
+    /// persist `cache_tier` instead.
+    #[serde(default)]
+    pub cache_retention_24h: Option<bool>,
+}
+
+impl Provider {
+    /// Effective cache tier: explicit override → legacy 24h flag → kind
+    /// default (Anthropic → Long, the pre-tier 1h-marking behavior; every
+    /// OpenAI-style kind → Short, cache-key routing without the retention
+    /// argument). Defaults keep each protocol path byte-identical with
+    /// v0.1.5 behavior.
+    pub fn cache_tier(&self) -> CacheTier {
+        if let Some(t) = self.cache_tier {
+            return t;
+        }
+        if self.cache_retention_24h == Some(true) {
+            return CacheTier::Long;
+        }
+        match self.kind {
+            ProviderKind::Anthropic => CacheTier::Long,
+            _ => CacheTier::Short,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -447,7 +489,8 @@ impl Default for AppConfig {
                 context_window: None,
                 pricing: std::collections::BTreeMap::new(),
                 behavior: std::collections::BTreeMap::new(),
-                cache_retention_24h: false,
+                cache_tier: None,
+                cache_retention_24h: None,
             }],
             mcp_servers: Vec::new(),
             subagents: Vec::new(),
@@ -790,5 +833,51 @@ mod tests {
         let raw = r#"{"version":1,"providers":[{"id":"p","name":"n","kind":"openai_compatible","base_url":"https://x","api_key":"","pricing":{}}],"settings":{"theme":"dark"}}"#;
         let cfg: AppConfig = serde_json::from_str(raw).unwrap();
         assert!(cfg.providers[0].behavior.is_empty());
+    }
+
+    #[test]
+    fn cache_tier_resolution_and_legacy_migration() {
+        // tier resolution: explicit override wins
+        let mut p = Provider {
+            id: "p".into(),
+            name: "n".into(),
+            kind: ProviderKind::OpenaiCompatible,
+            base_url: "https://x".into(),
+            api_key: String::new(),
+            models: vec![],
+            enabled: true,
+            allow_local: false,
+            context_window: None,
+            pricing: Default::default(),
+            behavior: Default::default(),
+            cache_tier: Some(CacheTier::None),
+            cache_retention_24h: Some(true),
+        };
+        assert_eq!(p.cache_tier(), CacheTier::None);
+
+        // legacy flag: true ⇒ Long, false ⇒ kind default
+        p.cache_tier = None;
+        assert_eq!(p.cache_tier(), CacheTier::Long);
+        p.cache_retention_24h = Some(false);
+        assert_eq!(p.cache_tier(), CacheTier::Short);
+
+        // kind defaults keep v0.1.5 behavior byte-identical
+        p.cache_retention_24h = None;
+        assert_eq!(p.cache_tier(), CacheTier::Short);
+        p.kind = ProviderKind::Anthropic;
+        assert_eq!(p.cache_tier(), CacheTier::Long);
+        p.kind = ProviderKind::OpenaiResponses;
+        assert_eq!(p.cache_tier(), CacheTier::Short);
+        p.kind = ProviderKind::AzureResponses;
+        assert_eq!(p.cache_tier(), CacheTier::Short);
+
+        // old configs carrying the bool flag load unchanged; new field is
+        // optional and the wire names are snake_case
+        let raw = r#"{"version":1,"providers":[{"id":"p","name":"n","kind":"openai_compatible","base_url":"https://x","api_key":"","pricing":{},"cache_retention_24h":true}],"settings":{"theme":"dark"}}"#;
+        let cfg: AppConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(cfg.providers[0].cache_tier(), CacheTier::Long);
+        let raw2 = r#"{"version":1,"providers":[{"id":"p","name":"n","kind":"azure_responses","base_url":"https://r.openai.azure.com/openai/v1","api_key":"","pricing":{},"cache_tier":"none"}],"settings":{"theme":"dark"}}"#;
+        let cfg: AppConfig = serde_json::from_str(raw2).unwrap();
+        assert_eq!(cfg.providers[0].cache_tier(), CacheTier::None);
     }
 }

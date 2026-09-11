@@ -14,8 +14,9 @@
 // An epoch counter marks expected cache rebuilds (model switch, first turn,
 // manual reset) so telemetry can separate "expected miss" from "regression".
 
+use crate::config::CacheTier;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest as ShaDigest, Sha256};
 
 /// One image attached to a message: mime type + base64 payload (no data-URI
@@ -158,9 +159,15 @@ pub struct LanePrefix {
     /// means the rebuilt transcript bytes differ ⇒ caller rebuilds (and the
     /// rebuild bumps the epoch).
     pub privacy: bool,
-    /// OpenAI long cache retention (`prompt_cache_retention:"24h"`) — rides
-    /// in the byte-stable head; a toggle changes head bytes ⇒ epoch bump.
-    retention_long: bool,
+    /// Raw Zone S text (Responses path rides it as top-level `instructions`;
+    /// the OpenAI/Anthropic paths use the serialized `system_json` form).
+    system_text: String,
+    /// Cache TTL tier riding in the byte-stable head: it decides whether
+    /// `prompt_cache_key` is emitted (Short/Long) or omitted (None) and
+    /// whether `prompt_cache_retention:"24h"` rides along (Long only). A
+    /// toggle changes head bytes ⇒ epoch bump (same discipline as
+    /// bind_behavior).
+    cache_tier: CacheTier,
     /// Hash of the tool-schema loadout sent in the head. A loadout change
     /// (MCP server added/removed mid-session) silently rewrites the head —
     /// tracking it keeps the epoch honest about that rebuild.
@@ -182,7 +189,8 @@ impl LanePrefix {
             temperature: None,
             max_output: None,
             privacy: false,
-            retention_long: false,
+            system_text: system_prompt.to_string(),
+            cache_tier: CacheTier::Short,
             tools_hash: None,
         };
         if !system_prompt.is_empty() {
@@ -282,16 +290,15 @@ impl LanePrefix {
         self.max_output = max_output;
     }
 
-    /// Rebind OpenAI long cache retention. The flag rides in the byte-stable
-    /// head, so toggling it changes head bytes ⇒ epoch bump (same discipline
-    /// as bind_behavior). Off-by-default; the field is omitted from the
-    /// request unless the provider opts in.
-    pub fn bind_retention(&mut self, long: bool) {
-        if self.retention_long == long {
+    /// Rebind the cache TTL tier. The tier rides in the byte-stable head
+    /// (prompt_cache_key presence / retention argument), so any change is an
+    /// expected rebuild: epoch bump (same discipline as bind_behavior).
+    pub fn bind_cache_tier(&mut self, tier: CacheTier) {
+        if self.cache_tier == tier {
             return;
         }
         self.epoch += 1;
-        self.retention_long = long;
+        self.cache_tier = tier;
     }
 
     /// Rebind the tool-schema loadout hash. MCP servers joining/leaving
@@ -342,15 +349,17 @@ impl LanePrefix {
         let mut body = String::with_capacity(self.prefix_len + tail + 1024);
         body.push_str("{\"model\":");
         body.push_str(&serde_json::to_string(model).expect("model str"));
-        // stable routing key so load-balanced gateways keep cache affinity
-        if !self.cache_key.is_empty() {
+        // stable routing key so load-balanced gateways keep cache affinity.
+        // Tier None omits it entirely — strict gateways that reject unknown
+        // arguments stay safe (nothing is cached through routing then).
+        if self.cache_tier != CacheTier::None && !self.cache_key.is_empty() {
             body.push_str(",\"prompt_cache_key\":");
             body.push_str(&serde_json::to_string(&self.cache_key).expect("cache key str"));
         }
-        // OpenAI extended retention (opt-in per provider): keeps cached
-        // prefixes active for up to 24h instead of the ~5-10min in-memory
-        // default. Supported by GPT-5.x/4.1; must stay in the byte-stable head.
-        if self.retention_long {
+        // OpenAI extended retention (Long tier): keeps cached prefixes
+        // active for up to 24h instead of the ~5-10min in-memory default.
+        // Supported by GPT-5.x/4.1; must stay in the byte-stable head.
+        if self.cache_tier == CacheTier::Long {
             body.push_str(",\"prompt_cache_retention\":\"24h\"");
         }
         body.push_str(",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
@@ -402,6 +411,92 @@ impl LanePrefix {
         self.build_openai_body_multi(model, std::slice::from_ref(user_msg), None)
     }
 
+    /// Assemble the OpenAI Responses request body (pi adapter matrix: the
+    /// Responses protocol is its own adapter, not a chat-completions
+    /// variant). Layout mirrors build_openai_body_multi: epoch-stable head
+    /// (model / instructions / sampling / tools / cache routing) → `input`
+    /// items = Zone S+H fragments converted 1:1 → live tail items.
+    ///
+    /// Server-side storage is disabled (`store:false`): context is managed
+    /// client-side by the byte-prefix design, and nothing must persist
+    /// provider-side. `previous_response_id` chaining is deliberately not
+    /// used — every request replays the full stable prefix, which is what
+    /// makes provider-side prefix caching possible at all.
+    pub fn build_responses_body(
+        &self,
+        model: &str,
+        new_msgs: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> String {
+        let tail: usize = new_msgs.iter().map(|m| m.content.len() + 128).sum();
+        let mut body = String::with_capacity(self.prefix_len + tail + 1024);
+        body.push_str("{\"model\":");
+        body.push_str(&serde_json::to_string(model).expect("model str"));
+        // the system prompt rides as top-level `instructions` (Responses
+        // shape) — Zone S bytes in their protocol-native form
+        body.push_str(",\"instructions\":");
+        body.push_str(&serde_json::to_string(&self.system_text).expect("system str"));
+        body.push_str(",\"stream\":true,\"store\":false");
+        // per-model sampling params ride the byte-stable head (epoch-gated)
+        if let Some(t) = self.temperature {
+            body.push_str(",\"temperature\":");
+            body.push_str(&serde_json::to_string(&t).expect("temperature f64"));
+        }
+        if let Some(n) = self.max_output {
+            body.push_str(",\"max_output_tokens\":");
+            body.push_str(&n.to_string());
+        }
+        // Responses nests the effort under reasoning:{effort} (chat
+        // completions uses the flat reasoning_effort field)
+        if let Some(level) = &self.thinking {
+            body.push_str(",\"reasoning\":{\"effort\":");
+            body.push_str(&serde_json::to_string(level).expect("effort str"));
+            body.push('}');
+        }
+        // cache routing: same tier semantics as the chat-completions path
+        if self.cache_tier != CacheTier::None && !self.cache_key.is_empty() {
+            body.push_str(",\"prompt_cache_key\":");
+            body.push_str(&serde_json::to_string(&self.cache_key).expect("cache key str"));
+        }
+        if self.cache_tier == CacheTier::Long {
+            body.push_str(",\"prompt_cache_retention\":\"24h\"");
+        }
+        if let Some(t) = tools {
+            body.push_str(",\"tools\":");
+            body.push_str(&serde_json::to_string(&responses_tools(t)).expect("tools schema"));
+            body.push_str(",\"tool_choice\":\"auto\"");
+        }
+        body.push_str(",\"input\":[");
+        let mut first = true;
+        for part in self.zone_parts() {
+            // Zone fragments are stored as chat-completions message bytes;
+            // converting them here is deterministic (total mapping + sorted
+            // serde_json keys), so the same fragment always yields the same
+            // item bytes — the Responses input array stays byte-stable.
+            if let Ok(v) = serde_json::from_str::<Value>(&part) {
+                for item in responses_items(&v) {
+                    if !first {
+                        body.push(',');
+                    }
+                    body.push_str(&serde_json::to_string(&item).expect("input item"));
+                    first = false;
+                }
+            }
+        }
+        for m in new_msgs {
+            let v = serde_json::to_value(m).expect("message value");
+            for item in responses_items(&v) {
+                if !first {
+                    body.push(',');
+                }
+                body.push_str(&serde_json::to_string(&item).expect("input item"));
+                first = false;
+            }
+        }
+        body.push_str("]}");
+        body
+    }
+
     fn zone_parts(&self) -> Vec<String> {
         let mut parts = Vec::with_capacity(self.history.len() + 1);
         if !self.system_json.is_empty() {
@@ -421,6 +516,100 @@ impl LanePrefix {
     }
 }
 
+/// Convert one chat-completions message value (the Zone fragment wire
+/// shape) into its Responses-API input item(s). The mapping is total and
+/// deterministic, so identical fragments always produce identical item
+/// bytes — the precondition for the Responses `input` array staying
+/// byte-stable across turns.
+///
+///   system    → dropped (rides as top-level `instructions`)
+///   user      → {type:"message", content:[input_text | input_image …]}
+///   assistant → {type:"message", content:[output_text]} + one
+///               {type:"function_call", call_id, name, arguments} per call
+///   tool      → {type:"function_call_output", call_id, output}
+fn responses_items(m: &Value) -> Vec<Value> {
+    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    match role {
+        "system" => Vec::new(),
+        "tool" => vec![json!({
+            "type": "function_call_output",
+            "call_id": m.get("tool_call_id").cloned().unwrap_or(Value::Null),
+            "output": m.get("content").cloned().unwrap_or(Value::Null),
+        })],
+        "assistant" => {
+            let mut items = Vec::new();
+            if let Some(text) = m.get("content").and_then(|c| c.as_str()) {
+                if !text.is_empty() {
+                    items.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": text }],
+                    }));
+                }
+            }
+            if let Some(calls) = m.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in calls {
+                    items.push(json!({
+                        "type": "function_call",
+                        "call_id": tc.pointer("/id").cloned().unwrap_or(Value::Null),
+                        "name": tc.pointer("/function/name").cloned().unwrap_or(Value::Null),
+                        "arguments": tc.pointer("/function/arguments").cloned().unwrap_or(Value::Null),
+                    }));
+                }
+            }
+            items
+        }
+        // user: string content → single input_text; multimodal parts →
+        // input_text / input_image (the data-URI image_url form is accepted
+        // by the Responses API as-is)
+        _ => {
+            let content = match m.get("content") {
+                Some(Value::String(s)) => json!([{ "type": "input_text", "text": s }]),
+                Some(Value::Array(parts)) => Value::Array(
+                    parts
+                        .iter()
+                        .map(|p| match p.get("type").and_then(|t| t.as_str()) {
+                            Some("image_url") => json!({
+                                "type": "input_image",
+                                "image_url": p.pointer("/image_url/url").cloned().unwrap_or(Value::Null),
+                            }),
+                            _ => json!({
+                                "type": "input_text",
+                                "text": p.get("text").cloned().unwrap_or(Value::Null),
+                            }),
+                        })
+                        .collect(),
+                ),
+                _ => json!([]),
+            };
+            vec![json!({ "type": "message", "role": "user", "content": content })]
+        }
+    }
+}
+
+/// Chat-completions tool schema → Responses flat tool schema
+/// ({type:"function",function:{name,…}} → {type:"function",name,…}).
+/// Order-preserving; entries without a `function` object are dropped.
+fn responses_tools(tools: &Value) -> Value {
+    Value::Array(
+        tools
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|t| {
+                let f = t.get("function")?;
+                Some(json!({
+                    "type": "function",
+                    "name": f.get("name").cloned().unwrap_or(Value::Null),
+                    "description": f.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": f.get("parameters").cloned().unwrap_or(Value::Null),
+                }))
+            })
+            .collect(),
+    )
+}
+
 /// Anthropic bodies are structurally different (top-level system, required
 /// max_tokens), so Zone stability is maintained per-role fragments but the
 /// exact byte-layout guarantee belongs to the OpenAI-compat path.
@@ -428,11 +617,15 @@ impl LanePrefix {
 /// `max_output` overrides the built-in 8192 cap; `temperature` is omitted
 /// when None (provider default).
 ///
-/// Prompt caching follows Claude Code's `getCacheControl` time setting:
-/// `cache_control: {"type":"ephemeral","ttl":"1h"}` — a 60-minute cache
+/// Prompt caching follows the CacheTier of the provider (pi retention
+/// alignment). Long = Claude Code's `getCacheControl` time setting,
+/// `cache_control:{"type":"ephemeral","ttl":"1h"}` — a 60-minute cache
 /// window (the API default when the marker is absent is only 5 minutes).
-/// Markers sit on (a) the stable system block (Zone S) and (b) the newest
-/// message (incremental breakpoint: the next request's Zone H prefix hits).
+/// Short = `{"type":"ephemeral"}` — the 5-minute default window at the
+/// cheaper 1.25× write rate. None = no markers at all (no write premium,
+/// but nothing is cached). Markers sit on (a) the stable system block
+/// (Zone S) and (b) the newest message (incremental breakpoint: the next
+/// request's Zone H prefix hits).
 ///
 /// Deliberately NO third breakpoint on the tool array (pi marks its last
 /// tool): Anthropic's cache prefix order is tools → system → messages, so a
@@ -445,8 +638,13 @@ pub fn build_anthropic_body(
     messages: &[ChatMessage],
     max_output: Option<u32>,
     temperature: Option<f64>,
+    tier: CacheTier,
 ) -> String {
-    let cache_mark = || serde_json::json!({ "type": "ephemeral", "ttl": "1h" });
+    let cache_mark = || match tier {
+        CacheTier::Long => Some(json!({ "type": "ephemeral", "ttl": "1h" })),
+        CacheTier::Short => Some(json!({ "type": "ephemeral" })),
+        CacheTier::None => None,
+    };
     #[derive(Serialize)]
     struct Msg {
         role: String,
@@ -482,14 +680,14 @@ pub fn build_anthropic_body(
         .collect();
     // incremental cache breakpoint: everything up to (and including) the
     // newest message becomes the cached prefix for the NEXT request
-    if let Some(last) = msgs.last_mut() {
+    if let (Some(mark), Some(last)) = (cache_mark(), msgs.last_mut()) {
         last.content = match std::mem::take(&mut last.content) {
             serde_json::Value::String(s) => {
-                json!([{ "type": "text", "text": s, "cache_control": cache_mark() }])
+                json!([{ "type": "text", "text": s, "cache_control": mark }])
             }
             serde_json::Value::Array(mut blocks) => {
                 if let Some(b) = blocks.last_mut() {
-                    b["cache_control"] = cache_mark();
+                    b["cache_control"] = mark;
                 }
                 serde_json::Value::Array(blocks)
             }
@@ -508,13 +706,18 @@ pub fn build_anthropic_body(
         );
     }
     if !system_prompt.is_empty() {
-        body["system"] = json!([
-            {
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": cache_mark(),
-            }
-        ]);
+        if let Some(mark) = cache_mark() {
+            body["system"] = json!([
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": mark,
+                }
+            ]);
+        } else {
+            // tier None: plain top-level string — no marker, no write premium
+            body["system"] = json!(system_prompt);
+        }
     }
     serde_json::to_string(&body).expect("anthropic body")
 }
@@ -631,14 +834,15 @@ mod tests {
     }
 
     #[test]
-    fn retention_and_tools_bind_with_epoch_discipline() {
+    fn tier_and_tools_bind_with_epoch_discipline() {
         let mut lp = sys();
         lp.bind_model("m1");
-        // retention off by default; the field is absent from the head
+        // default tier Short: cache key present, no retention argument
         let body = lp.build_openai_body_multi("m1", &[ChatMessage::plain("user", "hi")], None);
+        assert!(body.contains("\"prompt_cache_key\":\"ccharness-test-0\""), "{body}");
         assert!(!body.contains("prompt_cache_retention"), "{body}");
-        // off → on: epoch bump + field lands in the head before messages
-        lp.bind_retention(true);
+        // short → long: epoch bump + retention rides the head before messages
+        lp.bind_cache_tier(CacheTier::Long);
         assert_eq!(lp.epoch, 1);
         let body = lp.build_openai_body_multi("m1", &[ChatMessage::plain("user", "hi")], None);
         assert!(body.contains("\"prompt_cache_retention\":\"24h\""), "{body}");
@@ -646,49 +850,58 @@ mod tests {
         let msgs_at = body.find("\"messages\":").unwrap();
         assert!(ret_at < msgs_at, "retention must ride the byte-stable head");
         // same value: no bump
-        lp.bind_retention(true);
+        lp.bind_cache_tier(CacheTier::Long);
         assert_eq!(lp.epoch, 1);
-        // on → off: bump again, field gone
-        lp.bind_retention(false);
+        // long → none: bump again; cache key AND retention both gone
+        lp.bind_cache_tier(CacheTier::None);
         assert_eq!(lp.epoch, 2);
         let body = lp.build_openai_body_multi("m1", &[ChatMessage::plain("user", "hi")], None);
+        assert!(!body.contains("prompt_cache_key"), "{body}");
         assert!(!body.contains("prompt_cache_retention"), "{body}");
+        // none → none: no-op
+        lp.bind_cache_tier(CacheTier::None);
+        assert_eq!(lp.epoch, 2);
+        // none → short: bump back, key returns
+        lp.bind_cache_tier(CacheTier::Short);
+        assert_eq!(lp.epoch, 3);
+        let body = lp.build_openai_body_multi("m1", &[ChatMessage::plain("user", "hi")], None);
+        assert!(body.contains("\"prompt_cache_key\""), "{body}");
 
         // tools loadout: None → Some is an expected rebuild
         lp.bind_tools_hash(None);
-        assert_eq!(lp.epoch, 2, "no bump while no tools were ever bound");
+        assert_eq!(lp.epoch, 3, "no bump while no tools were ever bound");
         lp.bind_tools_hash(Some(0xDEAD));
-        assert_eq!(lp.epoch, 3);
+        assert_eq!(lp.epoch, 4);
         lp.bind_tools_hash(Some(0xDEAD));
-        assert_eq!(lp.epoch, 3, "same loadout must not bump epoch");
+        assert_eq!(lp.epoch, 4, "same loadout must not bump epoch");
         lp.bind_tools_hash(Some(0xBEEF));
-        assert_eq!(lp.epoch, 4, "loadout change (MCP join/leave) bumps epoch");
+        assert_eq!(lp.epoch, 5, "loadout change (MCP join/leave) bumps epoch");
     }
 
     #[test]
     fn anthropic_body_honors_behavior_opts() {
         let msgs = [ChatMessage::plain("user", "hi")];
         // no overrides: built-in 8192 cap, no temperature
-        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long);
         assert!(b.contains("\"max_tokens\":8192"), "{b}");
         assert!(!b.contains("temperature"), "{b}");
         // overrides applied
-        let b = build_anthropic_body("claude-x", "sys", &msgs, Some(2048), Some(0.5));
+        let b = build_anthropic_body("claude-x", "sys", &msgs, Some(2048), Some(0.5), CacheTier::Long);
         assert!(b.contains("\"max_tokens\":2048"), "{b}");
         assert!(b.contains("\"temperature\":0.5"), "{b}");
     }
 
     #[test]
     fn anthropic_body_marks_1h_cache() {
-        // Claude-Code time setting: cache_control ephemeral + ttl 1h (60min).
-        // Note: serde_json sorts object keys, so assertions parse the body
-        // back instead of matching raw strings in insertion order.
+        // Long tier = Claude-Code time setting: cache_control ephemeral +
+        // ttl 1h (60min). Note: serde_json sorts object keys, so assertions
+        // parse the body back instead of matching raw strings in order.
         let msgs = [
             ChatMessage::plain("user", "第一轮"),
             ChatMessage::plain("assistant", "回答一"),
             ChatMessage::plain("user", "第二轮"),
         ];
-        let b = build_anthropic_body("claude-x", "系统提示", &msgs, None, None);
+        let b = build_anthropic_body("claude-x", "系统提示", &msgs, None, None, CacheTier::Long);
         // exactly two markers: system + newest-message breakpoint
         assert_eq!(b.matches("\"ttl\":\"1h\"").count(), 2, "{b}");
         let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
@@ -715,11 +928,33 @@ mod tests {
             "看图",
             vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into() }],
         )];
-        let b = build_anthropic_body("claude-x", "", &msgs, None, None);
+        let b = build_anthropic_body("claude-x", "", &msgs, None, None, CacheTier::Long);
         let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
         let blocks = v["messages"][0]["content"].as_array().expect("blocks");
         assert_eq!(blocks.last().unwrap()["type"], "image");
         assert_eq!(blocks.last().unwrap()["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn anthropic_body_short_and_none_tiers() {
+        let msgs = [ChatMessage::plain("user", "hi")];
+        // Short: ephemeral markers WITHOUT ttl — the API-default 5-minute
+        // window at the cheaper write rate (serde_json sorts object keys,
+        // so match the marker substring without assuming key order)
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Short);
+        assert!(b.contains("\"cache_control\":{\"type\":\"ephemeral\"}"), "{b}");
+        assert!(!b.contains("ttl"), "{b}");
+        assert_eq!(b.matches("\"cache_control\"").count(), 2, "{b}");
+        let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
+        assert_eq!(v["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(v["system"][0]["cache_control"].get("ttl").is_none());
+
+        // None: no markers anywhere; system degrades to the plain string
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::None);
+        assert!(!b.contains("cache_control"), "{b}");
+        let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
+        assert_eq!(v["system"], serde_json::json!("sys"));
+        assert_eq!(v["messages"][0]["content"], serde_json::json!("hi"));
     }
 
     #[test]
@@ -763,9 +998,146 @@ mod tests {
             "看图",
             vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into() }],
         )];
-        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long);
         assert!(b.contains("\"type\":\"image\""), "{b}");
         assert!(b.contains("\"media_type\":\"image/png\""), "{b}");
         assert!(b.contains("\"data\":\"aGk=\""), "{b}");
+    }
+
+    // ---- OpenAI Responses adapter ----
+
+    fn tools_schema() -> Value {
+        serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": { "type": "object", "properties": { "path": { "type": "string" } } }
+                }
+            }
+        ])
+    }
+
+    #[test]
+    fn responses_body_shape_and_stability() {
+        let mut lp = LanePrefix::new("系统提示", "ccharness-rs-0");
+        lp.bind_model("gpt-5.1");
+        let u1 = ChatMessage::plain("user", "第一轮");
+        let body1 = lp.build_responses_body("gpt-5.1", &[u1.clone()], Some(&tools_schema()));
+
+        // protocol shape: instructions + input items + flat tools
+        assert!(body1.contains("\"instructions\":\"系统提示\""), "{body1}");
+        assert!(body1.contains("\"store\":false"), "{body1}");
+        assert!(body1.contains("\"stream\":true"), "{body1}");
+        assert!(body1.contains("\"prompt_cache_key\":\"ccharness-rs-0\""), "{body1}");
+        assert!(!body1.contains("prompt_cache_retention"), "{body1}");
+        assert!(body1.contains("\"tool_choice\":\"auto\""), "{body1}");
+        // tool schema flattened: {type,name,…} not nested under a function
+        // object (key order is sorted by serde_json)
+        assert!(body1.contains("\"name\":\"read_file\""), "{body1}");
+        assert!(!body1.contains("\"function\":{"), "{body1}");
+        // user message converted to a message item with input_text
+        let v: Value = serde_json::from_str(&body1).expect("valid json");
+        assert_eq!(v["input"][0]["type"], "message");
+        assert_eq!(v["input"][0]["role"], "user");
+        assert_eq!(v["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(v["input"][0]["content"][0]["text"], "第一轮");
+
+        // Zone S+H byte stability across turns (same invariant as the
+        // chat-completions path)
+        lp.append(&u1);
+        lp.append(&ChatMessage::plain("assistant", "回答一"));
+        let body2 = lp.build_responses_body("gpt-5.1", &[ChatMessage::plain("user", "第二轮")], Some(&tools_schema()));
+        let start = body1.find("\"input\":[").unwrap() + "\"input\":[".len();
+        let span1 = &body1[start..body1.len() - 2];
+        let span2 = &body2[start..start + span1.len()];
+        assert_eq!(span1, span2, "Responses input prefix bytes must be stable");
+        assert!(body2.len() > body1.len());
+
+        // deterministic: same state → same bytes
+        let again = lp.build_responses_body("gpt-5.1", &[ChatMessage::plain("user", "第二轮")], Some(&tools_schema()));
+        assert_eq!(body2, again);
+    }
+
+    #[test]
+    fn responses_body_converts_tool_loops() {
+        let mut lp = LanePrefix::new("", "k0");
+        lp.bind_model("gpt-5.1");
+        let mut call = ChatMessage::plain("assistant", "");
+        call.tool_calls = Some(serde_json::json!([
+            { "id": "call_1", "type": "function",
+              "function": { "name": "read_file", "arguments": "{\"path\":\"a.rs\"}" } }
+        ]));
+        let result = ChatMessage {
+            role: "tool".into(),
+            content: "file body".into(),
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            images: Vec::new(),
+        };
+        let body = lp.build_responses_body(
+            "gpt-5.1",
+            &[call, result, ChatMessage::plain("user", "继续")],
+            Some(&tools_schema()),
+        );
+        let v: Value = serde_json::from_str(&body).expect("valid json");
+        let items = v["input"].as_array().expect("items");
+        // assistant(empty text) → one function_call; tool → function_call_output
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["call_id"], "call_1");
+        assert_eq!(items[0]["name"], "read_file");
+        assert_eq!(items[0]["arguments"], "{\"path\":\"a.rs\"}");
+        assert_eq!(items[1]["type"], "function_call_output");
+        assert_eq!(items[1]["call_id"], "call_1");
+        assert_eq!(items[1]["output"], "file body");
+        assert_eq!(items[2]["type"], "message");
+        assert_eq!(items[2]["role"], "user");
+        // empty-text assistant must NOT emit an empty message item
+        assert!(items.iter().all(|i| i["type"] != "message" || i["role"] != "assistant"));
+    }
+
+    #[test]
+    fn responses_body_tier_and_head_params() {
+        let mut lp = LanePrefix::new("sys", "k1");
+        lp.bind_model("gpt-5.1");
+        lp.bind_cache_tier(CacheTier::None);
+        lp.bind_thinking(Some("high"));
+        lp.bind_behavior(Some(0.3), Some(4096));
+        let body = lp.build_responses_body("gpt-5.1", &[ChatMessage::plain("user", "hi")], None);
+        // tier None: no cache routing at all
+        assert!(!body.contains("prompt_cache_key"), "{body}");
+        // nested reasoning effort + sampling params in the head
+        assert!(body.contains("\"reasoning\":{\"effort\":\"high\"}"), "{body}");
+        assert!(body.contains("\"temperature\":0.3"), "{body}");
+        assert!(body.contains("\"max_output_tokens\":4096"), "{body}");
+        let reasoning_at = body.find("\"reasoning\"").unwrap();
+        let input_at = body.find("\"input\":").unwrap();
+        assert!(reasoning_at < input_at, "head must precede input");
+
+        // long tier adds the retention argument
+        let mut lp = LanePrefix::new("sys", "k1");
+        lp.bind_model("gpt-5.1");
+        lp.bind_cache_tier(CacheTier::Long);
+        let body = lp.build_responses_body("gpt-5.1", &[ChatMessage::plain("user", "hi")], None);
+        assert!(body.contains("\"prompt_cache_key\":\"k1\""), "{body}");
+        assert!(body.contains("\"prompt_cache_retention\":\"24h\""), "{body}");
+    }
+
+    #[test]
+    fn responses_body_multimodal_user_parts() {
+        let lp = LanePrefix::new("", "k2");
+        let m = ChatMessage::with_images(
+            "user",
+            "看图",
+            vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into() }],
+        );
+        let body = lp.build_responses_body("gpt-5.1", &[m], None);
+        let v: Value = serde_json::from_str(&body).expect("valid json");
+        let parts = v["input"][0]["content"].as_array().expect("parts");
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[0]["text"], "看图");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["image_url"], "data:image/png;base64,aGk=");
     }
 }

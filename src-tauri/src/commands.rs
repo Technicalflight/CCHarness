@@ -970,7 +970,8 @@ pub fn ccswitch_import(state: State<'_, AppState>) -> Result<Vec<Provider>, Stri
             context_window: None,
             pricing: std::collections::BTreeMap::new(),
             behavior: std::collections::BTreeMap::new(),
-            cache_retention_24h: false,
+            cache_tier: None,
+            cache_retention_24h: None,
         });
     }
 
@@ -2267,9 +2268,9 @@ async fn run_subagent(
         // sub agents honor the same per-model sampling params (epoch-gated)
         let beh = provider.behavior.get(&model);
         lp.bind_behavior(beh.and_then(|b| b.temperature), beh.and_then(|b| b.max_output));
-        // head-byte discipline: retention toggle and MCP loadout changes are
+        // head-byte discipline: cache-tier toggle and MCP loadout changes are
         // expected rebuilds and must move the epoch, not fake an upstream miss
-        lp.bind_retention(provider.cache_retention_24h);
+        lp.bind_cache_tier(provider.cache_tier());
         lp.bind_tools_hash(tools_hash(Some(&tools)));
         lp.clone()
     };
@@ -2293,7 +2294,13 @@ async fn run_subagent(
             channel: channel.clone(),
             stop: stop.clone(),
             progress_tap: Some(tap.clone()),
-            affinity: Some(cache_key.clone()),
+            // pi gating: the affinity header only makes sense while the tier
+            // still routes via prompt_cache_key (tier None sends no marks)
+            affinity: if provider.cache_tier() == crate::config::CacheTier::None {
+                None
+            } else {
+                Some(cache_key.clone())
+            },
         };
         let outcome = match chat::stream_lane(&ctx, body, chat::auth_for(&provider)).await {
             Ok(o) => o,
@@ -3119,11 +3126,11 @@ async fn run_send(
                         Some(cfg.settings.thinking_level.as_str())
                     });
                 lp.bind_thinking(reasoning);
-                // head-byte discipline: retention toggle and MCP loadout
+                // head-byte discipline: cache-tier toggle and MCP loadout
                 // changes rewrite the head without touching Zone H — they
                 // must bump the epoch (expected rebuild) rather than masquer
                 // -ade as an upstream cache miss in telemetry
-                lp.bind_retention(provider.cache_retention_24h);
+                lp.bind_cache_tier(provider.cache_tier());
                 lp.bind_tools_hash(tools_hash(tools_schema.as_ref()));
                 // system change (settings/workspace/AGENTS.md) or privacy-mode
                 // toggle or restart recovery ⇒ rebuild Zone H from the
@@ -3268,7 +3275,14 @@ async fn run_send(
                     channel: channel.clone(),
                     stop: stop.clone(),
                     progress_tap: None,
-                    affinity: Some(cache_key.clone()),
+                    // pi gating: the affinity header only makes sense while
+                    // the tier still routes via prompt_cache_key (tier None
+                    // sends no cache marks at all)
+                    affinity: if provider.cache_tier() == crate::config::CacheTier::None {
+                        None
+                    } else {
+                        Some(cache_key.clone())
+                    },
                 };
                 let outcome = match chat::stream_lane(&ctx, body, chat::auth_for(&provider)).await {
                     Ok(o) => o,

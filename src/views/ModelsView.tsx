@@ -7,7 +7,7 @@ import { BrandMark, ModelMark } from "../lib/lobeIcon";
 import { Icon } from "../lib/icons";
 import { fmtUsd } from "../lib/format";
 import * as api from "../lib/api";
-import type { Provider, ProviderKind } from "../types";
+import type { Provider, ProviderKind, CacheTier } from "../types";
 
 const EMPTY_BEHAVIOR = { max_output: null, temperature: null, reasoning: null };
 
@@ -23,11 +23,20 @@ const PRESETS: Preset[] = [
   { name: "DeepSeek", kind: "openai_compatible", base_url: "https://api.deepseek.com/v1", allow_local: false, note: "前缀缓存计费约为输入价 1/10" },
   { name: "智谱 GLM", kind: "openai_compatible", base_url: "https://open.bigmodel.cn/api/paas/v4", allow_local: false, note: "GLM-4 系列" },
   { name: "Moonshot Kimi", kind: "openai_compatible", base_url: "https://api.moonshot.cn/v1", allow_local: false, note: "Kimi 系列" },
-  { name: "OpenAI", kind: "openai_compatible", base_url: "https://api.openai.com/v1", allow_local: false, note: "GPT 系列" },
+  { name: "OpenAI", kind: "openai_compatible", base_url: "https://api.openai.com/v1", allow_local: false, note: "GPT 系列（chat/completions 协议）" },
+  { name: "OpenAI Responses", kind: "openai_responses", base_url: "https://api.openai.com/v1", allow_local: false, note: "Responses 协议（GPT-5.x / o 系列原生接口）" },
   { name: "Anthropic", kind: "anthropic", base_url: "https://api.anthropic.com", allow_local: false, note: "Claude 系列" },
+  { name: "Azure OpenAI (Responses)", kind: "azure_responses", base_url: "", allow_local: false, note: "v1 数据面：https://<资源名>.openai.azure.com/openai/v1，api-key 认证" },
   { name: "Ollama 本地", kind: "openai_compatible", base_url: "http://localhost:11434/v1", allow_local: true, note: "本地端点，需显式开启本地访问" },
   { name: "自定义 OpenAI 兼容", kind: "openai_compatible", base_url: "", allow_local: false, note: "任意 OpenAI 兼容网关" },
 ];
+
+const KIND_LABEL: Record<ProviderKind, string> = {
+  openai_compatible: "openai-compat",
+  openai_responses: "openai-responses",
+  azure_responses: "azure-responses",
+  anthropic: "anthropic",
+};
 
 function newId(): string {
   return `p_${Math.random().toString(36).slice(2, 9)}`;
@@ -141,7 +150,9 @@ function ProviderCard({ provider: p }: { provider: Provider }) {
             <input
               type="password"
               value={draft.api_key}
-              placeholder={draft.kind === "anthropic" ? "sk-ant-…" : "sk-…"}
+              placeholder={
+                draft.kind === "anthropic" ? "sk-ant-…" : draft.kind === "azure_responses" ? "Azure 门户密钥" : "sk-…"
+              }
               onChange={(e) => setDraft({ ...draft, api_key: e.target.value })}
               spellCheck={false}
             />
@@ -177,22 +188,30 @@ function ProviderCard({ provider: p }: { provider: Provider }) {
           </span>
         </div>
 
-        {draft.kind === "openai_compatible" && (
-          <div className="row" style={{ marginBottom: 10 }}>
-            <span className="row" style={{ gap: 6 }}>
-              <button
-                className={`switch ${draft.cache_retention_24h ? "on" : ""}`}
-                role="switch"
-                aria-checked={!!draft.cache_retention_24h}
-                onClick={() => setDraft({ ...draft, cache_retention_24h: !draft.cache_retention_24h })}
-              />
-              <span style={{ fontSize: 12.5, color: "var(--text-dim)" }}>OpenAI 24h 长缓存保留</span>
-            </span>
-            <span className="hint" style={{ fontSize: 11 }}>
-              （请求携带 prompt_cache_retention:"24h"——仅 OpenAI 官方 GPT-5.x / 4.1 等支持；严格兼容网关会拒绝该参数，保持关闭）
-            </span>
-          </div>
-        )}
+        <div className="row" style={{ marginBottom: 10 }}>
+          <span className="row" style={{ gap: 6 }}>
+            <span style={{ fontSize: 12.5, color: "var(--text-dim)" }}>缓存档位</span>
+            <select
+              style={{ width: 150 }}
+              value={draft.cache_tier ?? "auto"}
+              title="缓存 TTL 档位（对齐 pi 的 retention 矩阵）。auto = 协议默认（Anthropic 1h 标记 / OpenAI 仅缓存路由键）；long = 延长窗口（Anthropic ttl:1h / OpenAI 24h 保留）；short = 协议默认窗口；none = 不发任何缓存标记（严格网关最安全）"
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  cache_tier: e.target.value === "auto" ? null : (e.target.value as CacheTier),
+                })
+              }
+            >
+              <option value="auto">默认（{draft.kind === "anthropic" ? "1h 标记" : "short"}）</option>
+              <option value="short">short（5-10 分钟）</option>
+              <option value="long">long（Anthropic 1h / OpenAI 24h）</option>
+              <option value="none">none（禁用缓存标记）</option>
+            </select>
+          </span>
+          <span className="hint" style={{ fontSize: 11 }}>
+            （none 时不发 prompt_cache_key / cache_control；改动档位会重建该 Provider 各会话的缓存纪元）
+          </span>
+        </div>
 
         <div className="row" style={{ marginBottom: 12 }}>
           <button className="btn small" disabled={testing || !draft.base_url} onClick={test}>

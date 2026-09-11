@@ -1,7 +1,16 @@
 // Shared contract types. Field names mirror the Rust side (serde) —
 // any change here must be mirrored in src-tauri/src/*.
 
-export type ProviderKind = "openai_compatible" | "anthropic";
+export type ProviderKind =
+  | "openai_compatible"
+  | "openai_responses"
+  | "azure_responses"
+  | "anthropic";
+
+/** Cache TTL tier (pi retention alignment): short = protocol default window
+ *  (Anthropic 5m / OpenAI ~5-10min), long = extended window (Anthropic 1h /
+ *  OpenAI 24h), none = no cache marks at all. */
+export type CacheTier = "short" | "long" | "none";
 
 export interface Pricing {
   input_per_m: number;
@@ -30,9 +39,12 @@ export interface Provider {
   context_window: number | null;
   pricing: Record<string, Pricing>;
   behavior: Record<string, ModelBehavior>;
-  /** OpenAI extended retention: send prompt_cache_retention:"24h" (GPT-5.x/4.1).
-   *  Off by default — strict gateways reject the unknown argument. */
-  cache_retention_24h?: boolean;
+  /** Cache TTL tier override (null/absent = protocol default:
+   *  anthropic → long/1h, OpenAI family → short). */
+  cache_tier?: CacheTier | null;
+  /** Legacy v0.1.5 flag, superseded by cache_tier; kept so old configs
+   *  load unchanged (true ⇒ long tier). */
+  cache_retention_24h?: boolean | null;
 }
 
 export interface AppSettings {

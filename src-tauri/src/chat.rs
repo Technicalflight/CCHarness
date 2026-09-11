@@ -9,8 +9,7 @@
 // - Cost is computed from per-model pricing: non-cached input at input price,
 //   cached input at cached price, output at output price.
 
-use crate::config::{Provider, ProviderKind};
-use crate::prefix::{self, ChatMessage, LanePrefix};
+use crate::config::{Provider, ProviderKind};use crate::prefix::{self, ChatMessage, LanePrefix};
 use crate::sessions::SessionFile;
 use crate::types_rs::{MessageRecord, StreamEvent, ToolCallWire, UsageStat};
 use serde_json::{json, Value};
@@ -207,6 +206,18 @@ pub async fn stream_lane(
                         &mut tool_accs,
                         &mut finish_reason,
                     ),
+                    ProviderKind::OpenaiResponses | ProviderKind::AzureResponses => {
+                        handle_responses_frame(
+                            ctx,
+                            &v,
+                            &mut content,
+                            &mut reasoning,
+                            &mut usage,
+                            &mut cfilter,
+                            &mut tool_accs,
+                            &mut finish_reason,
+                        )
+                    }
                     ProviderKind::Anthropic => {
                         handle_anthropic_frame(ctx, &v, &mut content, &mut reasoning, &mut usage, &mut cfilter)
                     }
@@ -492,9 +503,119 @@ fn handle_anthropic_frame(
     }
 }
 
+/// One Responses-API SSE event (OpenaiResponses / AzureResponses lanes).
+/// Text/reasoning deltas ride the `delta` field of the `*-text.delta`
+/// events; function calls arrive whole on `output_item.done` — no fragment
+/// assembly needed. The terminal `response.completed` / `.incomplete` /
+/// `.failed` event carries the full response including usage (OpenAI-style
+/// bucket semantics: cached is a SUBSET of input_tokens). A failed response
+/// ends the stream like an empty reply — the caller's empty-content path
+/// reports it, matching how empty chat-completions replies surface today.
+#[allow(clippy::too_many_arguments)]
+fn handle_responses_frame(
+    ctx: &SendCtx<'_>,
+    v: &Value,
+    content: &mut String,
+    reasoning: &mut String,
+    usage: &mut UsageStat,
+    cfilter: &mut crate::confidence::ConfidenceFilter,
+    tool_accs: &mut Vec<ToolCallAcc>,
+    finish_reason: &mut Option<String>,
+) {
+    let (text_delta, reasoning_delta) = apply_responses_event(
+        v, content, reasoning, usage, cfilter, tool_accs, finish_reason,
+    );
+    if !text_delta.is_empty() {
+        ctx.emit_delta(&text_delta);
+    }
+    if !reasoning_delta.is_empty() {
+        ctx.emit_reasoning(&reasoning_delta);
+    }
+}
+
+/// Pure event parser (testable without a Tauri channel): applies one
+/// Responses SSE event to the lane accumulators and returns the (content,
+/// reasoning) deltas to emit upstream.
+#[allow(clippy::too_many_arguments)]
+fn apply_responses_event(
+    v: &Value,
+    content: &mut String,
+    reasoning: &mut String,
+    usage: &mut UsageStat,
+    cfilter: &mut crate::confidence::ConfidenceFilter,
+    tool_accs: &mut Vec<ToolCallAcc>,
+    finish_reason: &mut Option<String>,
+) -> (String, String) {
+    match v.get("type").and_then(|x| x.as_str()) {
+        Some("response.output_text.delta") => {
+            let mut out = String::new();
+            if let Some(t) = v.get("delta").and_then(|x| x.as_str()) {
+                if !t.is_empty() {
+                    let clean = cfilter.push(t);
+                    if !clean.is_empty() {
+                        content.push_str(&clean);
+                        out = clean;
+                    }
+                }
+            }
+            (out, String::new())
+        }
+        Some("response.reasoning_summary_text.delta") => {
+            let mut out = String::new();
+            if let Some(t) = v.get("delta").and_then(|x| x.as_str()) {
+                if !t.is_empty() {
+                    reasoning.push_str(t);
+                    out = t.to_string();
+                }
+            }
+            (String::new(), out)
+        }
+        Some("response.output_item.done") => {
+            // complete item: {type:"function_call", call_id, name, arguments}
+            if v.pointer("/item/type").and_then(|x| x.as_str()) == Some("function_call") {
+                tool_accs.push(ToolCallAcc {
+                    id: v
+                        .pointer("/item/call_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    name: v
+                        .pointer("/item/name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    args: v
+                        .pointer("/item/arguments")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("{}")
+                        .to_string(),
+                });
+            }
+            (String::new(), String::new())
+        }
+        Some("response.completed") | Some("response.incomplete") | Some("response.failed") => {
+            if let Some(u) = v.pointer("/response/usage") {
+                usage.input = u.get("input_tokens").and_then(|x| x.as_u64());
+                usage.output = u.get("output_tokens").and_then(|x| x.as_u64());
+                if let Some(c) = u
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(|x| x.as_u64())
+                {
+                    usage.cached = Some(c);
+                }
+            }
+            *finish_reason = Some(if tool_accs.is_empty() { "stop" } else { "tool_calls" }.into());
+            (String::new(), String::new())
+        }
+        _ => (String::new(), String::new()),
+    }
+}
+
 pub enum AuthHeader {
     Bearer(String),
     Anthropic { key: String },
+    /// Azure OpenAI: `api-key` request header (no Bearer / version header).
+    Azure { key: String },
 }
 
 impl AuthHeader {
@@ -516,6 +637,11 @@ impl AuthHeader {
                     );
                 }
             }
+            AuthHeader::Azure { key } => {
+                if let Ok(k) = HeaderValue::from_str(key) {
+                    hm.insert(HeaderName::from_static("api-key"), k);
+                }
+            }
         }
         hm
     }
@@ -524,6 +650,7 @@ impl AuthHeader {
 pub fn auth_for(p: &Provider) -> AuthHeader {
     match p.kind {
         ProviderKind::Anthropic => AuthHeader::Anthropic { key: p.api_key.clone() },
+        ProviderKind::AzureResponses => AuthHeader::Azure { key: p.api_key.clone() },
         _ => AuthHeader::Bearer(p.api_key.clone()),
     }
 }
@@ -531,6 +658,13 @@ pub fn auth_for(p: &Provider) -> AuthHeader {
 pub fn endpoint_chat(p: &Provider) -> String {
     match p.kind {
         ProviderKind::Anthropic => format!("{}/v1/messages", p.base_url.trim_end_matches('/')),
+        // Responses protocol: OpenAI official uses {base}/responses (base
+        // ends in /v1); Azure's v1 data-plane surface uses the same suffix
+        // with base https://<resource>.openai.azure.com/openai/v1 and the
+        // api-key header instead of Bearer.
+        ProviderKind::OpenaiResponses | ProviderKind::AzureResponses => {
+            format!("{}/responses", p.base_url.trim_end_matches('/'))
+        }
         _ => format!("{}/chat/completions", p.base_url.trim_end_matches('/')),
     }
 }
@@ -542,9 +676,10 @@ pub fn endpoint_models(p: &Provider) -> String {
     }
 }
 
-/// One-shot (non-streaming) OpenAI-compatible chat call — used by the
-/// post-turn reflection and the benchmark runner. Anthropic-kind providers
-/// are rejected (their /v1/messages body shape differs).
+/// One-shot (non-streaming) OpenAI chat call — used by the post-turn
+/// reflection and the benchmark runner. Supports the chat-completions and
+/// Responses protocols; Anthropic-kind providers are rejected (their
+/// /v1/messages body shape differs).
 pub async fn ask_once(
     client: &reqwest::Client,
     provider: &Provider,
@@ -556,21 +691,40 @@ pub async fn ask_once(
     if matches!(provider.kind, ProviderKind::Anthropic) {
         return Err("该 Provider 为 Anthropic 类型，暂不支持此功能所需的非流式调用".into());
     }
-    let body = json!({
-        "model": model,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user }
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.2
-    });
+    let responses = matches!(
+        provider.kind,
+        ProviderKind::OpenaiResponses | ProviderKind::AzureResponses
+    );
+    let body = if responses {
+        json!({
+            "model": model,
+            "store": false,
+            "instructions": system,
+            "input": [{ "type": "message", "role": "user",
+                        "content": [{ "type": "input_text", "text": user }] }],
+            "max_output_tokens": max_tokens,
+            "temperature": 0.2
+        })
+    } else {
+        json!({
+            "model": model,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user }
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.2
+        })
+    };
     let mut req = client
         .post(endpoint_chat(provider))
+        .header("Content-Type", "application/json")
         .json(&body)
         .timeout(std::time::Duration::from_secs(120));
     if !provider.api_key.trim().is_empty() {
-        req = req.bearer_auth(provider.api_key.trim());
+        // auth_for covers Bearer (chat-completions + OpenAI Responses) and
+        // the api-key header (Azure Responses)
+        req = req.headers(auth_for(provider).headers());
     }
     let resp = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
     let status = resp.status();
@@ -582,10 +736,38 @@ pub async fn ask_once(
             .unwrap_or("未知错误");
         return Err(format!("接口错误（HTTP {status}）: {msg}"));
     }
-    Ok(v.pointer("/choices/0/message/content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string())
+    let text = if responses {
+        responses_output_text(&v)
+    } else {
+        v.pointer("/choices/0/message/content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    Ok(text)
+}
+
+/// Extract the assistant text from a non-streaming Responses payload:
+/// walk `output[]` and join the output_text parts of message items.
+fn responses_output_text(v: &Value) -> String {
+    let mut out = String::new();
+    if let Some(items) = v.get("output").and_then(|o| o.as_array()) {
+        for item in items {
+            if item.get("type").and_then(|t| t.as_str()) != Some("message") {
+                continue;
+            }
+            if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
+                for p in parts {
+                    if p.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                        if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
+                            out.push_str(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Alt text for the generated-image markdown: strip markdown-breaking
@@ -736,6 +918,11 @@ pub fn build_body(
 ) -> String {
     match p.kind {
         ProviderKind::OpenaiCompatible => lp.build_openai_body_multi(model, new_msgs, tools),
+        // Responses protocol: same byte-stable head design, protocol-native
+        // item shapes (instructions + input items + flat tools)
+        ProviderKind::OpenaiResponses | ProviderKind::AzureResponses => {
+            lp.build_responses_body(model, new_msgs, tools)
+        }
         ProviderKind::Anthropic => {
             // Anthropic path: tool schema not injected in v1; the request keeps
             // its legacy shape (top-level system + merged roles). new_msgs
@@ -754,6 +941,7 @@ pub fn build_body(
                 &merged,
                 beh.and_then(|b| b.max_output),
                 beh.and_then(|b| b.temperature),
+                p.cache_tier(),
             )
         }
     }
@@ -1060,6 +1248,13 @@ fn parse_once_usage(kind: &ProviderKind, v: &Value) -> UsageStat {
             cached: v.pointer("/usage/cache_read_input_tokens").and_then(|x| x.as_u64()),
             cache_write: v.pointer("/usage/cache_creation_input_tokens").and_then(|x| x.as_u64()),
         },
+        // Responses usage: cached is a SUBSET of input_tokens (OpenAI style)
+        ProviderKind::OpenaiResponses | ProviderKind::AzureResponses => UsageStat {
+            input: v.pointer("/usage/input_tokens").and_then(|x| x.as_u64()),
+            output: v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()),
+            cached: v.pointer("/usage/input_tokens_details/cached_tokens").and_then(|x| x.as_u64()),
+            cache_write: None,
+        },
         ProviderKind::OpenaiCompatible => UsageStat {
             input: v.pointer("/usage/prompt_tokens").and_then(|x| x.as_u64()),
             output: v.pointer("/usage/completion_tokens").and_then(|x| x.as_u64()),
@@ -1084,6 +1279,14 @@ pub fn build_once_body(kind: &ProviderKind, system: &str, user_text: &str) -> Va
             "max_tokens": 1024,
             "system": system,
             "messages": [{"role": "user", "content": user_text}],
+        }),
+        ProviderKind::OpenaiResponses | ProviderKind::AzureResponses => serde_json::json!({
+            "model": "",
+            "stream": false,
+            "store": false,
+            "instructions": system,
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": user_text}]}],
         }),
         ProviderKind::OpenaiCompatible => serde_json::json!({
             "model": "",
@@ -1126,6 +1329,7 @@ pub async fn complete_once(
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string(),
+        ProviderKind::OpenaiResponses | ProviderKind::AzureResponses => responses_output_text(&v),
         ProviderKind::OpenaiCompatible => v
             .pointer("/choices/0/message/content")
             .and_then(|x| x.as_str())
@@ -1191,7 +1395,8 @@ mod tests {
                 m
             },
             behavior: std::collections::BTreeMap::new(),
-            cache_retention_24h: false,
+            cache_tier: None,
+            cache_retention_24h: None,
         }
     }
 
@@ -1203,7 +1408,12 @@ mod tests {
 
     #[test]
     fn once_body_has_no_cache_marks() {
-        for kind in [ProviderKind::Anthropic, ProviderKind::OpenaiCompatible] {
+        for kind in [
+            ProviderKind::Anthropic,
+            ProviderKind::OpenaiCompatible,
+            ProviderKind::OpenaiResponses,
+            ProviderKind::AzureResponses,
+        ] {
             let body = build_once_body(&kind, "sys", "usr").to_string();
             assert!(!body.contains("cache_control"), "{kind:?}: {body}");
             assert!(!body.contains("prompt_cache"), "{kind:?}: {body}");
@@ -1211,6 +1421,11 @@ mod tests {
         // Anthropic system stays a plain string (not the marked array form)
         let a = build_once_body(&ProviderKind::Anthropic, "sys", "usr");
         assert_eq!(a["system"], serde_json::json!("sys"));
+        // Responses once body uses instructions + typed input items
+        let r = build_once_body(&ProviderKind::OpenaiResponses, "sys", "usr");
+        assert_eq!(r["instructions"], serde_json::json!("sys"));
+        assert_eq!(r["store"], serde_json::json!(false));
+        assert_eq!(r["input"][0]["content"][0]["type"], "input_text");
     }
 
     // --- item: bucket semantics differ per provider (pi cache-stats parity)
@@ -1295,5 +1510,120 @@ mod tests {
             Some("ccharness-s1-0")
         );
         assert!(affinity_header_map(None).is_empty());
+    }
+
+    // --- item: OpenAI Responses / Azure Responses adapter (pi matrix)
+
+    #[test]
+    fn responses_auth_and_endpoints() {
+        use reqwest::header::HeaderName;
+        // OpenAI Responses: Bearer + {base}/responses
+        let p = mk_provider(ProviderKind::OpenaiResponses);
+        assert_eq!(endpoint_chat(&p), "https://example.invalid/responses");
+        assert_eq!(endpoint_models(&p), "https://example.invalid/models");
+        let hm = auth_for(&p).headers();
+        assert!(
+            hm.get(reqwest::header::AUTHORIZATION).is_some(),
+            "OpenAI Responses authenticates with Bearer"
+        );
+
+        // Azure Responses: api-key header + same endpoint suffix
+        let mut az = mk_provider(ProviderKind::AzureResponses);
+        az.base_url = "https://res.openai.azure.com/openai/v1".into();
+        assert_eq!(endpoint_chat(&az), "https://res.openai.azure.com/openai/v1/responses");
+        let hm = auth_for(&az).headers();
+        assert_eq!(
+            hm.get(HeaderName::from_static("api-key")).and_then(|v| v.to_str().ok()),
+            Some("k")
+        );
+        assert!(hm.get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn responses_output_text_walks_items() {
+        let v = serde_json::json!({
+            "output": [
+                { "type": "reasoning", "summary": [] },
+                { "type": "message", "role": "assistant",
+                  "content": [
+                      { "type": "output_text", "text": "第一段" },
+                      { "type": "output_text", "text": "第二段" }
+                  ] }
+            ]
+        });
+        assert_eq!(responses_output_text(&v), "第一段第二段");
+        // no message items → empty (caller reports 空内容)
+        assert_eq!(responses_output_text(&serde_json::json!({"output": []})), "");
+    }
+
+    #[test]
+    fn responses_frame_parses_deltas_usage_and_tools() {
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut usage = UsageStat::default();
+        let mut cfilter = crate::confidence::ConfidenceFilter::new();
+        let mut tool_accs: Vec<ToolCallAcc> = Vec::new();
+        let mut finish: Option<String> = None;
+        let mut apply = |v: Value,
+                         content: &mut String,
+                         reasoning: &mut String,
+                         usage: &mut UsageStat,
+                         cfilter: &mut crate::confidence::ConfidenceFilter,
+                         tool_accs: &mut Vec<ToolCallAcc>,
+                         finish: &mut Option<String>| {
+            apply_responses_event(&v, content, reasoning, usage, cfilter, tool_accs, finish)
+        };
+
+        // text + reasoning deltas stream into the accumulators
+        let (t, r) = apply(
+            serde_json::json!({"type":"response.output_text.delta","delta":"你好"}),
+            &mut content, &mut reasoning, &mut usage, &mut cfilter, &mut tool_accs, &mut finish,
+        );
+        assert_eq!((t, r), ("你好".to_string(), String::new()));
+        let (t, r) = apply(
+            serde_json::json!({"type":"response.reasoning_summary_text.delta","delta":"思考"}),
+            &mut content, &mut reasoning, &mut usage, &mut cfilter, &mut tool_accs, &mut finish,
+        );
+        assert_eq!((t, r), (String::new(), "思考".to_string()));
+        assert_eq!(content, "你好");
+        assert_eq!(reasoning, "思考");
+
+        // a whole function_call item lands in the accumulator
+        apply(
+            serde_json::json!({"type":"response.output_item.done","item":{
+                "type":"function_call","call_id":"call_9","name":"read_file",
+                "arguments":"{\"path\":\"a.rs\"}"}}),
+            &mut content, &mut reasoning, &mut usage, &mut cfilter, &mut tool_accs, &mut finish,
+        );
+        assert_eq!(tool_accs.len(), 1);
+        assert_eq!((tool_accs[0].id.as_str(), tool_accs[0].name.as_str()), ("call_9", "read_file"));
+
+        // terminal event: usage (cached ⊆ input) + finish_reason tool_calls
+        apply(
+            serde_json::json!({"type":"response.completed","response":{"usage":{
+                "input_tokens":100000,"output_tokens":500,
+                "input_tokens_details":{"cached_tokens":90000}}}}),
+            &mut content, &mut reasoning, &mut usage, &mut cfilter, &mut tool_accs, &mut finish,
+        );
+        assert_eq!(usage.input, Some(100_000));
+        assert_eq!(usage.cached, Some(90_000));
+        assert_eq!(usage.output, Some(500));
+        assert_eq!(finish.as_deref(), Some("tool_calls"));
+
+        // without tool calls the same terminal event finishes as stop
+        let mut tool_accs2: Vec<ToolCallAcc> = Vec::new();
+        let mut finish2: Option<String> = None;
+        apply(
+            serde_json::json!({"type":"response.completed","response":{"usage":{}}}),
+            &mut content, &mut reasoning, &mut usage, &mut cfilter, &mut tool_accs2, &mut finish2,
+        );
+        assert_eq!(finish2.as_deref(), Some("stop"));
+
+        // unknown events are ignored
+        let (t, r) = apply(
+            serde_json::json!({"type":"response.created","response":{}}),
+            &mut content, &mut reasoning, &mut usage, &mut cfilter, &mut tool_accs, &mut finish,
+        );
+        assert_eq!((t, r), (String::new(), String::new()));
     }
 }
