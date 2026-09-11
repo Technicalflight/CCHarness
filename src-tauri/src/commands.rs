@@ -1791,9 +1791,14 @@ fn state_mcp_tools(data_dir: &std::path::Path) -> Vec<Value> {
 
 /// Connect every enabled server once (best-effort) so the first send does
 /// not pay the handshake latency. Called from run_send before lanes start.
-async fn ensure_mcp_servers(data_dir: &std::path::Path) {
+async fn ensure_mcp_servers(data_dir: &std::path::Path, stop: &AtomicBool) {
     let cfg = config::load(data_dir);
     for s in cfg.mcp_servers.iter().filter(|s| s.enabled) {
+        // each dead server can burn up to ~2×15s of handshake timeout before
+        // the lanes spawn — a stop click must cut the walk short
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         if let Err(e) = crate::mcp::global().ensure(s).await {
             eprintln!("[mcp] {} 连接失败: {e}", s.name);
         }
@@ -1801,7 +1806,12 @@ async fn ensure_mcp_servers(data_dir: &std::path::Path) {
 }
 
 /// Auto boundary compaction: called at the user boundary inside run_send.
-async fn maybe_auto_compact(state: &State<'_, AppState>, session_id: &str, cfg: &AppConfig) {
+async fn maybe_auto_compact(
+    state: &State<'_, AppState>,
+    session_id: &str,
+    cfg: &AppConfig,
+    stop: &AtomicBool,
+) {
     let Ok(sf) = state.store.load(session_id) else { return };
     if sf.meta.kind != "chat" || sf.messages.len() < COMPACT_MIN_MESSAGES {
         return;
@@ -1821,6 +1831,11 @@ async fn maybe_auto_compact(state: &State<'_, AppState>, session_id: &str, cfg: 
     if last_input < window * COMPACT_AT_FRACTION {
         return;
     }
+    // the summary call is a full one-shot completion (up to 120s) — never
+    // start it for a turn the user already stopped
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
     let _ = compact_now(&state.client, &state.data_dir, session_id, provider, &binding.model).await;
 }
 
@@ -1829,6 +1844,44 @@ pub fn stop_generation(state: State<'_, AppState>, session_id: String) {
     if let Some(flag) = state.stops.lock().unwrap().get(&session_id) {
         flag.store(true, Ordering::Relaxed);
     }
+}
+
+/// Resolves as soon as the session's stop flag flips. Paired with
+/// `tokio::select!` around the pre-stream phases (MCP warm-up, auto
+/// compaction, memory recall, deep/review rehearsals) so a stop click takes
+/// effect immediately instead of being ignored until the first streamed
+/// token — previously those phases left the turn looking frozen with a dead
+/// stop button.
+async fn wait_stopped(stop: &AtomicBool) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+}
+
+/// Emit the turn-closing event for a lane aborted before any streamed
+/// content (stop during a pre-stream phase). No assistant record exists yet
+/// — nothing was generated — so the transcript keeps only the user message.
+/// The digest-span marker is dropped (mirroring the error path): the aborted
+/// turn's bytes never went upstream, so the next turn's totals legitimately
+/// shrink and must not be judged against the stale span.
+async fn abort_lane_pre_stream(
+    channel: &tauri::ipc::Channel<StreamEvent>,
+    session_id: &str,
+    lane: u32,
+    message_id: &str,
+) {
+    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+        map.remove(&(session_id.to_string(), lane));
+    }
+    let _ = channel.send(StreamEvent::Done {
+        lane,
+        message_id: message_id.to_string(),
+        status: "stopped".into(),
+        confidence: None,
+    });
 }
 
 /// Edit-and-resend support: drop the user message at `from_ts` and everything
@@ -2838,12 +2891,12 @@ async fn run_send(
     // boundary compaction fires here — only at the user boundary, only for
     // chat sessions, only when the last request approached the window
     if !arena {
-        maybe_auto_compact(state, &session_id, &cfg).await;
+        maybe_auto_compact(state, &session_id, &cfg, &stop).await;
     }
     // MCP handshakes are lazy — warm them before lanes spawn so the first
     // model turn sees the full tool surface
     if cfg.mcp_servers.iter().any(|s| s.enabled) {
-        ensure_mcp_servers(&state.data_dir).await;
+        ensure_mcp_servers(&state.data_dir, &stop).await;
     }
 
     // one task per lane
@@ -3158,7 +3211,25 @@ async fn run_send(
             // request replays it verbatim; at turn end it falls into Zone H.
             let mut sent_this_turn: Vec<ChatMessage> = vec![transcript.last().unwrap().clone()];
             let mut last_confidence: Option<u32> = None;
-            let mut last_message_id = Uuid::new_v4().to_string();
+            // The assistant bubble is created BEFORE the slow pre-stream
+            // phases below (memory recall / deep rehearsal / review experts)
+            // so those turns show a message card immediately instead of
+            // looking frozen. The first stream round reuses this id and the
+            // frontend dedupes Started events per lane, so exactly one
+            // bubble appears per lane per turn.
+            let first_message_id = Uuid::new_v4().to_string();
+            let mut last_message_id = first_message_id.clone();
+            let has_pre_phase = (cfg.settings.vector_memory
+                && !cfg.settings.embeddings_url.trim().is_empty())
+                || deep_mode
+                || review_mode;
+            if has_pre_phase {
+                let _ = channel.send(StreamEvent::Started {
+                    lane,
+                    model: model.clone(),
+                    message_id: first_message_id.clone(),
+                });
+            }
             let mut turn_status = "error".to_string();
             // per-turn delegation budget for delegate_subagent
             let mut delegations = 0usize;
@@ -3183,14 +3254,30 @@ async fn run_send(
                     .unwrap_or_default();
                 let ws = sf_snapshot.meta.workspace.clone().unwrap_or_default();
                 if !user_text.is_empty() && !ws.is_empty() {
-                    let mems = crate::memvector::recall(&client, &cfg, &data_dir, &ws, &user_text, 3).await;
-                    if !mems.is_empty() {
-                        let block = format!(
-                            "\n\n[长期记忆参考 — 与本条消息语义相关的既往记忆]\n{}",
-                            mems.iter().map(|m| format!("- {m}")).collect::<Vec<_>>().join("\n")
-                        );
-                        if let Some(first) = sent_this_turn.first_mut() {
-                            first.content.push_str(&block);
+                    let _ = channel.send(StreamEvent::Reasoning {
+                        lane,
+                        message_id: first_message_id.clone(),
+                        text: "正在检索相关的长期记忆…\n\n".to_string(),
+                    });
+                    let recall =
+                        crate::memvector::recall(&client, &cfg, &data_dir, &ws, &user_text, 3);
+                    // stop-aware: a click during the recall ends the turn
+                    // instead of being ignored until the first token
+                    tokio::select! {
+                        _ = wait_stopped(&stop) => {
+                            abort_lane_pre_stream(&channel, &session_id, lane, &first_message_id).await;
+                            return;
+                        }
+                        mems = recall => {
+                            if !mems.is_empty() {
+                                let block = format!(
+                                    "\n\n[长期记忆参考 — 与本条消息语义相关的既往记忆]\n{}",
+                                    mems.iter().map(|m| format!("- {m}")).collect::<Vec<_>>().join("\n")
+                                );
+                                if let Some(first) = sent_this_turn.first_mut() {
+                                    first.content.push_str(&block);
+                                }
+                            }
                         }
                     }
                 }
@@ -3205,9 +3292,22 @@ async fn run_send(
             // without it.
             if deep_mode && !sent_this_turn.is_empty() {
                 let task_text = sent_this_turn[0].content.clone();
-                if let Some(block) = run_tot_rehearsal(&client, &provider, &model, &task_text).await {
-                    if let Some(first) = sent_this_turn.first_mut() {
-                        first.content.push_str(&block);
+                let _ = channel.send(StreamEvent::Reasoning {
+                    lane,
+                    message_id: first_message_id.clone(),
+                    text: "正在并行预演三个候选方案（深度推理两阶段：三方案生成 + 评审选优）…\n\n".to_string(),
+                });
+                tokio::select! {
+                    _ = wait_stopped(&stop) => {
+                        abort_lane_pre_stream(&channel, &session_id, lane, &first_message_id).await;
+                        return;
+                    }
+                    block = run_tot_rehearsal(&client, &provider, &model, &task_text) => {
+                        if let Some(block) = block {
+                            if let Some(first) = sent_this_turn.first_mut() {
+                                first.content.push_str(&block);
+                            }
+                        }
                     }
                 }
             }
@@ -3224,14 +3324,34 @@ async fn run_send(
                         .map(|d| d.chars().take(6_000).collect::<String>())
                         .filter(|d| !d.trim().is_empty())
                 });
-                if let Some(block) =
-                    run_review_rehearsal(&client, &provider, &model, &task_text, diff.as_deref(), &data_dir)
-                        .await
-                {
-                    if let Some(first) = sent_this_turn.first_mut() {
-                        first.content.push_str(&block);
+                let _ = channel.send(StreamEvent::Reasoning {
+                    lane,
+                    message_id: first_message_id.clone(),
+                    text: "正在并行预审三个只读专家（正确性 / 安全性 / 可维护性）…\n\n".to_string(),
+                });
+                // stop-aware: a click during the pre-review ends the turn
+                // instead of being ignored until the first token
+                tokio::select! {
+                    _ = wait_stopped(&stop) => {
+                        abort_lane_pre_stream(&channel, &session_id, lane, &first_message_id).await;
+                        return;
+                    }
+                    block = run_review_rehearsal(&client, &provider, &model, &task_text, diff.as_deref(), &data_dir) => {
+                        if let Some(block) = block {
+                            if let Some(first) = sent_this_turn.first_mut() {
+                                first.content.push_str(&block);
+                            }
+                        }
                     }
                 }
+            }
+
+            // Stop clicked during (or between) the pre-stream phases: end the
+            // turn before any request goes upstream. Covers the race where a
+            // phase future resolves before the 120ms stop poll notices.
+            if stop.load(Ordering::Relaxed) {
+                abort_lane_pre_stream(&channel, &session_id, lane, &first_message_id).await;
+                return;
             }
 
             let max_rounds = if goal_mode { GOAL_MAX_TOOL_ROUNDS } else { MAX_TOOL_ROUNDS };
