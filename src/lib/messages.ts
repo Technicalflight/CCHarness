@@ -41,13 +41,15 @@ export function aggregateUsage(assistants: MessageRecord[]): UsageStat | null {
   const inputs = assistants.map((a) => a.usage?.input).filter((v): v is number => v != null);
   const outputs = assistants.map((a) => a.usage?.output).filter((v): v is number => v != null);
   const cached = assistants.map((a) => a.usage?.cached).filter((v): v is number => v != null);
-  if (inputs.length === 0 && outputs.length === 0 && cached.length === 0) {
+  const writes = assistants.map((a) => a.usage?.cache_write).filter((v): v is number => v != null);
+  if (inputs.length === 0 && outputs.length === 0 && cached.length === 0 && writes.length === 0) {
     return assistants.some((a) => a.usage != null) ? assistants[assistants.length - 1].usage : null;
   }
   return {
     input: inputs.length ? inputs.reduce((x, y) => x + y, 0) : null,
     output: outputs.length ? outputs.reduce((x, y) => x + y, 0) : null,
     cached: cached.length ? cached.reduce((x, y) => x + y, 0) : null,
+    cache_write: writes.length ? writes.reduce((x, y) => x + y, 0) : null,
   };
 }
 

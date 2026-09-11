@@ -3308,12 +3308,13 @@ async fn run_send(
                     .ok()
                     .and_then(|sf| sf.telemetry.iter().rev().find(|r| r.lane == lane).map(|r| r.epoch != owned_prefix.epoch))
                     .unwrap_or(false);
-                let miss = chat::analyze_cache_miss(usage.input, usage.cached, added_bytes, chain_ok, epoch_bumped);
+                let miss =
+                    chat::analyze_cache_miss(&usage, &provider.kind, added_bytes, chain_ok, epoch_bumped);
                 stat.miss_cause = Some(miss.cause.to_string());
                 if miss.significant {
                     stat.significant_miss = true;
                     stat.rebilled_tokens = miss.rebilled_tokens;
-                    stat.rebilled_cost = chat::rebill_cost(miss.rebilled_tokens, &provider, &model);
+                    stat.rebilled_cost = chat::rebill_cost(miss.rebilled_tokens, &usage, &provider, &model);
                 }
                 let _ = channel.send(StreamEvent::Usage {
                     lane,

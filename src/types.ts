@@ -373,6 +373,8 @@ export interface UsageStat {
   input: number | null;
   output: number | null;
   cached: number | null;
+  /** Anthropic cache_creation_input_tokens (disjoint bucket); unset on OpenAI-style providers. */
+  cache_write: number | null;
 }
 
 export interface RequestStat {

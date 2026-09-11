@@ -433,6 +433,12 @@ impl LanePrefix {
 /// window (the API default when the marker is absent is only 5 minutes).
 /// Markers sit on (a) the stable system block (Zone S) and (b) the newest
 /// message (incremental breakpoint: the next request's Zone H prefix hits).
+///
+/// Deliberately NO third breakpoint on the tool array (pi marks its last
+/// tool): Anthropic's cache prefix order is tools → system → messages, so a
+/// tools checkpoint only pays off when the system prompt changes while the
+/// tool set stays identical — a case byte-stable Zone S makes impossible;
+/// mid-session tool changes are already an honest epoch bump.
 pub fn build_anthropic_body(
     model: &str,
     system_prompt: &str,

@@ -80,10 +80,12 @@ pub struct SendCtx<'a> {
     pub stop: Arc<AtomicBool>,
     /// Present only for delegated sub-agents (None in main/arena lanes).
     pub progress_tap: Option<ProgressTap>,
-    /// `x-session-affinity` header value (the lane's stable cache key) —
-    /// sent on OpenAI-compatible requests only. Providers like Fireworks use
-    /// it to route follow-ups back to the replica holding the KV cache;
-    /// every other gateway simply ignores the unknown header.
+    /// `x-session-affinity` header value (the lane's stable cache key).
+    /// Providers with replica-level KV caches (Fireworks, Anthropic-compatible
+    /// gateways, …) route requests carrying the same affinity value back to
+    /// the same worker, which is what makes follow-up turns hit the prefix
+    /// cache. Unknown headers are ignored by every other gateway, so sending
+    /// it is always safe.
     pub affinity: Option<String>,
 }
 
@@ -248,22 +250,25 @@ fn find_frame_end(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2)
 }
 
-/// `x-session-affinity` header for OpenAI-compatible endpoints (pi-runtime
-/// parity): providers with replica-level KV caches (Fireworks, …) route
-/// requests carrying the same affinity value back to the same worker, which
-/// is what makes follow-up turns hit the prefix cache. Unknown headers are
-/// ignored by every other gateway, so sending it is always safe.
-fn affinity_headers(ctx: &SendCtx<'_>) -> reqwest::header::HeaderMap {
+fn affinity_header_map(affinity: Option<&str>) -> reqwest::header::HeaderMap {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     let mut hm = HeaderMap::new();
-    if !matches!(ctx.provider.kind, ProviderKind::Anthropic) {
-        if let Some(key) = &ctx.affinity {
-            if let Ok(v) = HeaderValue::from_str(key) {
-                hm.insert(HeaderName::from_static("x-session-affinity"), v);
-            }
+    if let Some(key) = affinity {
+        if let Ok(v) = HeaderValue::from_str(key) {
+            hm.insert(HeaderName::from_static("x-session-affinity"), v);
         }
     }
     hm
+}
+
+/// `x-session-affinity` header on every lane request (pi-runtime parity,
+/// now including the Anthropic path — pi's anthropic adapter sends the same
+/// header): providers with replica-level KV caches route requests carrying
+/// the same affinity value back to the same worker, which is what makes
+/// follow-up turns hit the prefix cache. api.anthropic.com and every other
+/// gateway simply ignore the unknown header, so sending it is always safe.
+fn affinity_headers(ctx: &SendCtx<'_>) -> reqwest::header::HeaderMap {
+    affinity_header_map(ctx.affinity.as_deref())
 }
 
 /// Outcome of the significant-miss analysis for one request (pi-runtime
@@ -283,11 +288,14 @@ pub struct MissAnalysis {
 /// Heuristic significant-miss detector, pi `cache-stats` style but exploiting
 /// CCHarness's exact byte accounting: the request legitimately re-bills only
 /// its new tail (`added_bytes`, ≈4 bytes/token mixed-script); everything
-/// beyond that was supposed to be a cache read. Requires the provider to
-/// report cached tokens at all — without the field there is nothing to analyze.
+/// beyond that was supposed to be a cache read. Bucket semantics differ by
+/// provider: OpenAI-style usage reports cached tokens as a SUBSET of
+/// prompt_tokens, while Anthropic reports three DISJOINT buckets (input tail
+/// / cache_write / cache_read — pi sums them for totalTokens), so the
+/// re-billed portion on the Anthropic path is `input + cache_write`.
 pub fn analyze_cache_miss(
-    input_tokens: Option<u64>,
-    cached_tokens: Option<u64>,
+    usage: &UsageStat,
+    kind: &ProviderKind,
     added_bytes: usize,
     chain_ok: bool,
     epoch_bumped: bool,
@@ -299,11 +307,14 @@ pub fn analyze_cache_miss(
     } else {
         "upstream"
     };
-    let (input, cached) = match (input_tokens, cached_tokens) {
+    let (input, cached) = match (usage.input, usage.cached) {
         (Some(i), Some(c)) => (i, c),
         _ => return MissAnalysis { significant: false, rebilled_tokens: 0, cause },
     };
-    let uncached = input.saturating_sub(cached);
+    let uncached = match kind {
+        ProviderKind::Anthropic => input.saturating_add(usage.cache_write.unwrap_or(0)),
+        _ => input.saturating_sub(cached),
+    };
     let expected_new = (added_bytes as u64) / 4; // mixed-script token estimate
     // Significant: the re-billed portion dwarfs the legitimate new material
     // (2×) AND is large in absolute terms — tiny prompts below OpenAI's
@@ -313,12 +324,41 @@ pub fn analyze_cache_miss(
     MissAnalysis { significant, rebilled_tokens: if significant { rebilled } else { 0 }, cause }
 }
 
+/// Anthropic 1h-TTL cache-write premium: writes bill at 2× the base input
+/// token price (5m writes would be 1.25×; the request path always marks
+/// `ttl:"1h"`). OpenAI-style providers bill writes at the plain input rate.
+const ANTHROPIC_1H_WRITE_PREMIUM: f64 = 2.0;
+
+fn write_rate_per_m(p: &Provider, pr: &crate::config::Pricing) -> f64 {
+    match p.kind {
+        ProviderKind::Anthropic => pr.input_per_m * ANTHROPIC_1H_WRITE_PREMIUM,
+        _ => pr.input_per_m,
+    }
+}
+
 /// Cost of the re-billed tokens at the uncached-minus-cached spread (the
-/// money a miss wastes compared to the hit it should have been). None when
-/// the model has no pricing configured — callers then show tokens only.
-pub fn rebill_cost(rebilled_tokens: u64, p: &Provider, model: &str) -> Option<f64> {
+/// money a miss wastes compared to the hit it should have been). pi
+/// `cache-stats` precision: derive the effective paid rate from the
+/// request's OWN bucket split instead of assuming every re-billed token
+/// lands in the plain input bucket — on Anthropic a missed prefix is
+/// typically re-WRITTEN to cache, billing at the 1h write premium. None
+/// when the model has no pricing configured — callers then show tokens only.
+pub fn rebill_cost(rebilled_tokens: u64, usage: &UsageStat, p: &Provider, model: &str) -> Option<f64> {
     let pr = p.pricing.get(model)?;
-    let spread = pr.input_per_m - pr.cached_per_m;
+    let paid_per_m = match p.kind {
+        ProviderKind::Anthropic => {
+            let i = usage.input.unwrap_or(0) as f64;
+            let w = usage.cache_write.unwrap_or(0) as f64;
+            let total = i + w;
+            if total > 0.0 {
+                (i * pr.input_per_m + w * write_rate_per_m(p, pr)) / total
+            } else {
+                pr.input_per_m
+            }
+        }
+        _ => pr.input_per_m,
+    };
+    let spread = paid_per_m - pr.cached_per_m;
     if spread <= 0.0 {
         return None;
     }
@@ -412,6 +452,14 @@ fn handle_anthropic_frame(
             }
             if let Some(c) = v.pointer("/message/usage/cache_read_input_tokens").and_then(|x| x.as_u64()) {
                 usage.cached = Some(c);
+            }
+            // cache_write is a bucket DISJOINT from input_tokens (pi sums all
+            // of input + output + cacheRead + cacheWrite for totalTokens)
+            if let Some(w) = v
+                .pointer("/message/usage/cache_creation_input_tokens")
+                .and_then(|x| x.as_u64())
+            {
+                usage.cache_write = Some(w);
             }
         }
         Some("content_block_delta") => {
@@ -974,10 +1022,24 @@ pub fn cost_of(usage: &UsageStat, p: &Provider, model: &str) -> Option<f64> {
     let input = usage.input.unwrap_or(0) as f64;
     let cached = usage.cached.unwrap_or(0) as f64;
     let out = usage.output.unwrap_or(0) as f64;
-    let non_cached = (input - cached).max(0.0);
-    let cost = non_cached / 1e6 * pr.input_per_m
-        + cached / 1e6 * pr.cached_per_m
-        + out / 1e6 * pr.output_per_m;
+    // Bucket semantics differ: OpenAI-style usage reports cached tokens as a
+    // SUBSET of prompt_tokens; Anthropic reports three DISJOINT buckets
+    // (input tail / cache_write at the 1h premium / cache_read discounted).
+    let cost = match p.kind {
+        ProviderKind::Anthropic => {
+            let write = usage.cache_write.unwrap_or(0) as f64;
+            input / 1e6 * pr.input_per_m
+                + write / 1e6 * write_rate_per_m(p, pr)
+                + cached / 1e6 * pr.cached_per_m
+                + out / 1e6 * pr.output_per_m
+        }
+        _ => {
+            let non_cached = (input - cached).max(0.0);
+            non_cached / 1e6 * pr.input_per_m
+                + cached / 1e6 * pr.cached_per_m
+                + out / 1e6 * pr.output_per_m
+        }
+    };
     Some((cost * 10000.0).round() / 10000.0)
 }
 
@@ -996,12 +1058,41 @@ fn parse_once_usage(kind: &ProviderKind, v: &Value) -> UsageStat {
             input: v.pointer("/usage/input_tokens").and_then(|x| x.as_u64()),
             output: v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()),
             cached: v.pointer("/usage/cache_read_input_tokens").and_then(|x| x.as_u64()),
+            cache_write: v.pointer("/usage/cache_creation_input_tokens").and_then(|x| x.as_u64()),
         },
         ProviderKind::OpenaiCompatible => UsageStat {
             input: v.pointer("/usage/prompt_tokens").and_then(|x| x.as_u64()),
             output: v.pointer("/usage/completion_tokens").and_then(|x| x.as_u64()),
             cached: v.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(|x| x.as_u64()),
+            cache_write: None, // writes are unreported and billed at input rate
         },
+    }
+}
+
+/// Wire body for one-shot non-streaming calls (boundary-compaction
+/// summaries, AuxMemo titles / prompt enhancement). Deliberately carries NO
+/// cache_control markers and no prompt_cache_key (pi compaction discipline:
+/// "summaries are standalone requests — avoid cache writes that cannot be
+/// reused"): the summary prefix is never replayed, so on Anthropic a marker
+/// would pay the 1h write premium (2× input) for a cache entry nothing will
+/// ever read; on OpenAI-style providers automatic caching stays free either
+/// way, so nothing is lost by not pinning routing either.
+pub fn build_once_body(kind: &ProviderKind, system: &str, user_text: &str) -> Value {
+    match kind {
+        ProviderKind::Anthropic => serde_json::json!({
+            "model": "",
+            "max_tokens": 1024,
+            "system": system,
+            "messages": [{"role": "user", "content": user_text}],
+        }),
+        ProviderKind::OpenaiCompatible => serde_json::json!({
+            "model": "",
+            "stream": false,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_text}
+            ],
+        }),
     }
 }
 
@@ -1012,30 +1103,10 @@ pub async fn complete_once(
     system: &str,
     user_text: &str,
 ) -> Result<OnceOutcome, String> {
-    let (url, body) = match provider.kind {
-        ProviderKind::Anthropic => (
-            format!("{}/v1/messages", provider.base_url.trim_end_matches('/')),
-            serde_json::json!({
-                "model": model,
-                "max_tokens": 1024,
-                "system": system,
-                "messages": [{"role": "user", "content": user_text}],
-            }),
-        ),
-        ProviderKind::OpenaiCompatible => (
-            format!("{}/chat/completions", provider.base_url.trim_end_matches('/')),
-            serde_json::json!({
-                "model": model,
-                "stream": false,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_text}
-                ],
-            }),
-        ),
-    };
+    let mut body = build_once_body(&provider.kind, system, user_text);
+    body["model"] = serde_json::Value::String(model.to_string());
     let resp = client
-        .post(&url)
+        .post(endpoint_chat(provider))
         .header("Content-Type", "application/json")
         .headers(auth_for(provider).headers())
         .json(&body)
@@ -1094,4 +1165,135 @@ pub async fn fetch_models_async(client: &reqwest::Client, p: &Provider) -> Resul
     }
     models.sort();
     Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_provider(kind: ProviderKind) -> Provider {
+        Provider {
+            id: "p".into(),
+            name: "P".into(),
+            kind,
+            base_url: "https://example.invalid".into(),
+            api_key: "k".into(),
+            models: vec![],
+            enabled: true,
+            allow_local: false,
+            context_window: None,
+            pricing: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "m".to_string(),
+                    crate::config::Pricing { input_per_m: 3.0, cached_per_m: 0.3, output_per_m: 15.0 },
+                );
+                m
+            },
+            behavior: std::collections::BTreeMap::new(),
+            cache_retention_24h: false,
+        }
+    }
+
+    fn usage(input: Option<u64>, cached: Option<u64>, cache_write: Option<u64>) -> UsageStat {
+        UsageStat { input, output: Some(100), cached, cache_write }
+    }
+
+    // --- item: one-shot bodies carry no cache marks (pi compaction discipline)
+
+    #[test]
+    fn once_body_has_no_cache_marks() {
+        for kind in [ProviderKind::Anthropic, ProviderKind::OpenaiCompatible] {
+            let body = build_once_body(&kind, "sys", "usr").to_string();
+            assert!(!body.contains("cache_control"), "{kind:?}: {body}");
+            assert!(!body.contains("prompt_cache"), "{kind:?}: {body}");
+        }
+        // Anthropic system stays a plain string (not the marked array form)
+        let a = build_once_body(&ProviderKind::Anthropic, "sys", "usr");
+        assert_eq!(a["system"], serde_json::json!("sys"));
+    }
+
+    // --- item: bucket semantics differ per provider (pi cache-stats parity)
+
+    #[test]
+    fn analyze_cache_miss_openai_cached_is_subset() {
+        let p = mk_provider(ProviderKind::OpenaiCompatible);
+        // OpenAI: cached ⊆ prompt_tokens ⇒ uncached = 100k − 5k
+        let u = usage(Some(100_000), Some(5_000), None);
+        let m = analyze_cache_miss(&u, &p.kind, 400, true, false);
+        assert!(m.significant);
+        assert_eq!(m.rebilled_tokens, 95_000 - 100);
+    }
+
+    #[test]
+    fn analyze_cache_miss_anthropic_buckets_are_disjoint() {
+        let p = mk_provider(ProviderKind::Anthropic);
+        // Anthropic disjoint buckets: input tail is NOT part of cache_read.
+        // input=2k, read=98k ⇒ uncached is 2k, NOT 0 (saturating_sub bug).
+        let u = usage(Some(2_000), Some(98_000), Some(0));
+        let m = analyze_cache_miss(&u, &p.kind, 8_000, true, false);
+        assert!(!m.significant, "small tail is a legitimate re-bill: {m:?}");
+
+        // a 12k tail beyond the expected new material is a real miss
+        let u = usage(Some(12_000), Some(98_000), Some(0));
+        let m = analyze_cache_miss(&u, &p.kind, 400, true, false);
+        assert!(m.significant);
+        assert_eq!(m.rebilled_tokens, 12_000 - 100);
+
+        // a large cache_write mid-session means the prefix was re-written
+        let u = usage(Some(2_000), Some(48_000), Some(50_000));
+        let m = analyze_cache_miss(&u, &p.kind, 400, true, false);
+        assert!(m.significant);
+    }
+
+    // --- item: re-bill cost derives the paid rate from the request's buckets
+
+    #[test]
+    fn rebill_cost_anthropic_uses_write_premium() {
+        let p = mk_provider(ProviderKind::Anthropic);
+        // paid rate = (2k×3.0 + 98k×6.0)/100k = 5.94 $/M ⇒ spread 5.64
+        let u = usage(Some(2_000), Some(0), Some(98_000));
+        let cost = rebill_cost(100_000, &u, &p, "m").unwrap();
+        assert!((cost - 0.564).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn rebill_cost_openai_plain_input_spread() {
+        let p = mk_provider(ProviderKind::OpenaiCompatible);
+        let u = usage(Some(100_000), Some(5_000), None);
+        // spread 2.7 $/M ⇒ 94_900 tokens = 0.25623 → round4 = 0.2562
+        let cost = rebill_cost(94_900, &u, &p, "m").unwrap();
+        assert!((cost - 0.2562).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn cost_of_anthropic_disjoint_buckets() {
+        let p = mk_provider(ProviderKind::Anthropic);
+        // 2k×3.0 + 0×6.0 + 98k×0.3 + 100×15.0 per M = 0.0369
+        let u = usage(Some(2_000), Some(98_000), Some(0));
+        let cost = cost_of(&u, &p, "m").unwrap();
+        assert!((cost - 0.0369).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn cost_of_openai_cached_subset() {
+        let p = mk_provider(ProviderKind::OpenaiCompatible);
+        // (100k−5k)×3.0 + 5k×0.3 + 100×15.0 per M = 0.288
+        let u = usage(Some(100_000), Some(5_000), None);
+        let cost = cost_of(&u, &p, "m").unwrap();
+        assert!((cost - 0.288).abs() < 1e-9, "{cost}");
+    }
+
+    // --- item: affinity header rides on every provider kind
+
+    #[test]
+    fn affinity_header_map_present_when_set() {
+        use reqwest::header::HeaderName;
+        let hm = affinity_header_map(Some("ccharness-s1-0"));
+        assert_eq!(
+            hm.get(HeaderName::from_static("x-session-affinity")).and_then(|v| v.to_str().ok()),
+            Some("ccharness-s1-0")
+        );
+        assert!(affinity_header_map(None).is_empty());
+    }
 }

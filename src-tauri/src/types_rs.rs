@@ -118,6 +118,12 @@ pub struct UsageStat {
     pub output: Option<u64>,
     #[serde(default)]
     pub cached: Option<u64>,
+    /// Tokens written to the provider cache (Anthropic
+    /// `cache_creation_input_tokens`). Anthropic reports this bucket disjoint
+    /// from `input`; OpenAI-style providers leave it unset (writes are
+    /// unreported and billed at the plain input rate).
+    #[serde(default)]
+    pub cache_write: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
