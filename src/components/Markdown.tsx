@@ -2,9 +2,8 @@
 // Mermaid diagram rendering (```mermaid blocks render as SVG, with a
 // source toggle and graceful fallback when the diagram fails to parse).
 import { memo, useEffect, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { ComponentPropsWithoutRef } from "react";
 
 // mermaid is heavy (~1MB): loaded on demand — the first ```mermaid block
 // in a session triggers the dynamic import, everything else never pays.
@@ -107,8 +106,8 @@ function languageOf(className: string | undefined): string {
   return m ? m[1] : "";
 }
 
-const components = {
-  pre({ children }: ComponentPropsWithoutRef<"pre">) {
+const components: Components = {
+  pre({ children }) {
     // react-markdown hands us <pre><code className="language-x">…</code></pre>
     const child = Array.isArray(children) ? children[0] : children;
     let lang = "";
@@ -125,7 +124,9 @@ const components = {
     }
     return <CodeBlock lang={lang} code={code.replace(/\n$/, "")} />;
   },
-  code({ className, children, ...rest }: ComponentPropsWithoutRef<"code">) {
+  // ExtraProps adds `node?: Element` — destructure it out so it never leaks
+  // into the DOM as an unknown attribute
+  code({ className, children, node: _node, ...rest }) {
     if (className && className.startsWith("language-")) {
       return (
         <code className={className} {...rest}>
@@ -144,7 +145,7 @@ const components = {
 export const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
     <div className="md">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components as never}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
         {text}
       </ReactMarkdown>
     </div>

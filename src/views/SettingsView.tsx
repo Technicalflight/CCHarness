@@ -65,6 +65,14 @@ export function SettingsView() {
 
   return (
     <>
+      {config.keys_plaintext && (
+        <div className="settings-warn-banner" role="alert">
+          <Icon name="diamond" size={14} />
+          <span>
+            系统密钥库不可用，至少一个 API Key 当前以明文存储在本机磁盘（其余功能不受影响）。请检查系统密钥服务后重新保存配置以启用加密存储。
+          </span>
+        </div>
+      )}
       <div className="view-header">
         <div>
           <div className="view-title">设置</div>

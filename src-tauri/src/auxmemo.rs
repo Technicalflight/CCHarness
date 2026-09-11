@@ -169,6 +169,12 @@ fn load_master_key(data_dir: &Path) -> Option<[u8; 32]> {
     }
     let _ = fs::create_dir_all(data_dir);
     fs::write(&path, key).ok()?;
+    // the master key unseals every L2 entry — never world-readable on unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
     Some(key)
 }
 

@@ -14,7 +14,7 @@
 - 安装依赖：`npm install`（改动依赖时保持 package-lock.json 同步提交）。
 - 桌面开发：`npm run tauri dev`。
 - 前端构建（含类型检查，即验收）：`npm run build`；仅类型检查：`npm run typecheck`。
-- 后端测试：`cd src-tauri && cargo test`（当前 84 个测试，全绿是后端唯一验收标准）。
+- 后端测试：`cd src-tauri && cargo test`（全绿是后端唯一验收标准；不要在文档里硬编码测试数量，会随迭代失真）。
 - 改动 Cargo.toml 的版本或依赖后，跑一次 cargo 命令刷新 Cargo.lock 并一并提交。
 
 ## 测试规范

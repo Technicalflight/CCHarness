@@ -197,6 +197,18 @@ fn domain_match(pattern: &str, host: &str) -> bool {
 /// Program name of a shell command line: first token (a quoted path counts
 /// as one token), basename of any path, `.exe` suffix stripped, lowercased.
 /// Unquoted paths containing spaces are inherently ambiguous and resolve to
+/// Normalize a command line for policy matching only: cmd.exe treats `^` as
+/// an escape and stitches mid-token quotes, so `r^m -rf` and `"r"m -rf`
+/// both execute as `rm`; TAB-separated tokens dodge space-anchored
+/// blocklist patterns like "rm -rf". Collapse whitespace runs to single
+/// spaces, strip `^` and quote characters, lowercase. The raw string is
+/// what actually runs — this function exists purely so the deny/blocklist
+/// sees what the shell will see.
+fn cmd_norm(cmd: &str) -> String {
+    let stripped: String = cmd.chars().filter(|c| !matches!(c, '^' | '"' | '\'')).collect();
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
 /// the first segment — document this in the settings dialog.
 fn program_name(cmd: &str) -> String {
     let s = cmd.trim();
@@ -210,6 +222,9 @@ fn program_name(cmd: &str) -> String {
         s.split_whitespace().next().unwrap_or("")
     };
     let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    // same escapes/quote-stitching dodge the deny list: `w^sl` and `w"s"l`
+    // both spawn wsl once the shell parses them
+    let base: String = base.chars().filter(|c| !matches!(c, '^' | '"' | '\'')).collect();
     // lowercase BEFORE stripping the suffix: strip_suffix is case-sensitive
     let lower = base.to_lowercase();
     match lower.strip_suffix(".exe") {
@@ -327,7 +342,7 @@ pub fn sandbox_check(name: &str, args: &Value) -> SandboxVerdict {
         }
         if let Some(hit) = SANDBOX_CMD_BLOCKLIST
             .iter()
-            .find(|pat| cmd.to_lowercase().contains(*pat))
+            .find(|pat| cmd_norm(&cmd).contains(&pat.trim().to_lowercase()))
         {
             return SandboxVerdict::Block(format!(
                 "沙箱模式已拦截：命令命中高危策略「{}」（命令策略）。可关闭沙箱模式后重试，或自行在终端执行。",
@@ -767,7 +782,13 @@ pub fn execute(workspace: &str, name: &str, args: &Value) -> String {
         "load_skill" => crate::skills::load_body(
             if workspace.is_empty() { None } else { Some(workspace) },
             &str_arg(args, "name"),
-        ),
+        )
+        .map(|body| {
+            // market-installed bodies are third-party text — the tool
+            // result must carry the same untrusted fence as Zone S
+            let name = str_arg(args, "name");
+            crate::skills::guarded_body(&name, &body)
+        }),
         _ => Err(format!("未知工具 {name}")),
     };
     match result {
@@ -953,17 +974,24 @@ pub fn take_screenshot(data_dir: &std::path::Path, session_id: &str) -> Result<(
 /// scrot or ImageMagick import. Runs with CREATE_NO_WINDOW on Windows so
 /// no console flashes over the very screen being captured.
 fn capture_to(path: &Path) -> Result<(), String> {
-    let p = path.to_string_lossy().replace('\'', "");
+    // Windows passes the path as base64 decoded inside the script: a path
+    // that reaches PowerShell through string interpolation is one broken
+    // quote away from executing attacker-chosen script (the path derives
+    // from the session id, which is not fully under our control).
+    let p = path.to_string_lossy().to_string();
     #[cfg(windows)]
     {
+        use base64::Engine as _;
+        let p_b64 = base64::engine::general_purpose::STANDARD.encode(p.as_bytes());
         let script = format!(
             "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
+             $p=[System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{p_b64}')); \
              $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; \
              $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height; \
              $g=[System.Drawing.Graphics]::FromImage($bmp); \
              $g.CopyFromScreen($b.X,$b.Y,0,0,$bmp.Size); \
-             $g.Dispose(); $bmp.Save('{p}'); $bmp.Dispose()",
-            p = p
+             $g.Dispose(); $bmp.Save($p); $bmp.Dispose()",
+            p_b64 = p_b64
         );
         let mut c = std::process::Command::new("powershell");
         c.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
@@ -2082,11 +2110,41 @@ mod sandbox_tests {
             sandbox_check("run_command", &json!({ "command": r#""C:\Windows\System32\SCHTASKS.EXE" /create ..."# })),
             SandboxVerdict::Block(_)
         ));
+        // cmd.exe 转义与引号拼接不能洗白程序名：w^sl / w"s"l 都是 wsl
+        assert!(matches!(
+            sandbox_check("run_command", &json!({ "command": "w^sl -d Ubuntu rm x" })),
+            SandboxVerdict::Block(_)
+        ));
+        assert!(matches!(
+            sandbox_check("run_command", &json!({ "command": "w\"s\"l -d Ubuntu rm x" })),
+            SandboxVerdict::Block(_)
+        ));
         // 非名单程序不受影响
         assert_eq!(
             sandbox_check("run_command", &json!({ "command": "git status" })),
             SandboxVerdict::Allow
         );
+    }
+
+    #[test]
+    fn blocklist_cannot_be_dodged_by_tab_or_escape() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_sandbox_policy(policy(json!({})));
+        // TAB 代替空格，绕过空格锚定的黑名单片段
+        assert!(matches!(
+            sandbox_check("run_command", &json!({ "command": "rm\t-rf /" })),
+            SandboxVerdict::Block(_)
+        ));
+        // ^ 转义拆散 "rm -rf"
+        assert!(matches!(
+            sandbox_check("run_command", &json!({ "command": "r^m -rf /" })),
+            SandboxVerdict::Block(_)
+        ));
+        // 多空白变体
+        assert!(matches!(
+            sandbox_check("run_command", &json!({ "command": "git push --force  origin" })),
+            SandboxVerdict::Block(_)
+        ));
     }
 
     #[test]

@@ -236,6 +236,8 @@ export interface AppConfig {
   subagents: SubagentProfile[];
   workflows?: WorkflowDef[];
   settings: AppSettings;
+  /** backend-computed: at least one key is stored unsealed on disk */
+  keys_plaintext?: boolean;
 }
 
 /** One benchmark case: question + ANY-match pass keywords. */

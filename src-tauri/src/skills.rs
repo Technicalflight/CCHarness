@@ -134,6 +134,20 @@ pub fn load_body(workspace: Option<&str>, name: &str) -> Result<String, String> 
     }
 }
 
+/// Skill bodies are prompt-layer content authored by whoever installed the
+/// file — including SkillHub market packages nobody on this machine wrote.
+/// Before any body is folded into a prompt (Zone S auto-inject or a /command
+/// load), run injection detection over it; on a hit, deliver it wrapped as
+/// untrusted data instead of raw instructions.
+pub fn guarded_body(name: &str, body: &str) -> String {
+    let hits = crate::guard::scan(body, &[]);
+    if hits.is_empty() {
+        body.to_string()
+    } else {
+        crate::guard::wrap_untrusted(&format!("技能 /{name}"), body, &hits)
+    }
+}
+
 /// Zone S block: auto-inject bodies + a name catalog for command skills.
 /// Bounded so a fat skills folder can never crowd out the conversation.
 pub fn zone_section(workspace: Option<&str>) -> String {
@@ -144,7 +158,7 @@ pub fn zone_section(workspace: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut budget = SKILLS_TOTAL_CAP;
     for s in skills.iter().filter(|s| s.auto_inject) {
-        let block = format!("### 技能: {}\n{}", s.name, s.body);
+        let block = format!("### 技能: {}\n{}", s.name, guarded_body(&s.name, &s.body));
         if block.len() > budget {
             break;
         }

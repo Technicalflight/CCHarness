@@ -258,7 +258,34 @@ pub async fn stream_lane(
 }
 
 fn find_frame_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2)
+    // Providers differ in wire framing: LF-LF (\n\n) is the common case,
+    // but some gateways emit CRLF-CRLF (\r\n\r\n). Accept whichever
+    // terminator appears first; a pure CRLF stream never contains a bare
+    // \n\n pair (bytes interleave as 0d 0a 0d 0a), so the two cannot
+    // mis-slice each other. Line handling downstream (str::lines + trim)
+    // already tolerates \r.
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2);
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::find_frame_end;
+
+    #[test]
+    fn frame_end_accepts_lf_and_crlf() {
+        assert_eq!(find_frame_end(b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n"), Some(15));
+        assert_eq!(find_frame_end(b"data: {\"a\":1}\r\n\r\ndata: x"), Some(17));
+        assert_eq!(find_frame_end(b"data: partial"), None);
+        // mixed streams: whichever terminator completes first wins
+        assert_eq!(find_frame_end(b"a\n\rb\r\n\r\nc"), Some(8));
+        // plain LF framing is still found when no CRLF terminator exists
+        assert_eq!(find_frame_end(b"x\ry\n\nz"), Some(5));
+    }
 }
 
 fn affinity_header_map(affinity: Option<&str>) -> reqwest::header::HeaderMap {
@@ -1145,6 +1172,9 @@ pub fn transcript_for_lane(
                 for name in calls {
                     match skill_map.get(name) {
                         Some(body) => {
+                            // market-installed skills are third-party text:
+                            // wrap on injection-pattern hits, same as Zone S
+                            let body = crate::skills::guarded_body(name, body);
                             text.push_str(&format!("---\n[调用技能 /{name}]\n\n{body}\n---\n\n"));
                         }
                         None => {

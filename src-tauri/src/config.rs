@@ -506,6 +506,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub workflows: Vec<WorkflowDef>,
     pub settings: AppSettings,
+    /// Computed at load(): at least one API key is stored UNSEALED on disk
+    /// (OS keyring / DPAPI unavailable → fail-open plaintext). Surfaced so
+    /// the settings UI can warn; recomputed every load, never trusted from
+    /// the file itself.
+    #[serde(default)]
+    pub keys_plaintext: bool,
 }
 
 impl Default for AppConfig {
@@ -532,6 +538,7 @@ impl Default for AppConfig {
             subagents: Vec::new(),
             workflows: Vec::new(),
             settings: AppSettings::default(),
+            keys_plaintext: false,
         }
     }
 }
@@ -812,7 +819,19 @@ pub fn load(data_dir: &Path) -> AppConfig {
             cfg
         }
     };
-    // keys are stored sealed on disk; memory always holds plaintext
+    // keys are stored sealed on disk; memory always holds plaintext.
+    // First flag any UNSEALED stored value (fail-open plaintext from a
+    // keyring/DPAPI failure) so the UI can warn about at-rest exposure.
+    cfg.keys_plaintext = cfg
+        .providers
+        .iter()
+        .map(|p| &p.api_key)
+        .chain(std::iter::once(&cfg.settings.embeddings_key))
+        .any(|k| {
+            !k.is_empty()
+                && !k.starts_with(KEY_MARK)
+                && !k.starts_with(KEY_MARK_ENC)
+        });
     for p in &mut cfg.providers {
         p.api_key = unprotect_api_key(&p.api_key);
     }
@@ -834,6 +853,13 @@ pub fn save(data_dir: &Path, cfg: &AppConfig) {
     if let Ok(body) = serde_json::to_string_pretty(&out) {
         if fs::write(&tmp, body).is_ok() {
             let _ = fs::rename(&tmp, &path);
+            // the file holds sealed (and worst-case plaintext) API keys —
+            // never world-readable on unix
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            }
         }
     }
 }

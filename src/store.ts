@@ -476,7 +476,10 @@ export const useApp = create<AppState>((set, get) => ({
       // first send). Server truth predating the send would clobber them —
       // skip the overwrite; the post-stream refresh (after busy clears)
       // brings back the full transcript including the persisted user msg.
-      if (get().busy[id]) return;
+      // The skip only applies when local records actually exist: entering
+      // a busy session for the FIRST time has nothing to clobber, and
+      // skipping would leave the transcript blank for the whole stream.
+      if (get().busy[id] && (get().messages[id]?.length ?? 0) > 0) return;
       set((s) => ({ messages: { ...s.messages, [id]: msgs } }));
     } catch (e) {
       get().toast("error", `消息加载失败: ${String(e)}`);

@@ -1684,12 +1684,16 @@ fn compute_keep_from_ts(messages: &[MessageRecord], keep_budget_tokens: usize) -
 /// Stable hash of the tool-schema loadout sent in the request head. Fed to
 /// LanePrefix::bind_tools_hash so MCP join/leave mid-session is honest about
 /// the epoch rebuild it causes (tools serialize before messages).
+/// SHA-256-derived: the old DefaultHasher output is not stable across rustc
+/// releases, which would silently falsify every recorded tools_hash after a
+/// toolchain upgrade.
 fn tools_hash(tools: Option<&Value>) -> Option<u64> {
     tools.map(|t| {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        t.to_string().hash(&mut h);
-        h.finish()
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(t.to_string().as_bytes());
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&digest[..8]);
+        u64::from_be_bytes(b)
     })
 }
 
@@ -2487,7 +2491,11 @@ async fn maybe_auto_compact(
         .iter()
         .filter(|c| c.trigger == "auto" && c.completed_turns + 10 > completed_turns)
         .count();
-    if recent_auto >= 1 {
+    // one-time notice: while a boost from an earlier engage is still active
+    // (e.g. the ≥90% pressure hardline keeps forcing compactions), writing
+    // the notice again would spam an identical row into the transcript on
+    // every turn — extend silently instead
+    if recent_auto >= 1 && sf.meta.compact_boost_until_turn <= completed_turns {
         let _guard = state.save_lock.lock().await;
         if let Ok(mut s) = state.store.load(session_id) {
             s.meta.compact_boost_until_turn = completed_turns + 30;

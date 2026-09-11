@@ -4060,3 +4060,18 @@ kbd {
 }
 .sec-log-table td.mono { font-family: var(--mono); word-break: break-all; }
 .sec-empty { color: var(--text-faint); font-size: 12px; padding: 24px 12px; text-align: center; }
+
+/* 明文密钥告警条（设置页顶部）：密钥库不可用时的 fail-open 提示 */
+.settings-warn-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--warn);
+  border-radius: 10px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
