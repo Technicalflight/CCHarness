@@ -1,6 +1,6 @@
 [package]
 name = "ccharness"
-version = "0.1.7"
+version = "0.1.8"
 description = "CCHarness — multi-model chat platform with prefix-cache telemetry"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/Technicalflight/CCHarness"
