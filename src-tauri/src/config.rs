@@ -245,10 +245,19 @@ pub struct AppSettings {
     /// URL / punycode 仿冒域名）。
     #[serde(default = "default_true")]
     pub sandbox_net_malicious: bool,
+    /// 上下文体积：工具结果超过该字符数时，完整输出溢出保存到本机
+    /// spills 目录，上下文内只保留首尾与定位标记（可用 read_file 读回）。
+    /// 0 = 关闭。修剪是内容的纯函数，前缀缓存字节稳定性不受影响。
+    #[serde(default = "default_spill_max_chars")]
+    pub spill_max_chars: usize,
 }
 
 fn default_backup_cap_mb() -> u64 {
     500
+}
+
+fn default_spill_max_chars() -> usize {
+    crate::spill::DEFAULT_SPILL_MAX_CHARS
 }
 
 fn default_cmd_deny() -> Vec<String> {
@@ -294,6 +303,7 @@ impl Default for AppSettings {
             sandbox_net_allow: Vec::new(),
             sandbox_net_block_all: false,
             sandbox_net_malicious: true,
+            spill_max_chars: default_spill_max_chars(),
         }
     }
 }

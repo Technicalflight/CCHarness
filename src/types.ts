@@ -106,6 +106,9 @@ export interface AppSettings {
   sandbox_net_block_all: boolean;
   /** 沙箱·网络策略：恶意域名拦截（内置启发式规则）。 */
   sandbox_net_malicious: boolean;
+  /** 上下文体积：工具结果超过该字符数时溢出保存完整输出，上下文内只留
+   *  首尾与定位标记。0 = 关闭。默认 24000。 */
+  spill_max_chars: number;
 }
 
 /** One line of the privacy mapping log (backend `privacy_log_tail`). */

@@ -19,6 +19,7 @@ mod privacy;
 mod sessions;
 mod skillhub;
 mod skills;
+mod spill;
 mod sysprompt;
 mod types_rs;
 mod update;

@@ -610,6 +610,8 @@ impl AppState {
         // privacy mapping log lives in the data dir (no-op until privacy mode
         // actually scrubs something)
         crate::privacy::init_log(&data_dir);
+        // spill root for the read_file allowlist (oversized tool outputs)
+        crate::spill::init_root(&data_dir);
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .connect_timeout(std::time::Duration::from_secs(20))
@@ -1805,6 +1807,63 @@ async fn ensure_mcp_servers(data_dir: &std::path::Path, stop: &AtomicBool) {
     }
 }
 
+/// Compaction ladder L1 (free pruning): rewrite every tool record exceeding
+/// `max_chars` through the spill trim — full output to the spill dir, bounded
+/// head/tail + locator into the record. Persisted once; deterministic and
+/// idempotent (marker guard), so Zone H replay and restart rebuilds stay
+/// byte-identical. Returns the recovered character count (0 = nothing pruned
+/// or the save failed).
+fn prune_oversized_tool_records(
+    data_dir: &std::path::Path,
+    session_id: &str,
+    max_chars: usize,
+) -> usize {
+    if max_chars == 0 {
+        return 0;
+    }
+    let store = SessionStore::new(data_dir);
+    let Ok(mut sf) = store.load(session_id) else {
+        return 0;
+    };
+    let mut saved = 0usize;
+    let mut changed = false;
+    for m in sf.messages.iter_mut().filter(|m| m.role == "tool") {
+        if m.content.chars().count() <= max_chars {
+            continue;
+        }
+        let trimmed = crate::spill::maybe_spill_in(
+            &data_dir.join("spills"),
+            session_id,
+            "tool",
+            &m.content,
+            max_chars,
+        );
+        let before = m.content.chars().count();
+        let after = trimmed.chars().count();
+        if after < before {
+            saved += before - after;
+            m.content = trimmed;
+            changed = true;
+        }
+    }
+    if !changed {
+        return 0;
+    }
+    sf.meta.updated_at = now_ms();
+    if store.save(&sf).is_err() {
+        return 0;
+    }
+    // expected rebuild: the next request re-creates the prefix from the
+    // smaller transcript instead of judging the byte change an upstream miss
+    if let Some(map) = prefixes_lock().as_mut() {
+        map.remove(&(session_id.to_string(), 0));
+    }
+    if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
+        map.remove(&(session_id.to_string(), 0));
+    }
+    saved
+}
+
 /// Auto boundary compaction: called at the user boundary inside run_send.
 async fn maybe_auto_compact(
     state: &State<'_, AppState>,
@@ -1835,6 +1894,17 @@ async fn maybe_auto_compact(
     // start it for a turn the user already stopped
     if stop.load(Ordering::Relaxed) {
         return;
+    }
+    // Compaction ladder L1 — free retro-prune: recover oversized tool
+    // results without any model call. When that alone projects the request
+    // back under the compaction line, skip the summary entirely; otherwise
+    // fall through and let the summarizer read the now-smaller input.
+    let saved = prune_oversized_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars);
+    if saved > 0 {
+        let projected = last_input - (saved as f64 / 4.0);
+        if projected < window * COMPACT_AT_FRACTION {
+            return;
+        }
     }
     let _ = compact_now(&state.client, &state.data_dir, session_id, provider, &binding.model).await;
 }
@@ -2443,6 +2513,15 @@ async fn run_subagent(
                 Err(e) => format!("ERROR: 参数不是合法 JSON: {e}"),
                 Ok(args) => crate::agent_tools::execute(parent_ws.as_deref().unwrap_or(""), &tc.name, &args),
             };
+            // context-volume: same trim as the main lane, so a delegation
+            // whose result is later promoted into the parent replay keeps
+            // identical bytes
+            let result = crate::spill::maybe_spill(
+                &sub_id,
+                &tc.name,
+                &result,
+                cfg.settings.spill_max_chars,
+            );
             let tool_record = MessageRecord {
                 id: Uuid::new_v4().to_string(),
                 lane: 0,
@@ -3676,6 +3755,15 @@ async fn run_send(
                             Ok(summary) => format!("【并行分支 {st_name} 完成】\n\n{summary}"),
                             Err(e) => format!("ERROR: 并行分支 {st_name} 失败: {e}"),
                         };
+                        // context-volume: spill before the privacy scrub so
+                        // the file keeps real values while the record keeps
+                        // the trimmed form the model actually sees
+                        result = crate::spill::maybe_spill(
+                            &session_id,
+                            &fc.name,
+                            &result,
+                            cfg.settings.spill_max_chars,
+                        );
                         if privacy_on {
                             result = crate::privacy::outbound(&session_id, &pseed, &result);
                         }
@@ -4256,6 +4344,16 @@ async fn run_send(
                     } else {
                         result
                     };
+                    // context-volume: oversized results spill to disk — the
+                    // record (and from there Zone H replay) keeps the trimmed
+                    // form; the full output stays readable via read_file at
+                    // the locator path
+                    let result = crate::spill::maybe_spill(
+                        &session_id,
+                        &tc.name,
+                        &result,
+                        cfg.settings.spill_max_chars,
+                    );
                     let result_preview: String = result.lines().next().unwrap_or("").chars().take(120).collect();
                     let _ = channel.send(StreamEvent::ToolResult {
                         lane,

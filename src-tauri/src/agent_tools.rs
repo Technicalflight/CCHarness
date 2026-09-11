@@ -1585,6 +1585,26 @@ fn list_dir(workspace: &str, rel: &str) -> Result<String, String> {
 }
 
 fn read_file(workspace: &str, rel: &str) -> Result<String, String> {
+    // spill allowlist: absolute paths under the spill root (written only by
+    // the spill subsystem itself, shape-gated) are readable so the model can
+    // retrieve a spilled tool output. No other escape from the workspace.
+    if let Some(sp) = crate::spill::resolve_spill_file(rel) {
+        let meta = fs::metadata(&sp).map_err(|e| format!("无法读取文件: {e}"))?;
+        if meta.is_dir() {
+            return Err("spill 路径指向目录".into());
+        }
+        let cap = READ_FILE_CAP.min(meta.len());
+        let f = fs::read(&sp).map_err(|e| format!("读取失败: {e}"))?;
+        if f.get(..8).is_some_and(|head| head.contains(&0)) {
+            return Err("疑似二进制文件，已拒绝读取".into());
+        }
+        let text = String::from_utf8_lossy(&f[..cap as usize]);
+        let mut out = text.to_string();
+        if meta.len() > READ_FILE_CAP {
+            out.push_str("\n…[文件超过 256KB，已截断]");
+        }
+        return Ok(out);
+    }
     let path = resolve_in_workspace(workspace, rel)?;
     let meta = fs::metadata(&path).map_err(|e| format!("无法读取文件: {e}"))?;
     if meta.is_dir() {

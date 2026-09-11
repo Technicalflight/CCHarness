@@ -537,6 +537,28 @@ export function SettingsView() {
         </div>
 
         <div className="card">
+          <h3>上下文体积</h3>
+          <div className="row" style={{ marginTop: 10, gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
+            <label style={{ fontSize: 12, color: "var(--text-dim)", minWidth: 240 }}>
+              工具结果溢出阈值（字符，0 = 关闭）
+              <input
+                className="input mono"
+                type="number"
+                min="0"
+                step="1000"
+                style={{ display: "block", marginTop: 4, width: "100%" }}
+                value={config.settings.spill_max_chars ?? 24000}
+                placeholder="24000"
+                onChange={(e) => update({ spill_max_chars: Math.max(0, Number(e.target.value) || 0) })}
+              />
+            </label>
+          </div>
+          <div className="hint" style={{ marginTop: 8 }}>
+            超过阈值的工具结果（命令输出、网页抓取等）会把完整内容保存到本机 spills 目录，上下文内只保留开头、结尾与定位标记——模型需要时可用 read_file 按标记中的路径读回全文。省 token 成本最直接的手段：未进入上下文的字节永远不会被计费。自动压缩前也会先免费修剪超限历史，可能直接免掉摘要调用。
+          </div>
+        </div>
+
+        <div className="card">
           <h3>系统通知</h3>
           <div className="row" style={{ gap: 8 }}>
             <button
