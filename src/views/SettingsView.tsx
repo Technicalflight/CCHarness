@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { useApp } from "../store";
 import { Dropdown } from "../components/Dropdown";
+import { PolicyDialog, PrivacyLogDialog } from "../components/PolicyDialog";
 import type { ImportCandidate, SkillInfo } from "../types";
 import * as api from "../lib/api";
 import { Icon } from "../lib/icons";
@@ -23,6 +24,9 @@ export function SettingsView() {
   const [impScanning, setImpScanning] = useState(false);
   const [impCustom, setImpCustom] = useState("");
   const [impBusy, setImpBusy] = useState<string | null>(null);
+  // sandbox policy dialogs: "file" | "cmd" | "net"; privacy mapping log
+  const [policyDlg, setPolicyDlg] = useState<null | "file" | "cmd" | "net">(null);
+  const [logDlg, setLogDlg] = useState(false);
   useEffect(() => {
     void api.getSkills(null).then(setSkills).catch(() => {});
   }, []);
@@ -331,8 +335,17 @@ export function SettingsView() {
               />
               <span style={{ fontSize: 13 }}>
                 <strong>文件安全</strong>
-                <span style={{ color: "var(--text-dim)" }}> —— 删除类工具（delete_file）一律拒绝；写入仍逐条审批</span>
+                <span style={{ color: "var(--text-dim)" }}>
+                  {" "}—— 删除类工具一律拒绝；禁止名单里的路径模型碰不到，白名单路径在自动模式下免审批
+                </span>
               </span>
+              <button
+                className="btn small ghost"
+                style={{ marginLeft: "auto" }}
+                onClick={() => setPolicyDlg("file")}
+              >
+                自定义…
+              </button>
             </div>
             <div className="row" style={{ marginBottom: 0 }}>
               <button
@@ -344,9 +357,16 @@ export function SettingsView() {
               <span style={{ fontSize: 13 }}>
                 <strong>命令安全</strong>
                 <span style={{ color: "var(--text-dim)" }}>
-                  {" "}—— 拦截高危命令（rm -rf / del /s / format / reg / shutdown / git push --force / git reset --hard / curl|sh 等）
+                  {" "}—— 内置高危黑名单（rm -rf / format / git push --force 等）+ 按程序名的禁止 / 确认 / 允许名单
                 </span>
               </span>
+              <button
+                className="btn small ghost"
+                style={{ marginLeft: "auto" }}
+                onClick={() => setPolicyDlg("cmd")}
+              >
+                自定义…
+              </button>
             </div>
             <div className="row" style={{ marginBottom: 0 }}>
               <button
@@ -357,8 +377,17 @@ export function SettingsView() {
               />
               <span style={{ fontSize: 13 }}>
                 <strong>网络安全</strong>
-                <span style={{ color: "var(--text-dim)" }}> —— 禁用 web_fetch 外网抓取（MCP 工具请另行关闭）</span>
+                <span style={{ color: "var(--text-dim)" }}>
+                  {" "}—— 域名禁止 / 允许名单 + 可选阻止全部外部网络与恶意域名拦截（MCP 工具请另行关闭）
+                </span>
               </span>
+              <button
+                className="btn small ghost"
+                style={{ marginLeft: "auto" }}
+                onClick={() => setPolicyDlg("net")}
+              >
+                自定义…
+              </button>
             </div>
             <div className="row" style={{ marginBottom: 0 }}>
               <button
@@ -372,8 +401,8 @@ export function SettingsView() {
                 <span style={{ color: "var(--text-dim)" }}> —— 每次写入 / 编辑文件之前自动备份原文件</span>
               </span>
             </div>
-            {config.settings.sandbox_backup && (
-              <div className="row" style={{ marginBottom: 0, gap: 10, flexWrap: "wrap" }}>
+            <div className="row" style={{ marginBottom: 0, gap: 10, flexWrap: "wrap" }}>
+              {config.settings.sandbox_backup && (
                 <label style={{ fontSize: 12, color: "var(--text-dim)", display: "flex", alignItems: "center", gap: 8 }}>
                   备份总上限
                   <input
@@ -389,14 +418,14 @@ export function SettingsView() {
                   />
                   MB
                 </label>
-                <button
-                  className="btn small ghost"
-                  onClick={() => void api.openBackupDir().catch((e) => toast("error", String(e)))}
-                >
-                  打开备份目录
-                </button>
-              </div>
-            )}
+              )}
+              <button
+                className="btn small ghost"
+                onClick={() => void api.openBackupDir().catch((e) => toast("error", String(e)))}
+              >
+                打开备份位置
+              </button>
+            </div>
           </div>
           <div className="hint" style={{ marginTop: 10, color: "var(--warn, #d29922)" }}>
             ⚠️ 免责声明：沙箱模式是策略级拦截而非容器级隔离，无法覆盖所有风险形态；开启后模型的部分操作会被拒绝，
@@ -421,6 +450,14 @@ export function SettingsView() {
           <div className="hint" style={{ marginTop: 8 }}>
             替代值按会话确定性生成（同一会话内同一原文永远映射同一替身，跨会话隔离），映射表只存在于本机
             data_dir 下，不会上传。
+          </div>
+          <div className="row" style={{ marginTop: 10, marginBottom: 0 }}>
+            <button className="btn small ghost" onClick={() => setLogDlg(true)}>
+              查看映射日志
+            </button>
+            <span style={{ fontSize: 12, color: "var(--text-dim)" }}>
+              逐条查看「哪些信息被匿名化了」：时间、类型、原文 → 替身
+            </span>
           </div>
           <div className="hint" style={{ marginTop: 8, color: "var(--warn, #d29922)" }}>
             ⚠️ 免责声明：① 开启后模型看到的是替代值，<strong>可能影响模型结果</strong>（涉及真实凭据的操作请让工具执行而非模型转述）；
@@ -644,6 +681,136 @@ export function SettingsView() {
           </div>
         </div>
       </div>
+
+      {policyDlg === "file" && (
+        <PolicyDialog
+          title="文件安全 · 自定义名单"
+          description="命中禁止名单的路径对模型完全不可见不可触碰（支持 * 通配，不区分大小写，如 secrets/**、*.env）；白名单是可信路径：自动模式下对这些路径的写入不再逐条审批，其余写操作仍逐条确认。删除类操作无论如何都被拒绝。"
+          lists={[
+            {
+              key: "file_deny",
+              label: "禁止名单（命中即拒绝）",
+              hint: "路径片段或通配模式，禁止名单优先级最高",
+              items: config.settings.sandbox_file_deny ?? [],
+              placeholder: "如 secrets/** 或 .env",
+            },
+            {
+              key: "file_allow",
+              label: "允许名单（可信路径，自动模式免审批）",
+              hint: "如 src/** —— 只对写文件工具生效",
+              items: config.settings.sandbox_file_allow ?? [],
+              placeholder: "如 src/**",
+            },
+          ]}
+          defaults={{ lists: { file_deny: [], file_allow: [] } }}
+          onSave={(lists) => {
+            update({ sandbox_file_deny: lists.file_deny, sandbox_file_allow: lists.file_allow });
+            setPolicyDlg(null);
+          }}
+          onClose={() => setPolicyDlg(null)}
+        />
+      )}
+
+      {policyDlg === "cmd" && (
+        <PolicyDialog
+          title="命令安全 · 自定义名单"
+          description="按程序名匹配（不含参数、自动去掉路径与 .exe 后缀）。优先级：禁止名单 > 确认名单 > 允许名单 > 内置高危黑名单。允许名单会显式放行并跳过内置黑名单（自担风险）；确认名单即使在自动模式下也强制弹出审批卡。"
+          lists={[
+            {
+              key: "cmd_deny",
+              label: "禁止运行的程序（命中即拒绝）",
+              hint: "默认已含 wsl / wmic / sc / reg / schtasks",
+              items: config.settings.sandbox_cmd_deny ?? [],
+              placeholder: "如 diskpart 或 ncat",
+            },
+            {
+              key: "cmd_ask",
+              label: "需逐次确认的程序（强制审批）",
+              hint: "如 docker / npm —— 自动模式也逐次弹卡",
+              items: config.settings.sandbox_cmd_ask ?? [],
+              placeholder: "如 docker",
+            },
+            {
+              key: "cmd_allow",
+              label: "允许运行的程序（跳过内置高危黑名单）",
+              hint: "如 curl —— 放行后不再被黑名单拦截",
+              items: config.settings.sandbox_cmd_allow ?? [],
+              placeholder: "如 curl",
+            },
+          ]}
+          defaults={{
+            lists: {
+              cmd_deny: ["wsl", "wmic", "sc", "reg", "schtasks"],
+              cmd_ask: [],
+              cmd_allow: [],
+            },
+          }}
+          onSave={(lists) => {
+            update({
+              sandbox_cmd_deny: lists.cmd_deny,
+              sandbox_cmd_ask: lists.cmd_ask,
+              sandbox_cmd_allow: lists.cmd_allow,
+            });
+            setPolicyDlg(null);
+          }}
+          onClose={() => setPolicyDlg(null)}
+        />
+      )}
+
+      {policyDlg === "net" && (
+        <PolicyDialog
+          title="网络安全 · 自定义名单"
+          description="对 web_fetch 生效，按域名匹配（自动包含子域名）。优先级：恶意拦截 > 禁止名单 > 阻止全部外部网络（允许名单除外）。MCP 工具的网络访问不受此控制，请按需自行关闭对应服务。"
+          lists={[
+            {
+              key: "net_deny",
+              label: "禁止访问的域名（含子域名）",
+              hint: "如 tracker.example.com 或 ads.example.net",
+              items: config.settings.sandbox_net_deny ?? [],
+              placeholder: "如 evil.example.com",
+            },
+            {
+              key: "net_allow",
+              label: "允许访问的域名（阻止全部外部网络时仍放行）",
+              hint: "如 docs.rs / api.github.com",
+              items: config.settings.sandbox_net_allow ?? [],
+              placeholder: "如 docs.rs",
+            },
+          ]}
+          toggles={[
+            {
+              key: "net_block_all",
+              label: "阻止所有外部网络",
+              hint: "除允许名单外的所有域名一律拒绝",
+              value: config.settings.sandbox_net_block_all ?? false,
+            },
+            {
+              key: "net_malicious",
+              label: "恶意域名拦截",
+              hint: "内置规则：非标准协议 / 带凭据的 URL / punycode 仿冒域名",
+              value: config.settings.sandbox_net_malicious ?? true,
+            },
+          ]}
+          defaults={{
+            lists: { net_deny: [], net_allow: [] },
+            toggles: { net_block_all: false, net_malicious: true },
+          }}
+          onSave={(lists, toggles) => {
+            update({
+              sandbox_net_deny: lists.net_deny,
+              sandbox_net_allow: lists.net_allow,
+              sandbox_net_block_all: !!toggles.net_block_all,
+              sandbox_net_malicious: !!toggles.net_malicious,
+            });
+            setPolicyDlg(null);
+          }}
+          onClose={() => setPolicyDlg(null)}
+        />
+      )}
+
+      {logDlg && (
+        <PrivacyLogDialog toast={toast} onClose={() => setLogDlg(false)} />
+      )}
     </>
   );
 }

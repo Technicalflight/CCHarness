@@ -3976,3 +3976,81 @@ kbd {
 .update-dialog .upd-err {
   margin-bottom: 16px;
 }
+
+/* ---- security policy / privacy-log dialogs（安全策略自定义弹窗）---- */
+.sec-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sec-dialog {
+  width: min(640px, 92vw);
+  max-height: 82vh;
+  overflow: auto;
+  background: var(--bg1);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  padding: 18px 20px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.sec-dialog h3 { margin: 0; font-size: 15px; }
+.sec-desc { font-size: 12px; color: var(--text-dim); line-height: 1.7; }
+.sec-list { display: flex; flex-direction: column; gap: 6px; }
+.sec-list-head { font-size: 13px; font-weight: 600; }
+.sec-list-hint { font-size: 11px; color: var(--text-faint); }
+.sec-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.sec-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  font-family: var(--mono);
+  word-break: break-all;
+}
+.sec-chip button {
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--text-dim);
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+}
+.sec-chip button:hover { color: var(--text); }
+.sec-add { display: flex; gap: 8px; }
+.sec-add .input { flex: 1; }
+.sec-foot { display: flex; justify-content: flex-end; gap: 10px; align-items: center; }
+.sec-log-scroll {
+  overflow: auto;
+  max-height: 46vh;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.sec-log-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.sec-log-table th,
+.sec-log-table td {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.sec-log-table th {
+  color: var(--text-dim);
+  font-weight: 500;
+  position: sticky;
+  top: 0;
+  background: var(--bg1);
+}
+.sec-log-table td.mono { font-family: var(--mono); word-break: break-all; }
+.sec-empty { color: var(--text-faint); font-size: 12px; padding: 24px 12px; text-align: center; }

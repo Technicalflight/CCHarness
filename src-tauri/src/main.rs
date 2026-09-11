@@ -183,6 +183,8 @@ fn main() {
             commands::session_digest,
             commands::session_change_lines,
             commands::open_backup_dir,
+            commands::privacy_log_tail,
+            commands::privacy_log_clear,
             commands::goal_status,
             commands::goal_clear,
             commands::sm_get,

@@ -71,6 +71,34 @@ export interface AppSettings {
   sandbox_network: boolean;
   sandbox_backup: boolean;
   sandbox_backup_cap_mb: number;
+  /** 沙箱·文件策略：禁止触碰的路径模式（* 通配，不区分大小写）。 */
+  sandbox_file_deny: string[];
+  /** 沙箱·文件策略：可信路径白名单（自动模式下免审批）。 */
+  sandbox_file_allow: string[];
+  /** 沙箱·命令策略：禁止运行的程序名（命中即拒绝）。 */
+  sandbox_cmd_deny: string[];
+  /** 沙箱·命令策略：允许运行的程序名（跳过内置高危黑名单）。 */
+  sandbox_cmd_allow: string[];
+  /** 沙箱·命令策略：需逐次确认的程序名（自动模式也强制审批）。 */
+  sandbox_cmd_ask: string[];
+  /** 沙箱·网络策略：禁止访问的域名（含子域名）。 */
+  sandbox_net_deny: string[];
+  /** 沙箱·网络策略：允许访问的域名（阻止全部外部网络时仍放行）。 */
+  sandbox_net_allow: string[];
+  /** 沙箱·网络策略：阻止所有外部网络（允许名单除外）。 */
+  sandbox_net_block_all: boolean;
+  /** 沙箱·网络策略：恶意域名拦截（内置启发式规则）。 */
+  sandbox_net_malicious: boolean;
+}
+
+/** One line of the privacy mapping log (backend `privacy_log_tail`). */
+export interface PrivacyLogEntry {
+  ts: string;
+  session: string;
+  /** apikey | email | userpath | idcard | bank | phone | secret | ipv4 */
+  kind: string;
+  original: string;
+  surrogate: string;
 }
 
 /** Result of an update check (backend `check_update`). */

@@ -23,10 +23,75 @@ use rand::RngCore;
 use regex::Regex;
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 type HmacSha256 = Hmac<Sha256>;
+
+// ---------- 映射日志（privacy_log.jsonl）-------------------------------
+//
+// 每生成一个新映射（原文 → 替身）就追加一行 JSON，方便用户在设置页查看
+// 「到底哪些信息被匿名化了」。只记录新建映射：历史重放里已存在的替身不
+// 重复记录。日志与映射表一样只存在本机 data_dir，文件超过 5MB 自动裁剪
+// 到最近 2000 行。
+
+/// One mapping-log row (JSONL line in <data_dir>/privacy_log.jsonl).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LogEntry {
+    pub ts: String,
+    pub session: String,
+    /// Entity type: apikey | email | userpath | idcard | bank | phone |
+    /// secret | ipv4.
+    pub kind: String,
+    pub original: String,
+    pub surrogate: String,
+}
+
+static LOG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static LOG_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const LOG_KEEP_LINES: usize = 2000;
+
+/// Point the log at <data_dir>/privacy_log.jsonl (called once at startup).
+pub fn init_log(dir: &Path) {
+    let _ = LOG_PATH.set(dir.join("privacy_log.jsonl"));
+}
+
+fn trim_log(path: &Path) {
+    let Ok(md) = std::fs::metadata(path) else { return };
+    if md.len() <= LOG_MAX_BYTES {
+        return;
+    }
+    if let Ok(raw) = std::fs::read_to_string(path) {
+        let kept: Vec<&str> = raw.lines().rev().take(LOG_KEEP_LINES).collect();
+        let mut body = kept.into_iter().rev().collect::<Vec<_>>().join("\n");
+        body.push('\n');
+        let _ = std::fs::write(path, body);
+    }
+}
+
+/// Append one mapping to the JSONL log. No-op until init_log ran (tests).
+fn log_hit(session: &str, kind: &str, original: &str, surrogate: &str) {
+    let Some(path) = LOG_PATH.get() else { return };
+    let entry = LogEntry {
+        ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+        session: session.chars().take(40).collect(),
+        kind: kind.to_string(),
+        original: original.chars().take(160).collect(),
+        surrogate: surrogate.chars().take(160).collect(),
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        if let Ok(line) = serde_json::to_string(&entry) {
+            let _ = writeln!(f, "{line}");
+            let n = LOG_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 200 == 0 {
+                trim_log(path);
+            }
+        }
+    }
+}
 
 /// Surrogate reverse-table per session (surrogate → original). Rebuilt
 /// lazily on every outbound scrub; used by the restore engine.
@@ -245,10 +310,12 @@ fn ipv4_surrogate(seed: &[u8; 32], original: &str) -> String {
 // ---------- detection (regex candidates + strict validators) ----------
 
 /// One scrubbed entity: (byte span in the ORIGINAL text, replacement).
+/// One scrubbed entity: (byte span in the ORIGINAL text, replacement, kind).
 struct Hit {
     start: usize,
     end: usize,
     replacement: String,
+    kind: &'static str,
 }
 
 /// Luhn validity for a digit string.
@@ -300,9 +367,9 @@ fn idcard_ok(s: &str) -> bool {
 /// Scan `text` and return non-overlapping hits in priority order.
 fn detect(seed: &[u8; 32], text: &str) -> Vec<Hit> {
     let mut hits: Vec<Hit> = Vec::new();
-    let mut push = |start: usize, end: usize, replacement: String| {
+    let mut push = |start: usize, end: usize, kind: &'static str, replacement: String| {
         if !hits.iter().any(|h| start < h.end && end > h.start) {
-            hits.push(Hit { start, end, replacement });
+            hits.push(Hit { start, end, replacement, kind });
         }
     };
     // API keys / tokens with known provider prefixes (sk-, ghp_, AKIA…)
@@ -317,23 +384,23 @@ fn detect(seed: &[u8; 32], text: &str) -> Vec<Hit> {
             .map(|p| p.len())
             .unwrap_or(0);
         let (prefix, body) = original.split_at(prefix_len);
-        push(m.start(), m.end(), format!("{prefix}{}", alnum_surrogate(seed, "apikey", body)));
+        push(m.start(), m.end(), "apikey", format!("{prefix}{}", alnum_surrogate(seed, "apikey", body)));
     }
     // email
     let email_re = Regex::new(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b").unwrap();
     for m in email_re.find_iter(text) {
-        push(m.start(), m.end(), email_surrogate(seed, m.as_str()));
+        push(m.start(), m.end(), "email", email_surrogate(seed, m.as_str()));
     }
     // user-home paths (Windows + macOS + Linux)
     let path_re = Regex::new(r#"(?i)(?:[A-Z]:\\Users\\|/Users/|/home/)[A-Za-z0-9._\-]+(?:[\\/][^\s"'<>)]+)?"#).unwrap();
     for m in path_re.find_iter(text) {
-        push(m.start(), m.end(), user_path_surrogate(seed, m.as_str()));
+        push(m.start(), m.end(), "userpath", user_path_surrogate(seed, m.as_str()));
     }
     // CN ID card (validated)
     let id_re = Regex::new(r"\b[0-9]{17}[0-9Xx]\b").unwrap();
     for m in id_re.find_iter(text) {
         if idcard_ok(m.as_str()) {
-            push(m.start(), m.end(), idcard_surrogate(seed, m.as_str()));
+            push(m.start(), m.end(), "idcard", idcard_surrogate(seed, m.as_str()));
         }
     }
     // bank card: 13-19 digits + Luhn (validation avoids clashing with phones/IDs)
@@ -341,26 +408,26 @@ fn detect(seed: &[u8; 32], text: &str) -> Vec<Hit> {
     for m in digits_re.find_iter(text) {
         let s = m.as_str();
         if luhn_ok(s) {
-            push(m.start(), m.end(), bank_surrogate(seed, s));
+            push(m.start(), m.end(), "bank", bank_surrogate(seed, s));
         }
     }
     // CN mobile: 1[3-9] + 9 digits, boundary-guarded
     let phone_re = Regex::new(r"\b1[3-9][0-9]{9}\b").unwrap();
     for m in phone_re.find_iter(text) {
-        push(m.start(), m.end(), phone_surrogate(seed, m.as_str()));
+        push(m.start(), m.end(), "phone", phone_surrogate(seed, m.as_str()));
     }
     // generic high-entropy secret assignments (token = "…", password: '…')
     let secret_re = Regex::new(r#"(?i)\b(token|secret|password|passwd|api_?key)\b["'\s:=]{1,4}["']?([A-Za-z0-9!@#$%^&*_.\-+/]{16,})["']?"#).unwrap();
     for cap in secret_re.captures_iter(text) {
         let value = cap.get(2).unwrap();
-        push(value.start(), value.end(), shape_surrogate(seed, "secret", value.as_str()));
+        push(value.start(), value.end(), "secret", shape_surrogate(seed, "secret", value.as_str()));
     }
     // IPv4
     let ip_re = Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b").unwrap();
     for m in ip_re.find_iter(text) {
         let s = m.as_str();
         if s.split('.').all(|o| o.parse::<u16>().map(|v| v <= 255).unwrap_or(false)) {
-            push(m.start(), m.end(), ipv4_surrogate(seed, s));
+            push(m.start(), m.end(), "ipv4", ipv4_surrogate(seed, s));
         }
     }
     hits.sort_by_key(|h| h.start);
@@ -392,7 +459,11 @@ pub fn outbound(session_id: &str, seed: &[u8; 32], text: &str) -> String {
             out.push_str(original);
         } else {
             out.push_str(&h.replacement);
-            vault.reverse.entry(h.replacement.clone()).or_insert_with(|| original.to_string());
+            vault.reverse
+                .entry(h.replacement.clone())
+                .or_insert_with(|| original.to_string());
+            // 映射日志：只记录新建映射，历史重放里已存在的替身不重复记录
+            log_hit(session_id, h.kind, original, &h.replacement);
         }
         last = h.end;
     }

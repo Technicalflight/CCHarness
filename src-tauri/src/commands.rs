@@ -607,6 +607,9 @@ pub fn get_todos(state: State<'_, AppState>, session_id: String) -> Vec<TodoItem
 
 impl AppState {
     pub fn new(data_dir: PathBuf) -> Self {
+        // privacy mapping log lives in the data dir (no-op until privacy mode
+        // actually scrubs something)
+        crate::privacy::init_log(&data_dir);
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .connect_timeout(std::time::Duration::from_secs(20))
@@ -690,12 +693,21 @@ pub fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<(), 
 /// Mirror the sandbox settings into the agent-tools guard (startup +
 /// every save).
 fn sync_sandbox_policy(s: &config::AppSettings) {
-    crate::agent_tools::set_sandbox_policy(
-        s.sandbox_mode,
-        s.sandbox_files,
-        s.sandbox_commands,
-        s.sandbox_network,
-    );
+    crate::agent_tools::set_sandbox_policy(crate::agent_tools::SandboxPolicy {
+        on: s.sandbox_mode,
+        files: s.sandbox_files,
+        commands: s.sandbox_commands,
+        network: s.sandbox_network,
+        file_deny: s.sandbox_file_deny.clone(),
+        file_allow: s.sandbox_file_allow.clone(),
+        cmd_deny: s.sandbox_cmd_deny.clone(),
+        cmd_allow: s.sandbox_cmd_allow.clone(),
+        cmd_ask: s.sandbox_cmd_ask.clone(),
+        net_deny: s.sandbox_net_deny.clone(),
+        net_allow: s.sandbox_net_allow.clone(),
+        net_block_all: s.sandbox_net_block_all,
+        net_malicious: s.sandbox_net_malicious,
+    });
 }
 
 /// Recursively restore surrogates inside a tool-call argument JSON so the
@@ -800,6 +812,39 @@ pub fn open_backup_dir(state: State<'_, AppState>) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+// ---------- privacy mapping log（伪匿名化映射日志）----------
+
+/// Tail of the privacy mapping log: what got scrubbed, when, into what.
+/// Returns at most `n` (default 200) NEWEST entries, newest first.
+#[tauri::command]
+pub fn privacy_log_tail(
+    state: State<'_, AppState>,
+    n: Option<u32>,
+) -> Vec<crate::privacy::LogEntry> {
+    let take = n.unwrap_or(200).clamp(1, 2000) as usize;
+    let path = state.data_dir.join("privacy_log.jsonl");
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .rev()
+        .take(take)
+        .filter_map(|line| serde_json::from_str::<crate::privacy::LogEntry>(line).ok())
+        .collect()
+}
+
+/// Clear the privacy mapping log (the in-memory vaults of live sessions are
+/// untouched — the log is a view, not the mapping itself).
+#[tauri::command]
+pub fn privacy_log_clear(state: State<'_, AppState>) -> Result<(), String> {
+    let path = state.data_dir.join("privacy_log.jsonl");
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// One-click import from cc-switch (https://github.com/farion1231/cc-switch).
@@ -2732,11 +2777,12 @@ async fn run_send(
                     workspace = Some(wt.path);
                 }
             }
-            let perm_mode = permission_of(&session_id);
+            let perm_base = permission_of(&session_id);
             // sandbox: the risky "auto" write tier degrades to per-action
-            // approval — fail-safe rather than convenient
+            // approval — fail-safe rather than convenient. 文件白名单的可信
+            // 路径在自动模式下保持免审批（见写路径的 trusted 判定）。
             let sb = crate::agent_tools::sandbox_policy();
-            let perm_mode = if sb.on && perm_mode == "auto" { "approve" } else { perm_mode };
+            let perm_mode = if sb.on && perm_base == "auto" { "approve" } else { perm_base.clone() };
             // plan gate: read-only tool surface, no MCP, no writes — the
             // directive itself rides on the user message (see transcript_for_lane).
             // goal gate: full surface, but more tool rounds per turn.
@@ -3699,8 +3745,12 @@ async fn run_send(
                                 {
                                     handle_goal_tool(&data_dir, &session_id, &tc.name, &args)
                                 } else if !crate::agent_tools::is_write_tool(&tc.name) {
-                                    // sandbox network policy: web_fetch refused
-                                    if let Err(reason) = crate::agent_tools::sandbox_check(&tc.name, &args) {
+                                    // sandbox policy: read tools may be refused
+                                    // (delete-class rules don't apply here, but
+                                    // deny-listed paths / network lists do)
+                                    if let crate::agent_tools::SandboxVerdict::Block(reason) =
+                                        crate::agent_tools::sandbox_check(&tc.name, &args)
+                                    {
                                         reason
                                     } else {
                                         crate::agent_tools::execute(
@@ -3713,10 +3763,11 @@ async fn run_send(
                                     "DENIED: 当前为只读或规划模式，写入工具不可用".to_string()
                                 } else {
                                     // sandbox guard: refuse before the approval
-                                    // card is ever raised (delete / dangerous
-                                    // commands / blocked network paths)
-                                    if let Err(reason) = crate::agent_tools::sandbox_check(&tc.name, &args) {
-                                        reason
+                                    // card is ever raised (delete / deny-listed
+                                    // paths / denied programs / blocked network)
+                                    let verdict = crate::agent_tools::sandbox_check(&tc.name, &args);
+                                    if let crate::agent_tools::SandboxVerdict::Block(reason) = &verdict {
+                                        reason.clone()
                                     } else {
                                     // privacy: tool arguments may carry
                                     // surrogates the model echoed back — the
@@ -3726,14 +3777,23 @@ async fn run_send(
                                         restore_args(&session_id, &pseed, &mut exec_args);
                                     }
                                     // ---- approval gate (fail-closed) ----
-                                    // "auto" mode skips the card; still
-                                    // workspace-bound, still session-scoped
-                                    let granted = perm_mode == "auto"
-                                        || GRANTS
-                                            .lock()
-                                            .unwrap()
-                                            .as_ref()
-                                            .is_some_and(|s| s.contains(&grant_key(&session_id, &tc.name)));
+                                    // sandbox ForceAsk（需逐次确认名单）强制弹出
+                                    // 审批卡，即使自动模式 / 已记住授权；
+                                    // 文件白名单的可信路径 keep the auto tier.
+                                    let trusted = sb.on
+                                        && perm_base == "auto"
+                                        && verdict == crate::agent_tools::SandboxVerdict::Allow
+                                        && crate::agent_tools::file_paths_trusted(&tc.name, &args);
+                                    let granted = trusted
+                                        || (verdict != crate::agent_tools::SandboxVerdict::ForceAsk
+                                            && (perm_mode == "auto"
+                                                || GRANTS
+                                                    .lock()
+                                                    .unwrap()
+                                                    .as_ref()
+                                                    .is_some_and(|s| {
+                                                        s.contains(&grant_key(&session_id, &tc.name))
+                                                    })));
                                     let approved = if granted {
                                         true
                                     } else {

@@ -22,6 +22,7 @@ import type {
   MarketPlugin,
   MessageRecord,
   Provider,
+  PrivacyLogEntry,
   ProviderKind,
   SendResult,
   SessionBinding,
@@ -544,6 +545,16 @@ export async function openDataDir(): Promise<void> {
 /** Open the sandbox auto-backup directory in the OS file manager. */
 export async function openBackupDir(): Promise<void> {
   await invoke("open_backup_dir");
+}
+
+/** Tail of the privacy mapping log (newest first, at most `n` entries). */
+export async function privacyLogTail(n = 200): Promise<PrivacyLogEntry[]> {
+  return invoke<PrivacyLogEntry[]>("privacy_log_tail", { n });
+}
+
+/** Clear the privacy mapping log file. */
+export async function privacyLogClear(): Promise<void> {
+  await invoke("privacy_log_clear");
 }
 
 export type { ProviderKind };

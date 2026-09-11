@@ -159,10 +159,49 @@ pub struct AppSettings {
     /// 自动备份总上限（MB）：超过后从最旧开始清理。
     #[serde(default = "default_backup_cap_mb")]
     pub sandbox_backup_cap_mb: u64,
+    /// 沙箱·文件策略：禁止触碰的路径模式（支持 * 通配，不区分大小写，
+    /// 优先级最高）。空 = 不做路径级拦截。
+    #[serde(default)]
+    pub sandbox_file_deny: Vec<String>,
+    /// 沙箱·文件策略：可信路径白名单 —— 自动模式下对这些路径的写入不再
+    /// 逐条审批（其余写操作仍逐条审批）。
+    #[serde(default)]
+    pub sandbox_file_allow: Vec<String>,
+    /// 沙箱·命令策略：禁止运行的程序名（wsl / wmic / sc / reg / schtasks
+    /// 等按名称匹配，命中即拒绝）。
+    #[serde(default = "default_cmd_deny")]
+    pub sandbox_cmd_deny: Vec<String>,
+    /// 沙箱·命令策略：允许运行的程序名 —— 显式放行并跳过内置高危黑名单。
+    #[serde(default)]
+    pub sandbox_cmd_allow: Vec<String>,
+    /// 沙箱·命令策略：需逐次确认的程序名 —— 即使自动模式/已记住授权也
+    /// 强制弹出审批卡。
+    #[serde(default)]
+    pub sandbox_cmd_ask: Vec<String>,
+    /// 沙箱·网络策略：禁止访问的域名（含子域名，支持 * 通配）。
+    #[serde(default)]
+    pub sandbox_net_deny: Vec<String>,
+    /// 沙箱·网络策略：允许访问的域名（「阻止所有外部网络」开启时仍放行）。
+    #[serde(default)]
+    pub sandbox_net_allow: Vec<String>,
+    /// 沙箱·网络策略：阻止所有外部网络（允许名单除外）。
+    #[serde(default)]
+    pub sandbox_net_block_all: bool,
+    /// 沙箱·网络策略：恶意域名拦截（内置规则：非标准协议 / 带凭据的
+    /// URL / punycode 仿冒域名）。
+    #[serde(default = "default_true")]
+    pub sandbox_net_malicious: bool,
 }
 
 fn default_backup_cap_mb() -> u64 {
     500
+}
+
+fn default_cmd_deny() -> Vec<String> {
+    ["wsl", "wmic", "sc", "reg", "schtasks"]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 impl Default for AppSettings {
@@ -191,6 +230,15 @@ impl Default for AppSettings {
             sandbox_network: true,
             sandbox_backup: false,
             sandbox_backup_cap_mb: 500,
+            sandbox_file_deny: Vec::new(),
+            sandbox_file_allow: Vec::new(),
+            sandbox_cmd_deny: default_cmd_deny(),
+            sandbox_cmd_allow: Vec::new(),
+            sandbox_cmd_ask: Vec::new(),
+            sandbox_net_deny: Vec::new(),
+            sandbox_net_allow: Vec::new(),
+            sandbox_net_block_all: false,
+            sandbox_net_malicious: true,
         }
     }
 }

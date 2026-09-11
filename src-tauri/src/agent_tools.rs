@@ -46,24 +46,58 @@ pub fn is_write_tool(name: &str) -> bool {
 //
 // Tool-level isolation, NOT a VM/container: the agent keeps running in
 // process, but its destructive surface is cut down by policy —
-//   文件策略  delete-class tools are refused outright; writes stay inside
-//             the workspace guard and every write still needs approval
-//   命令策略  a destructive-command blocklist (rm -rf / del /s / format /
-//             reg / shutdown / git push --force / git reset --hard …)
-//   网络策略  web_fetch refused; common network-fetching shell commands
-//             blocked as well
+//   文件策略  delete-class tools are refused outright; deny-listed path
+//             patterns are blocked for every path-bearing tool; allow-listed
+//             trusted paths keep the auto tier approval-free
+//   命令策略  per-program deny list (wsl / wmic / sc / reg / schtasks by
+//             default), ask list that forces the approval card even in auto
+//             mode, allow list that overrides the built-in blocklist, plus
+//             the built-in destructive-command blocklist
+//   网络策略  domain deny/allow lists, a block-all-external switch and
+//             built-in malicious-URL heuristics for web_fetch
 // plus: the per-session permission mode "auto" degrades to "approve"
 // (enforced at send time). Fail-closed: unknown risk = block.
 // A global policy loaded from settings on startup and on every save_config.
 // `on` gates everything; the three sub-policies mirror the settings page.
 // Backup snapshots live in commands.rs (needs data_dir).
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SandboxPolicy {
     pub on: bool,
     pub files: bool,
     pub commands: bool,
     pub network: bool,
+    /// 文件策略：禁止触碰的路径模式（* 通配，不区分大小写，优先级最高）。
+    pub file_deny: Vec<String>,
+    /// 文件策略：可信路径白名单（自动模式下免审批）。
+    pub file_allow: Vec<String>,
+    /// 命令策略：禁止运行的程序名（小写，不含 .exe）。
+    pub cmd_deny: Vec<String>,
+    /// 命令策略：允许运行的程序名（跳过内置高危黑名单）。
+    pub cmd_allow: Vec<String>,
+    /// 命令策略：需逐次确认的程序名（auto 模式也强制审批）。
+    pub cmd_ask: Vec<String>,
+    /// 网络策略：禁止访问的域名（含子域名）。
+    pub net_deny: Vec<String>,
+    /// 网络策略：允许访问的域名（阻止全部外部网络时仍放行）。
+    pub net_allow: Vec<String>,
+    /// 网络策略：阻止所有外部网络。
+    pub net_block_all: bool,
+    /// 网络策略：恶意域名拦截（内置启发式规则）。
+    pub net_malicious: bool,
+}
+
+/// Three-way verdict for the sandbox guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxVerdict {
+    /// Proceed; the regular approval flow applies as configured.
+    Allow,
+    /// Proceed, but force the approval card even in auto / granted tiers
+    /// (命令策略·需逐次确认名单).
+    ForceAsk,
+    /// Refuse outright; the reason goes back to the model as the tool result
+    /// without ever raising an approval card.
+    Block(String),
 }
 
 static SANDBOX: Mutex<SandboxPolicy> = Mutex::new(SandboxPolicy {
@@ -71,16 +105,24 @@ static SANDBOX: Mutex<SandboxPolicy> = Mutex::new(SandboxPolicy {
     files: false,
     commands: false,
     network: false,
+    file_deny: Vec::new(),
+    file_allow: Vec::new(),
+    cmd_deny: Vec::new(),
+    cmd_allow: Vec::new(),
+    cmd_ask: Vec::new(),
+    net_deny: Vec::new(),
+    net_allow: Vec::new(),
+    net_block_all: false,
+    net_malicious: false,
 });
 
 /// Called on startup and whenever the config is saved.
-pub fn set_sandbox_policy(on: bool, files: bool, commands: bool, network: bool) {
-    let mut p = SANDBOX.lock().unwrap_or_else(|p| p.into_inner());
-    *p = SandboxPolicy { on, files, commands, network };
+pub fn set_sandbox_policy(p: SandboxPolicy) {
+    *SANDBOX.lock().unwrap_or_else(|p| p.into_inner()) = p;
 }
 
 pub fn sandbox_policy() -> SandboxPolicy {
-    *SANDBOX.lock().unwrap_or_else(|p| p.into_inner())
+    SANDBOX.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// Destructive / network shell patterns (lowercase, substring match).
@@ -103,33 +145,197 @@ const SANDBOX_CMD_BLOCKLIST: &[&str] = &[
     ":(){", "| sh", "| bash", "|sh", "|bash", "invoke-expression", "iex ",
 ];
 
-/// Pre-execution guard for mutating / network tools. `Ok(())` = proceed
-/// (approval flow still applies); `Err(reason)` = the tool returns ERROR to
-/// the model without ever reaching the approval card.
-pub fn sandbox_check(name: &str, args: &Value) -> Result<(), String> {
+/// Case-insensitive `*`-wildcard match (no path-boundary awareness — keep
+/// the semantics predictable for users writing patterns in the settings UI).
+fn wildcard_match(pattern: &str, subject: &str) -> bool {
+    fn go(p: &[u8], t: &[u8]) -> bool {
+        let (mut pi, mut ti) = (0usize, 0usize);
+        let (mut star, mut mark) = (usize::MAX, 0usize);
+        while ti < t.len() {
+            if pi < p.len() && p[pi] == b'*' {
+                star = pi;
+                mark = ti;
+                pi += 1;
+            } else if pi < p.len() && p[pi].eq_ignore_ascii_case(&t[ti]) {
+                pi += 1;
+                ti += 1;
+            } else if star < p.len() {
+                pi = star + 1;
+                mark += 1;
+                ti = mark;
+            } else {
+                return false;
+            }
+        }
+        while pi < p.len() && p[pi] == b'*' {
+            pi += 1;
+        }
+        pi == p.len()
+    }
+    let pat = pattern.trim();
+    !pat.is_empty() && go(pat.as_bytes(), subject.as_bytes())
+}
+
+/// Host of a URL: lowercased, without scheme / userinfo / port / path.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
+    let host = host.split(':').next().unwrap_or(host);
+    host.trim_matches(|c: char| c == '[' || c == ']').to_lowercase()
+}
+
+/// Domain list match: exact host, any sub-domain suffix, or `*` wildcard.
+fn domain_match(pattern: &str, host: &str) -> bool {
+    let pat = pattern.trim().to_lowercase();
+    if pat.is_empty() || host.is_empty() {
+        return false;
+    }
+    wildcard_match(&pat, host) || host == pat || host.ends_with(&format!(".{pat}"))
+}
+
+/// Program name of a shell command line: first token (a quoted path counts
+/// as one token), basename of any path, `.exe` suffix stripped, lowercased.
+/// Unquoted paths containing spaces are inherently ambiguous and resolve to
+/// the first segment — document this in the settings dialog.
+fn program_name(cmd: &str) -> String {
+    let s = cmd.trim();
+    let first = if s.starts_with('"') || s.starts_with('\'') {
+        let q = s.chars().next().unwrap();
+        match s[1..].find(q) {
+            Some(end) => &s[1..1 + end],
+            None => s[1..].trim_end_matches(q),
+        }
+    } else {
+        s.split_whitespace().next().unwrap_or("")
+    };
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    // lowercase BEFORE stripping the suffix: strip_suffix is case-sensitive
+    let lower = base.to_lowercase();
+    match lower.strip_suffix(".exe") {
+        Some(stem) => stem.to_string(),
+        None => lower,
+    }
+}
+
+/// Built-in malicious-URL heuristics (网络策略·恶意域名拦截): non-http(s)
+/// scheme, credentials in the URL, punycode homograph host.
+fn malicious_url(url: &str, host: &str) -> bool {
+    let lower = url.to_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return true;
+    }
+    if let Some((_, rest)) = lower.split_once("://") {
+        if rest.contains('@') {
+            return true; // userinfo tricks (user:pass@host)
+        }
+    }
+    host.starts_with("xn--") || host.contains(".xn--")
+}
+
+/// Path-like string arguments of a tool (deny/allow lists evaluate these).
+fn path_args(args: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["path", "from", "to"] {
+        if let Some(v) = args.get(key).and_then(|v| v.as_str()) {
+            if !v.is_empty() {
+                out.push(v.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 文件策略·白名单：every path the tool touches sits inside the trusted
+/// allow-list (used by the send path to keep the auto tier approval-free
+/// for explicitly trusted paths).
+pub fn file_paths_trusted(name: &str, args: &Value) -> bool {
+    let p = sandbox_policy();
+    if !p.on || !p.files || p.file_allow.is_empty() {
+        return false;
+    }
+    if !matches!(name, "write_file" | "edit_file" | "apply_patch") {
+        return false;
+    }
+    let paths = path_args(args);
+    !paths.is_empty()
+        && paths
+            .iter()
+            .all(|path| p.file_allow.iter().any(|pat| wildcard_match(pat, path)))
+}
+
+/// Pre-execution guard for mutating / network tools. The write path treats
+/// `ForceAsk` as "show the approval card even in auto / grant mode"; both
+/// paths turn `Block` into an ERROR tool result without ever raising a card.
+pub fn sandbox_check(name: &str, args: &Value) -> SandboxVerdict {
     let p = sandbox_policy();
     if !p.on {
-        return Ok(());
+        return SandboxVerdict::Allow;
     }
-    // 文件策略: deletion is refused outright
-    if p.files && name == "delete_file" {
-        return Err("沙箱模式已拦截：删除类操作被禁止（文件策略）。如需删除，请关闭沙箱模式或手动执行。".into());
+    // ---- 文件策略 ----
+    if p.files {
+        if name == "delete_file" {
+            return SandboxVerdict::Block(
+                "沙箱模式已拦截：删除类操作被禁止（文件策略）。如需删除，请关闭沙箱模式或手动执行。".into(),
+            );
+        }
+        if !p.file_deny.is_empty() {
+            for path in path_args(args) {
+                if p.file_deny.iter().any(|pat| wildcard_match(pat, &path)) {
+                    return SandboxVerdict::Block(format!(
+                        "沙箱模式已拦截：路径「{path}」命中文件禁止名单（文件策略）。"
+                    ));
+                }
+            }
+        }
     }
-    // 网络策略: no outbound fetch tool
+    // ---- 网络策略 ----
     if p.network && name == "web_fetch" {
-        return Err("沙箱模式已拦截：网络访问被禁止（网络策略）。web_fetch 在沙箱内不可用。".into());
+        let url = str_arg(args, "url");
+        let host = url_host(&url);
+        if p.net_malicious && malicious_url(&url, &host) {
+            return SandboxVerdict::Block(format!(
+                "沙箱模式已拦截：「{host}」命中恶意域名拦截规则（网络策略）。"
+            ));
+        }
+        if p.net_deny.iter().any(|d| domain_match(d, &host)) {
+            return SandboxVerdict::Block(format!(
+                "沙箱模式已拦截：「{host}」命中网络禁止名单（网络策略）。"
+            ));
+        }
+        if p.net_block_all && !p.net_allow.iter().any(|d| domain_match(d, &host)) {
+            return SandboxVerdict::Block(
+                "沙箱模式已拦截：已开启「阻止所有外部网络」，目标域名不在允许名单（网络策略）。".into(),
+            );
+        }
     }
-    // 命令策略: destructive / network shell commands are blocked
+    // ---- 命令策略 ----
     if p.commands && name == "run_command" {
-        let cmd = str_arg(args, "command").to_lowercase();
-        if let Some(hit) = SANDBOX_CMD_BLOCKLIST.iter().find(|pat| cmd.contains(*pat)) {
-            return Err(format!(
+        let cmd = str_arg(args, "command");
+        let prog = program_name(&cmd);
+        if p.cmd_deny.iter().any(|d| d.trim().to_lowercase() == prog) {
+            return SandboxVerdict::Block(format!(
+                "沙箱模式已拦截：程序「{prog}」在命令禁止名单中（命令策略）。"
+            ));
+        }
+        if p.cmd_ask.iter().any(|d| d.trim().to_lowercase() == prog) {
+            return SandboxVerdict::ForceAsk;
+        }
+        if p.cmd_allow.iter().any(|d| d.trim().to_lowercase() == prog) {
+            // 显式允许名单：用户自担风险的放行，跳过内置高危黑名单
+            return SandboxVerdict::Allow;
+        }
+        if let Some(hit) = SANDBOX_CMD_BLOCKLIST
+            .iter()
+            .find(|pat| cmd.to_lowercase().contains(*pat))
+        {
+            return SandboxVerdict::Block(format!(
                 "沙箱模式已拦截：命令命中高危策略「{}」（命令策略）。可关闭沙箱模式后重试，或自行在终端执行。",
                 hit.trim()
             ));
         }
     }
-    Ok(())
+    SandboxVerdict::Allow
 }
 
 /// The OpenAI `tools` array. Constant bytes per build — it sits in the
@@ -1707,5 +1913,221 @@ mod tests {
         assert_eq!(all.len(), 3);
         assert!(search_files(&wstr, "不存在的关键词").is_empty());
         let _ = fs::remove_dir_all(&ws);
+    }
+}
+
+// ---- sandbox 三态裁决（Allow / ForceAsk / Block）测试 --------------------
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// sandbox_check / set_sandbox_policy touch the process-global SANDBOX:
+    /// serialize the whole group so parallel test threads never interfere.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn policy(lists: serde_json::Value) -> SandboxPolicy {
+        let mut p = SandboxPolicy {
+            on: true,
+            files: true,
+            commands: true,
+            network: true,
+            file_deny: Vec::new(),
+            file_allow: Vec::new(),
+            cmd_deny: Vec::new(),
+            cmd_allow: Vec::new(),
+            cmd_ask: Vec::new(),
+            net_deny: Vec::new(),
+            net_allow: Vec::new(),
+            net_block_all: false,
+            net_malicious: false,
+        };
+        if let Some(v) = lists.get("file_deny").and_then(|v| v.as_array()) {
+            p.file_deny = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        }
+        if let Some(v) = lists.get("file_allow").and_then(|v| v.as_array()) {
+            p.file_allow = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        }
+        if let Some(v) = lists.get("cmd_deny").and_then(|v| v.as_array()) {
+            p.cmd_deny = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        }
+        if let Some(v) = lists.get("cmd_allow").and_then(|v| v.as_array()) {
+            p.cmd_allow = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        }
+        if let Some(v) = lists.get("cmd_ask").and_then(|v| v.as_array()) {
+            p.cmd_ask = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        }
+        if let Some(v) = lists.get("net_deny").and_then(|v| v.as_array()) {
+            p.net_deny = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        }
+        if let Some(v) = lists.get("net_allow").and_then(|v| v.as_array()) {
+            p.net_allow = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        }
+        if let Some(v) = lists.get("net_block_all").and_then(|v| v.as_bool()) {
+            p.net_block_all = v;
+        }
+        if let Some(v) = lists.get("net_malicious").and_then(|v| v.as_bool()) {
+            p.net_malicious = v;
+        }
+        p
+    }
+
+    #[test]
+    fn cmd_deny_blocks_by_program_name() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_sandbox_policy(policy(json!({ "cmd_deny": ["wsl", "schtasks"] })));
+        assert!(matches!(
+            sandbox_check("run_command", &json!({ "command": "wsl -d Ubuntu rm x" })),
+            SandboxVerdict::Block(_)
+        ));
+        // 带路径 + .exe 也能按程序名匹配（大小写不敏感）
+        assert!(matches!(
+            sandbox_check("run_command", &json!({ "command": r#""C:\Windows\System32\SCHTASKS.EXE" /create ..."# })),
+            SandboxVerdict::Block(_)
+        ));
+        // 非名单程序不受影响
+        assert_eq!(
+            sandbox_check("run_command", &json!({ "command": "git status" })),
+            SandboxVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn cmd_ask_forces_and_allow_overrides_blocklist() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_sandbox_policy(policy(json!({ "cmd_ask": ["docker"] })));
+        assert_eq!(
+            sandbox_check("run_command", &json!({ "command": "docker ps" })),
+            SandboxVerdict::ForceAsk
+        );
+        // 内置高危黑名单默认拦截 curl
+        set_sandbox_policy(policy(json!({})));
+        assert!(matches!(
+            sandbox_check("run_command", &json!({ "command": "curl https://x/y" })),
+            SandboxVerdict::Block(_)
+        ));
+        // 显式允许名单跳过内置黑名单（用户自担风险的放行）
+        set_sandbox_policy(policy(json!({ "cmd_allow": ["curl"] })));
+        assert_eq!(
+            sandbox_check("run_command", &json!({ "command": "curl https://x/y" })),
+            SandboxVerdict::Allow
+        );
+        // 但 deny 名单优先级高于 allow
+        set_sandbox_policy(policy(json!({ "cmd_allow": ["curl"], "cmd_deny": ["curl"] })));
+        assert!(matches!(
+            sandbox_check("run_command", &json!({ "command": "curl https://x/y" })),
+            SandboxVerdict::Block(_)
+        ));
+    }
+
+    #[test]
+    fn file_deny_wildcard_and_delete() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_sandbox_policy(policy(json!({ "file_deny": ["secrets/*", "*.env"] })));
+        assert!(matches!(
+            sandbox_check("read_file", &json!({ "path": "secrets/api.txt" })),
+            SandboxVerdict::Block(_)
+        ));
+        assert!(matches!(
+            sandbox_check("write_file", &json!({ "path": "SRC/Prod.env" })),
+            SandboxVerdict::Block(_)
+        ));
+        // move_path 的 from 与 to 都要检查
+        assert!(matches!(
+            sandbox_check("move_path", &json!({ "from": "a.txt", "to": "x/.env" })),
+            SandboxVerdict::Block(_)
+        ));
+        // 未命中名单的正常路径放行
+        assert_eq!(
+            sandbox_check("write_file", &json!({ "path": "src/main.rs" })),
+            SandboxVerdict::Allow
+        );
+        // 删除类工具一律拒绝（文件策略开启时）
+        assert!(matches!(
+            sandbox_check("delete_file", &json!({ "path": "src/main.rs" })),
+            SandboxVerdict::Block(_)
+        ));
+    }
+
+    #[test]
+    fn file_allow_trusted_paths() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_sandbox_policy(policy(json!({ "file_allow": ["src/**"] })));
+        assert!(file_paths_trusted("write_file", &json!({ "path": "src/a/b.rs" })));
+        assert!(!file_paths_trusted("write_file", &json!({ "path": "docs/x.md" })));
+        assert!(!file_paths_trusted("read_file", &json!({ "path": "src/a/b.rs" })));
+    }
+
+    #[test]
+    fn network_lists_and_block_all() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_sandbox_policy(policy(json!({ "net_deny": ["evil.example"] })));
+        assert!(matches!(
+            sandbox_check("web_fetch", &json!({ "url": "https://sub.evil.example/x" })),
+            SandboxVerdict::Block(_)
+        ));
+        assert_eq!(
+            sandbox_check("web_fetch", &json!({ "url": "https://ok.example/x" })),
+            SandboxVerdict::Allow
+        );
+        // 阻止所有外部网络：允许名单外的域名全部拒绝
+        set_sandbox_policy(policy(json!({ "net_block_all": true, "net_allow": ["docs.rs"] })));
+        assert!(matches!(
+            sandbox_check("web_fetch", &json!({ "url": "https://crates.io/x" })),
+            SandboxVerdict::Block(_)
+        ));
+        assert_eq!(
+            sandbox_check("web_fetch", &json!({ "url": "https://docs.rs/serde" })),
+            SandboxVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn malicious_heuristics() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_sandbox_policy(policy(json!({ "net_malicious": true })));
+        // punycode 仿冒域名
+        assert!(matches!(
+            sandbox_check("web_fetch", &json!({ "url": "https://xn--pple-43d.com/x" })),
+            SandboxVerdict::Block(_)
+        ));
+        // 带凭据的 URL
+        assert!(matches!(
+            sandbox_check("web_fetch", &json!({ "url": "https://user:pass@real.example/x" })),
+            SandboxVerdict::Block(_)
+        ));
+        // 非标准协议
+        assert!(matches!(
+            sandbox_check("web_fetch", &json!({ "url": "file:///C:/Windows/win.ini" })),
+            SandboxVerdict::Block(_)
+        ));
+        // 关闭后放行
+        set_sandbox_policy(policy(json!({ "net_malicious": false })));
+        assert_eq!(
+            sandbox_check("web_fetch", &json!({ "url": "file:///C:/x" })),
+            SandboxVerdict::Allow
+        );
+        set_sandbox_policy(SandboxPolicy { on: false, ..policy(json!({})) });
+        assert_eq!(
+            sandbox_check("web_fetch", &json!({ "url": "https://xn--pple-43d.com/x" })),
+            SandboxVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn program_name_and_domain_helpers() {
+        assert_eq!(program_name(r#""C:\Program Files\Docker\docker.exe" ps"#), "docker");
+        assert_eq!(program_name(r#""C:\Program Files\Docker\docker.exe""#), "docker");
+        assert_eq!(program_name("/usr/bin/WSL.EXE -l"), "wsl");
+        assert_eq!(program_name("git status"), "git");
+        assert_eq!(url_host("https://User@Example.COM:8443/a/b?q=1"), "example.com");
+        assert_eq!(url_host("http://192.168.1.4:3000"), "192.168.1.4");
+        assert!(domain_match("example.com", "api.example.com"));
+        assert!(domain_match("*.example.com", "api.example.com"));
+        assert!(!domain_match("example.com", "notexample.com"));
+        assert!(wildcard_match("src/**", "src/a/b.rs"));
+        // * 无路径边界语义：可跨分隔符（设计如此，保持可预期）
+        assert!(wildcard_match("src/*", "src/a/b.rs"));
+        assert!(!wildcard_match("src/*", "docs/a.md"));
     }
 }
