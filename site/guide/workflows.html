@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>工作流模式 | CCHarness 指南</title>
-  <meta name="description" content="CCHarness 六种工作流模式：智能体、规划、目标、深度推理、生图与自定义状态机——会话即工作流，一个下拉随时切换。" />
+  <meta name="description" content="CCHarness 七种工作流模式：智能体、规划、目标、深度推理、审阅、生图与自定义状态机——会话即工作流，一个下拉随时切换。" />
   <link rel="icon" type="image/png" href="../logo.png" />
   <script>(function(){var t;try{t=localStorage.getItem("cch-theme")}catch(e){}if(!t){t=window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"}document.documentElement.setAttribute("data-theme",t)})()</script>
   <link rel="stylesheet" href="../style.css" />
@@ -62,7 +62,7 @@
       <div class="crumb">指南 / 核心概念</div>
       <h1>工作流模式</h1>
       <p class="lead">
-        会话即工作流。输入框上方的下拉随时切换六种模式，
+        会话即工作流。输入框上方的下拉随时切换七种模式，
         权限边界、指令注入与工具面随模式自动收敛——每种模式都只给它真正需要的。
       </p>
 
@@ -74,6 +74,7 @@
           <tr><td>📋 规划</td><td>只读调研，输出方案卡；批准前不修改任何文件</td></tr>
           <tr><td>🎯 目标</td><td>锁定目标与验收标准，逐轮输出可核验清单，自动延续直到全部达成</td></tr>
           <tr><td>🧠 深度推理</td><td>思维树：三路候选方案并行生成，评审模型择优后执行</td></tr>
+          <tr><td>🔍 审阅</td><td>三专家并行只读预审：正确性 / 安全边界 / 可维护性，汇合去重定级输出发现表</td></tr>
           <tr><td>🎨 生图</td><td>独立的图像生成会话，走 <code>/images/generations</code> 端点</td></tr>
           <tr><td>🔀 自定义状态机</td><td>可视化编排的声明式工作流：状态、指令、工具面与分支自定</td></tr>
         </tbody>
@@ -108,6 +109,15 @@
         由评审模型打分择优后再进入执行。难题不再单点赌运气。
       </p>
 
+      <h2 id="review">审阅</h2>
+      <p>
+        三专家并行预审：正确性、安全边界、可维护性三个<strong>互斥的只读视角</strong>同时审查
+        当前任务与未提交变更（有 <code>git diff</code> 时自动附带），
+        每位专家独立输出结构化发现——<code>[严重度] 后果 ← 根因 @ 位置 → 验证方式</code>。
+        主模型随后作为汇合评审，先只读核实、再去重定级，输出最终发现表；无法核实的条目标注「待核」。
+        审阅期间工具面强制只读，改与不改由你决定。
+      </p>
+
       <h2 id="image">生图</h2>
       <p>
         走 <code>/images/generations</code> 端点的独立图像生成会话：
@@ -123,7 +133,7 @@
       </p>
       <div class="callout">
         <b>工具面随模式收敛</b>
-        规划模式只有只读工具；目标模式额外注入目标管理工具；状态机按状态裁剪工具面——
+        规划模式只有只读工具；审阅模式同样强制只读；目标模式额外注入目标管理工具；状态机按状态裁剪工具面——
         模式即边界，不需要你手动开关。
       </div>
 
@@ -140,6 +150,7 @@
       <a href="#plan">规划</a>
       <a href="#goal">目标</a>
       <a href="#deep">深度推理</a>
+      <a href="#review">审阅</a>
       <a href="#image">生图</a>
       <a href="#sm">自定义状态机</a>
     </aside>
