@@ -212,9 +212,10 @@ src-tauri/              Rust 后端
 
 ## 项目状态
 
-- 当前版本 v0.1.5，处于快速迭代期，更新日志见 [Releases](https://github.com/Technicalflight/CCHarness/releases)；
+- 当前版本 v0.1.6，处于快速迭代期，更新日志见 [Releases](https://github.com/Technicalflight/CCHarness/releases)；
+- v0.1.6：协议适配器矩阵拓宽——新增 OpenAI Responses 与 Azure OpenAI（Responses）适配器（GPT-5.x / o 系列原生接口、Azure v1 数据面 api-key 认证）；缓存 TTL 三档位（默认 / long / short / none，模型管理页可选，原 24h 开关自动迁移）；Anthropic 缓存记账修复（输入 / 写入 / 读取三桶互斥按厂商归一，未命中检测与成本核算修正）；
 - v0.1.5：应用内更新检查节流调整为每天一次（启动静默检查 24 小时一次，发现更新仅徽标 + 提示、手动下载）；
-- v0.1.4：模型缓存时间调整为 60 分钟（Anthropic 请求携带 cache_control ttl 1h，对齐 Claude Code 时间设定）；隐私匿名化修复 +86 国际前缀手机号识别并新增自定义正则脱敏；隐私映射 JSONL 日志（设置页可查看 / 清空）；策略沙箱文件 / 命令 / 网络三维自定义清单与三态裁决；应用内更新检查节流缩短为 60 分钟；
+- v0.1.4：模型缓存时间调整为 60 分钟（Anthropic 请求携带 cache_control ttl 1h）；隐私匿名化修复 +86 国际前缀手机号识别并新增自定义正则脱敏；隐私映射 JSONL 日志（设置页可查看 / 清空）；策略沙箱文件 / 命令 / 网络三维自定义清单与三态裁决；应用内更新检查节流缩短为 60 分钟；
 - v0.1.3：新增「审阅」工作流模式（三专家并行只读预审，汇合定级输出发现表）；写后自动验证钩子（post_write_command，验证不依赖模型自觉）；目标模式证据分级（无证据的 ✅ 计「待补」）；智能体宪法质量纪律；技能路由阶梯与记忆隐私红线；
 - v0.1.2：仓库公开开源（AGPL-3.0）；应用内更新检查开箱即用——移除设置页的 GitHub 访问令牌配置，匿名即可检查；
 - v0.1.1：应用内更新检查（侧边栏版本号 / 启动自动检查）、macOS / Linux 下的 Key 等价保护（钥匙串 / 密钥环保存主密钥 + AES-256-GCM 加密落盘）；
