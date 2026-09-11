@@ -192,22 +192,41 @@ node scripts/gen-icons.mjs    # 重新生成图标
 
 ```
 src/                    React 前端
-  components/           Sidebar / Composer / 面板 / 命令面板 / 宠物
-  views/                会话 / 竞技场 / 工作流 / 子智能体 / 评测 / 遥测 / 设置
-  lib/                  Tauri API 封装、格式化、配色、图标
+  App.tsx               布局 / 视图路由 / 全局快捷键
   store.ts              zustand 全局状态
-src-tauri/              Rust 后端
-  src/prefix.rs         三区前缀状态机 + 指纹链（含字节稳定性测试）
-  src/chat.rs           Provider HTTP / SSE / 图像生成 / 用量与成本
-  src/commands.rs       Tauri 命令层（会话编排 / 工具循环 / 目标状态机）
-  src/auxmemo.rs        辅助调用精确缓存（L1 LRU + L2 加密磁盘 + 账本）
-  src/memvector.rs      向量长期记忆（embeddings + 余弦召回）
-  src/guard.rs          注入检测（Guardrails）
-  src/urlguard.rs       SSRF 防护（含测试）
-  src/worktree.rs       git worktree 隔离生命周期
-  src/git_panel.rs      Git 面板命令（暂存/提交/分支/远程）
-  src/bench.rs          Benchmark + LLM-as-judge
-  src/sessions.rs       会话持久化 + Markdown 导出
+  types.ts              前后端共享 wire 类型
+  components/           Sidebar / Composer / 面板 / 命令面板 / 宠物
+  views/                会话 / 竞技场 / 工作流 / 子智能体 / 审阅 / 评测 /
+                        市场 / 模型管理 / MCP / 遥测 / 设置
+  lib/                  Tauri API 封装、格式化、配色、图标
+src-tauri/src/          Rust 后端
+  main.rs               Tauri 2 入口 / AppState / 命令注册
+  prefix.rs             三区前缀状态机 + 指纹链（含字节稳定性测试）
+  sysprompt.rs          Zone S 分层系统提示组装
+  chat.rs               Provider HTTP / SSE / 图像生成 / 用量与成本
+  commands.rs           Tauri 命令层（会话编排 / 工具循环 / 目标状态机）
+  agent_tools.rs        只读内置工具（schema 注入 + 进程内受控执行）
+  mcp.rs                MCP 客户端运行时（stdio / HTTP，JSON-RPC 2.0）
+  spill.rs              超长工具结果落盘（留一行存根可读回）
+  confidence.rs         流侧置信度标记提取
+  divergence.rs         缓存未命中定位（本地指纹链 vs Provider 报告）
+  warmer.rs             可选缓存保温（空闲保活探针）
+  deepfiles.rs          图片 Files API 复用（file_id 引用）
+  auxmemo.rs            辅助调用精确缓存（L1 LRU + L2 加密磁盘 + 账本）
+  memvector.rs          向量长期记忆（embeddings + 余弦召回）
+  privacy.rs            伪匿名化隐私模式（类型一致代换）
+  guard.rs              注入检测（Guardrails）
+  urlguard.rs           SSRF 防护（含测试）
+  skills.rs             技能提示层插件（markdown + frontmatter）
+  skillhub.rs           SkillHub 市场集成
+  importer.rs           本地 agent-CLI 会话 JSONL 导入
+  worktree.rs           git worktree 隔离生命周期
+  git_panel.rs          Git 面板命令（暂存/提交/分支/远程）
+  bench.rs              Benchmark + LLM-as-judge
+  sessions.rs           会话持久化 + Markdown 导出
+  types_rs.rs           跨模块 wire 类型（与 src/types.ts 一一对应）
+  config.rs             配置加载 / 密钥封存
+  update.rs             应用内更新检查（GitHub Releases）
 ```
 
 ## 项目状态
