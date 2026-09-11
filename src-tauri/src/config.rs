@@ -264,6 +264,11 @@ pub struct AppSettings {
     /// 稳定不重建；要求模型支持读取历史中最新 system 指令）。
     #[serde(default = "default_system_update_mode")]
     pub system_update_mode: String,
+    /// 缓存保温（one-shot keepalive）：对话成功结束 4 分钟后向前端补发
+    /// 一次非流式 ping（max_tokens=1），以命中价刷新即将过期的服务端
+    /// 前缀缓存。仅 OpenAI 兼容接口生效；每轮最多一次，不循环。
+    #[serde(default)]
+    pub cache_warmup: bool,
 }
 
 fn default_backup_cap_mb() -> u64 {
@@ -323,6 +328,7 @@ impl Default for AppSettings {
             sandbox_net_malicious: true,
             spill_max_chars: default_spill_max_chars(),
             system_update_mode: default_system_update_mode(),
+            cache_warmup: false,
         }
     }
 }

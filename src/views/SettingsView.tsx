@@ -582,6 +582,29 @@ export function SettingsView() {
         </div>
 
         <div className="card">
+          <h3>缓存保温</h3>
+          <div className="row" style={{ gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+            {(
+              [
+                [false, "关闭"],
+                [true, "开启（闲置保温）"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={String(value)}
+                className={`btn small ${(config.settings.cache_warmup ?? false) === value ? "primary" : ""}`}
+                onClick={() => update({ cache_warmup: value })}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="hint" style={{ marginTop: 8 }}>
+            对话成功结束约 4 分钟后，自动向前端补发一次非流式 ping（max_tokens=1），以缓存命中价刷新即将过期的服务端前缀缓存——闲置后回来继续对话时不必按全价重算整个前缀。仅在 OpenAI 兼容接口生效；每轮最多触发一次、不循环，新对话会自动取消未发出的保温。划算条件：回归概率 &gt; 命中价 ÷（输入价 − 命中价）——DeepSeek 约 14%，OpenAI 约 5%；推理模型自动跳过（思考链不受 max_tokens 限制，保温得不偿失）。
+          </div>
+        </div>
+
+        <div className="card">
           <h3>系统通知</h3>
           <div className="row" style={{ gap: 8 }}>
             <button

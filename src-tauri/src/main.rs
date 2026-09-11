@@ -21,6 +21,7 @@ mod sessions;
 mod skillhub;
 mod skills;
 mod spill;
+mod warmer;
 mod sysprompt;
 mod types_rs;
 mod update;

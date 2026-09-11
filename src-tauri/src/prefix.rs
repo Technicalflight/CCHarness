@@ -319,6 +319,14 @@ impl LanePrefix {
         self.cache_tier = tier;
     }
 
+    /// Whether a reasoning-effort level is bound to the head. Reasoning
+    /// models don't cap their CoT with `max_tokens`, so the cache warmer
+    /// skips these prefixes (a one-token probe could still burn a real
+    /// thinking tail).
+    pub fn is_reasoning_bound(&self) -> bool {
+        self.thinking.is_some()
+    }
+
     /// Rebind the tool-schema loadout hash. MCP servers joining/leaving
     /// mid-session rewrite the head bytes (tools serialize before messages)
     /// without touching Zone H — tracking the hash keeps the epoch honest
@@ -449,6 +457,55 @@ impl LanePrefix {
     #[allow(dead_code)]
     pub fn build_openai_body(&self, model: &str, user_msg: &ChatMessage) -> String {
         self.build_openai_body_multi(model, std::slice::from_ref(user_msg), None)
+    }
+
+    /// Non-streaming one-shot keepalive body (cache warmer): the same
+    /// head identity (model / cache key / tools schema / temperature) and
+    /// the same Zone S+H message bytes as the next real request, with
+    /// transport flags swapped to `stream:false` + `max_tokens:1` so the
+    /// refresh costs one output token. The fixed probe tail extends the
+    /// cached span by a few tokens; the next real request re-matches
+    /// everything up to its own new tail. Transport flags are not part of
+    /// prompt-cache identity, so the cache hit is the real one.
+    ///
+    /// Callers must gate this on the warmer eligibility (no
+    /// reasoning-bound prefixes — CoT isn't capped by max_tokens).
+    pub fn build_warmup_body(&self, model: &str, tools: Option<&serde_json::Value>) -> String {
+        let mut body = String::with_capacity(self.prefix_len + 256);
+        body.push_str("{\"model\":");
+        body.push_str(&serde_json::to_string(model).expect("model str"));
+        if self.cache_tier != CacheTier::None && !self.cache_key.is_empty() {
+            body.push_str(",\"prompt_cache_key\":");
+            body.push_str(&serde_json::to_string(&self.cache_key).expect("cache key str"));
+        }
+        if self.cache_tier == CacheTier::Long {
+            body.push_str(",\"prompt_cache_retention\":\"24h\"");
+        }
+        body.push_str(",\"stream\":false,\"max_tokens\":1");
+        if let Some(t) = self.temperature {
+            body.push_str(",\"temperature\":");
+            body.push_str(&serde_json::to_string(&t).expect("temperature f64"));
+        }
+        if let Some(t) = tools {
+            body.push_str(",\"tools\":");
+            body.push_str(&serde_json::to_string(t).expect("tools schema"));
+            body.push_str(",\"tool_choice\":\"auto\"");
+        }
+        body.push_str(",\"messages\":[");
+        let mut first = true;
+        for part in self.zone_parts() {
+            if !first {
+                body.push(',');
+            }
+            body.push_str(&part);
+            first = false;
+        }
+        if !first {
+            body.push(',');
+        }
+        body.push_str(&message_json(&ChatMessage::plain("user", crate::warmer::WARMUP_PING)));
+        body.push_str("]}");
+        body
     }
 
     /// Assemble the OpenAI Responses request body (pi adapter matrix: the

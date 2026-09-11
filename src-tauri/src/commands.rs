@@ -3005,6 +3005,9 @@ async fn run_send(
                 }
             };
             let model = binding.model.clone();
+            // a new turn cancels any pending keepalive probe on this lane —
+            // it must never fire between our pre-stream phases and requests
+            crate::warmer::cancel(&session_id, lane);
             let store = SessionStore::new(&data_dir);
 
             // workspace + layered Zone S (identity → user global → AGENTS.md → env).
@@ -4470,13 +4473,36 @@ async fn run_send(
 
             // Zone T falls into Zone H for the next user turn
             if turn_status != "error" {
-                let mut guard = prefixes_lock();
-                if let Some(map) = guard.as_mut() {
-                    if let Some(lp) = map.get_mut(&(session_id.clone(), lane)) {
-                        for m in &sent_this_turn {
-                            lp.append(m);
+                let mut warm_slot: Option<crate::warmer::WarmSlot> = None;
+                {
+                    let mut guard = prefixes_lock();
+                    if let Some(map) = guard.as_mut() {
+                        if let Some(lp) = map.get_mut(&(session_id.clone(), lane)) {
+                            for m in &sent_this_turn {
+                                lp.append(m);
+                            }
+                            // cache warmer (opt-in): snapshot the post-append
+                            // prefix — exactly the span the next real request
+                            // wants cached — and schedule one keepalive probe
+                            if turn_status == "ok"
+                                && crate::warmer::eligible(
+                                    cfg.settings.cache_warmup,
+                                    provider.kind.clone(),
+                                    provider.cache_tier(),
+                                    lp.is_reasoning_bound(),
+                                )
+                            {
+                                warm_slot = Some(crate::warmer::WarmSlot {
+                                    prefix: lp.clone(),
+                                    model: model.clone(),
+                                    tools: tools_schema.clone(),
+                                });
+                            }
                         }
                     }
+                }
+                if let Some(slot) = warm_slot {
+                    crate::warmer::schedule(client.clone(), provider.clone(), session_id.clone(), lane, slot);
                 }
             } else {
                 // an errored turn's tail never enters Zone H — drop the

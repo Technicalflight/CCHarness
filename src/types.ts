@@ -116,6 +116,9 @@ export interface AppSettings {
    *  （仅 OpenAI 兼容接口，变更以历史内 system 消息注入，前缀缓存身份
    *  保持不变）。 */
   system_update_mode: string;
+  /** 缓存保温：对话成功结束 4 分钟后补发一次非流式 ping（max_tokens=1）
+   *  刷新服务端前缀缓存，避免闲置过期后全价重算。仅 OpenAI 兼容接口。 */
+  cache_warmup: boolean;
 }
 
 /** One line of the privacy mapping log (backend `privacy_log_tail`). */
