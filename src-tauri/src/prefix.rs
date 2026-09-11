@@ -138,6 +138,16 @@ pub fn message_json(m: &ChatMessage) -> String {
     serde_json::to_string(m).expect("message serialize cannot fail")
 }
 
+/// Stable cache-routing key for a subagent lane: one shard per (parent
+/// session, subagent role). Repeated runs of the same profile replay a
+/// byte-identical head + Zone S span — a per-run random key would route
+/// every run to a different shard and cold-start that span every time;
+/// the derived key lets the upstream cache actually reuse it. Mirrors the
+/// `{source}:{parent}` derivation pattern of reference agents.
+pub fn subagent_cache_key(parent_session: &str, profile: Option<&str>) -> String {
+    format!("ccharness-{parent_session}-sub-{}", profile.unwrap_or("default"))
+}
+
 #[derive(Clone)]
 pub struct LanePrefix {
     /// Zone S bytes: the serialized system message ("" if none configured).
@@ -1270,5 +1280,25 @@ mod tests {
         assert_eq!(parts[0]["text"], "看图");
         assert_eq!(parts[1]["type"], "input_image");
         assert_eq!(parts[1]["image_url"], "data:image/png;base64,aGk=");
+    }
+
+    #[test]
+    fn subagent_key_is_stable_per_parent_and_role() {
+        // same parent + same profile ⇒ identical shard across runs
+        assert_eq!(
+            subagent_cache_key("sess-1", Some("reviewer")),
+            subagent_cache_key("sess-1", Some("reviewer"))
+        );
+        // different role or parent ⇒ different shard (no cross-dilution)
+        assert_ne!(
+            subagent_cache_key("sess-1", Some("reviewer")),
+            subagent_cache_key("sess-1", Some("researcher"))
+        );
+        assert_ne!(
+            subagent_cache_key("sess-1", Some("reviewer")),
+            subagent_cache_key("sess-2", Some("reviewer"))
+        );
+        // profile-less delegates share the parent's default shard
+        assert_eq!(subagent_cache_key("sess-1", None), "ccharness-sess-1-sub-default");
     }
 }

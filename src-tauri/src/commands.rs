@@ -2353,7 +2353,11 @@ async fn run_subagent(
         .and_then(|p| p.max_turns)
         .map(|n| (n as usize).clamp(1, 40))
         .unwrap_or(SUB_MAX_ROUNDS);
-    let cache_key = format!("ccharness-{sub_id}-0");
+    // stable per-(parent, role) routing shard: repeated runs of the same
+    // profile replay identical Zone S bytes and hit the warm shard instead
+    // of cold-starting on a fresh per-run key
+    let cache_key =
+        crate::prefix::subagent_cache_key(parent_session, profile.map(|p| p.name.as_str()));
 
     // the task record carries workflow="subagent" so transcript_for_lane
     // injects SUBAGENT_DIRECTIVE — identical bytes live and after restart
