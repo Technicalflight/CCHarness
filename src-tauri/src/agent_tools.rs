@@ -719,13 +719,7 @@ pub fn resolve_in_workspace(workspace: &str, rel: &str) -> Result<PathBuf, Strin
         if c_norm.starts_with(&ws_norm) {
             // canonical re-check closes the symlink escape: when both sides
             // resolve on disk, the real location must remain inside.
-            if let (Ok(ws_canon), Ok(c_canon)) =
-                (fs::canonicalize(&ws_norm), fs::canonicalize(&c_norm))
-            {
-                if !c_canon.starts_with(&ws_canon) {
-                    return Err(format!("路径 {rel_trim} 经符号链接越出工作区边界"));
-                }
-            }
+            canonical_escape_check(&c_norm, &ws_norm, rel_trim)?;
             return Ok(c_norm);
         }
         return Err(format!("拒绝绝对路径 {rel_trim}：请使用相对工作区的路径"));
@@ -738,7 +732,52 @@ pub fn resolve_in_workspace(workspace: &str, rel: &str) -> Result<PathBuf, Strin
     if !joined.starts_with(&base) {
         return Err(format!("路径 {rel_trim} 越出工作区边界"));
     }
+    // the relative branch needs the same canonical re-check as the absolute
+    // one: a symlink inside the workspace (repo-supplied, or planted via one
+    // approved command) carries the resolved location outside while the
+    // lexical prefix still holds.
+    canonical_escape_check(&joined, &base, rel_trim)?;
     Ok(joined)
+}
+
+/// Symlink-escape re-check shared by both path branches: resolve the deepest
+/// existing ancestor of `p` and require it to stay inside the canonical
+/// workspace root. Walking up matters because `canonicalize` needs every
+/// component to exist — a not-yet-created leaf is covered by its deepest
+/// existing ancestor, which is exactly the chain `create_dir_all`/`fs::write`
+/// would follow.
+fn canonical_escape_check(p: &Path, base: &Path, rel_trim: &str) -> Result<(), String> {
+    let Ok(ws_canon) = fs::canonicalize(base) else {
+        return Ok(()); // workspace root not on disk — nothing to compare against
+    };
+    let mut probe = p.to_path_buf();
+    let resolved = loop {
+        match fs::canonicalize(&probe) {
+            Ok(real) => break real,
+            Err(_) => match probe.parent() {
+                Some(parent) => probe = parent.to_path_buf(),
+                None => break probe,
+            },
+        }
+    };
+    if !resolved.starts_with(&ws_canon) {
+        return Err(format!("路径 {rel_trim} 经符号链接越出工作区边界"));
+    }
+    Ok(())
+}
+
+/// Write-side complement to `canonical_escape_check`: refuse a symlink as
+/// the final target component. A *dangling* link cannot be resolved by
+/// `canonicalize` at all, yet `fs::write` through it would create the file
+/// at the link's destination — outside the workspace.
+fn refuse_symlink_target(path: &Path, rel: &str) -> Result<(), String> {
+    if fs::symlink_metadata(path)
+        .map(|m| m.is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!("拒绝操作符号链接 {rel}（真实落点可能在工作区之外）"));
+    }
+    Ok(())
 }
 
 fn normalize_plain(p: &Path) -> PathBuf {
@@ -1515,6 +1554,7 @@ fn apply_patch(workspace: &str, rel: &str, hunks: &[Value]) -> Result<String, St
         return Err("hunks 超过 50 处上限".into());
     }
     let path = resolve_in_workspace(workspace, rel)?;
+    refuse_symlink_target(&path, rel)?;
     if path.is_dir() {
         return Err(format!("{rel} 是目录"));
     }
@@ -1549,6 +1589,7 @@ fn delete_file(workspace: &str, rel: &str) -> Result<String, String> {
         return Err("拒绝删除工作区根".into());
     }
     let path = resolve_in_workspace(workspace, rel)?;
+    refuse_symlink_target(&path, rel)?;
     if path.is_dir() {
         return Err(format!("{rel} 是目录 —— delete_file 只接受文件（防误删整棵子树）"));
     }
@@ -1563,6 +1604,8 @@ fn move_path(workspace: &str, from: &str, to: &str) -> Result<String, String> {
     }
     let src = resolve_in_workspace(workspace, from)?;
     let dst = resolve_in_workspace(workspace, to)?;
+    refuse_symlink_target(&src, from)?;
+    refuse_symlink_target(&dst, to)?;
     if !src.exists() {
         return Err(format!("源不存在: {from}"));
     }
@@ -1584,6 +1627,7 @@ fn write_file(workspace: &str, rel: &str, content: &str) -> Result<String, Strin
         return Err("内容包含 NUL，疑似二进制".into());
     }
     let path = resolve_in_workspace(workspace, rel)?;
+    refuse_symlink_target(&path, rel)?;
     if path.is_dir() {
         return Err(format!("{rel} 是目录"));
     }
@@ -1615,6 +1659,7 @@ fn edit_file(workspace: &str, rel: &str, old_text: &str, new_text: &str) -> Resu
         return Err("old_text 不能为空".into());
     }
     let path = resolve_in_workspace(workspace, rel)?;
+    refuse_symlink_target(&path, rel)?;
     let current = fs::read_to_string(&path).map_err(|e| format!("读取失败: {e}"))?;
     let n = current.matches(old_text).count();
     if n == 0 {
@@ -1892,6 +1937,82 @@ mod tests {
         assert!(resolve_in_workspace(ws, escape).is_err());
         // empty workspace: absolute candidates have no boundary → refuse
         assert!(resolve_in_workspace("", outside).is_err());
+    }
+
+    #[test]
+    fn symlink_escape_is_refused() {
+        // P0: a symlink inside the workspace must never carry a tool's
+        // write outside. Cases where the OS refuses symlink creation
+        // (Windows without privilege / developer mode) degrade to the
+        // plain-write assertion only.
+        let ws = std::env::temp_dir().join(format!("cch_sym_ws_{}", std::process::id()));
+        let out = std::env::temp_dir().join(format!("cch_sym_out_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        let _ = fs::remove_dir_all(&out);
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&out).unwrap();
+
+        // Case A: dangling link as the final component — canonicalize
+        // cannot resolve it, so the write-side symlink rejection must fire
+        // (fs::write through it would create the file at the destination).
+        let target = out.join("created_outside.txt");
+        let made_a = make_symlink(&target, &ws.join("dangling.txt"));
+        if made_a {
+            let r = execute_write(ws.to_str().unwrap(), "write_file", &serde_json::json!({
+                "path": "dangling.txt", "content": "escape"
+            }));
+            assert!(r.contains("符号链接"), "{r}");
+            assert!(!target.exists(), "悬空链接不应被写入");
+        }
+
+        // Case B: symlinked directory inside the workspace pointing at a
+        // real outside directory — the canonical ancestor check must refuse
+        // even though the lexical path (in/new.txt) looks inside.
+        fs::write(out.join("secret.txt"), "outside").unwrap();
+        let made_b = make_symlink(&out, &ws.join("in"));
+        if made_b {
+            let r = execute_write(ws.to_str().unwrap(), "write_file", &serde_json::json!({
+                "path": "in/new.txt", "content": "escape"
+            }));
+            assert!(r.contains("符号链接"), "{r}");
+            assert!(!out.join("new.txt").exists(), "目录链接不应被写入");
+        }
+
+        // normal relative writes remain unaffected
+        let ok = execute_write(ws.to_str().unwrap(), "write_file", &serde_json::json!({
+            "path": "plain.txt", "content": "inside"
+        }));
+        assert!(ok.starts_with("OK"), "{ok}");
+
+        let _ = fs::remove_dir_all(&ws);
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// create a symlink (dir- or file-shaped on Windows); false when the
+    /// platform or privilege level refuses. The result is *verified*:
+    /// sandboxed environments (filter drivers, virtualized FS) have been
+    /// observed to report success without materializing the link, which
+    /// would otherwise silently downgrade the escape test to a no-op.
+    fn make_symlink(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+                && fs::symlink_metadata(link)
+                    .map(|m| m.is_symlink())
+                    .unwrap_or(false)
+        }
+        #[cfg(windows)]
+        {
+            let made = if target.is_dir() {
+                std::os::windows::fs::symlink_dir(target, link).is_ok()
+            } else {
+                std::os::windows::fs::symlink_file(target, link).is_ok()
+            };
+            made
+                && fs::symlink_metadata(link)
+                    .map(|m| m.is_symlink())
+                    .unwrap_or(false)
+        }
     }
 
     #[test]
