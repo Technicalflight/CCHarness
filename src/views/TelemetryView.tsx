@@ -149,6 +149,20 @@ export function TelemetryView() {
               <div className="value" style={{ fontSize: 16 }}>{fmtBytes(summary.prefix_bytes)}</div>
               <div className="sub">append-only 字节</div>
             </div>
+            <div className="stat-card">
+              <div className="label">miss 重计费</div>
+              <div
+                className="value"
+                style={{ fontSize: 16, color: (summary.significant_misses ?? 0) > 0 ? "var(--warn)" : "var(--good)" }}
+              >
+                {(summary.rebilled_cost ?? 0) > 0 ? fmtUsd(summary.rebilled_cost!) : summary.rebilled_cost === null && (summary.significant_misses ?? 0) > 0 ? `${fmtTokens(summary.rebilled_tokens ?? 0)} tok` : "—"}
+              </div>
+              <div className="sub">
+                {(summary.significant_misses ?? 0) > 0
+                  ? `${summary.significant_misses} 次显著 miss 的冤枉钱`
+                  : "无显著 miss（预期重建不计入）"}
+              </div>
+            </div>
           </div>
         )}
 
@@ -229,6 +243,7 @@ export function TelemetryView() {
                   <th>命中率</th>
                   <th>输出</th>
                   <th>成本</th>
+                  <th>重计费</th>
                 </tr>
               </thead>
               <tbody>
@@ -266,6 +281,20 @@ export function TelemetryView() {
                       </td>
                       <td>{fmtTokens(r.output_tokens)}</td>
                       <td>{fmtUsd(r.cost_usd)}</td>
+                      <td
+                        title={
+                          r.significant_miss
+                            ? `显著 miss（${r.miss_cause === "client" ? "客户端改写" : "上游"}）：重计费 ≈ ${fmtTokens(r.rebilled_tokens ?? 0)} tokens`
+                            : "无显著 miss——纪元首轮（预期重建）与未上报缓存字段的请求不计入"
+                        }
+                        style={{ color: r.significant_miss ? "var(--warn)" : undefined }}
+                      >
+                        {r.significant_miss
+                          ? r.rebilled_cost != null
+                            ? fmtUsd(r.rebilled_cost)
+                            : `${fmtTokens(r.rebilled_tokens ?? 0)} tok`
+                          : "—"}
+                      </td>
                     </tr>
                   ))}
               </tbody>

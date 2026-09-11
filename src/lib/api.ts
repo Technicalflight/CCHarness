@@ -9,6 +9,7 @@ import type {
   BenchRun,
   ChatImage,
   CompactionInfo,
+  CompactEstimate,
   EnhanceOutcome,
   GoalInfo,
   GitBranch,
@@ -217,6 +218,11 @@ export async function rollbackSession(sessionId: string, fromTs: number): Promis
 
 export async function compactSession(sessionId: string): Promise<string> {
   return invoke<string>("compact_session", { sessionId });
+}
+
+/** Pre-compaction break-even estimate (rewrite premium vs per-turn saving). */
+export async function compactEstimate(sessionId: string): Promise<CompactEstimate> {
+  return invoke<CompactEstimate>("compact_estimate", { sessionId });
 }
 
 export async function getSessionCompaction(sessionId: string): Promise<CompactionInfo | null> {

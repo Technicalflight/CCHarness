@@ -30,6 +30,9 @@ export interface Provider {
   context_window: number | null;
   pricing: Record<string, Pricing>;
   behavior: Record<string, ModelBehavior>;
+  /** OpenAI extended retention: send prompt_cache_retention:"24h" (GPT-5.x/4.1).
+   *  Off by default — strict gateways reject the unknown argument. */
+  cache_retention_24h?: boolean;
 }
 
 export interface AppSettings {
@@ -337,7 +340,7 @@ export type MessageStatus = "ok" | "stopped" | "error";
 export interface MessageRecord {
   id: string;
   lane: number;
-  role: "system" | "user" | "assistant" | "tool";
+  role: "system" | "user" | "assistant" | "tool" | "notice";
   content: string;
   reasoning: string | null;
   ts: number;
@@ -386,6 +389,12 @@ export interface RequestStat {
   cached_tokens: number | null;
   output_tokens: number | null;
   cost_usd: number | null;
+  /** Significant-miss analysis (pi-runtime parity). */
+  significant_miss?: boolean;
+  rebilled_tokens?: number;
+  rebilled_cost?: number | null;
+  /** "upstream" | "client" | "expected" */
+  miss_cause?: string | null;
 }
 
 export interface TelemetrySummary {
@@ -398,6 +407,20 @@ export interface TelemetrySummary {
   total_cost: number;
   current_epoch: number;
   prefix_bytes: number;
+  /** Cumulative re-billed tokens from significant (unexpected) misses. */
+  rebilled_tokens?: number;
+  /** Their cost at the uncached-minus-cached spread (null = no pricing). */
+  rebilled_cost?: number | null;
+  significant_misses?: number;
+}
+
+/** Pre-compaction break-even estimate (pi pruning economics). */
+export interface CompactEstimate {
+  folded_tokens: number;
+  summary_tokens: number;
+  rewrite_cost_usd: number | null;
+  save_per_turn_usd: number | null;
+  payback_turns: number | null;
 }
 
 export interface SessionTelemetry {

@@ -177,6 +177,23 @@ function ProviderCard({ provider: p }: { provider: Provider }) {
           </span>
         </div>
 
+        {draft.kind === "openai_compatible" && (
+          <div className="row" style={{ marginBottom: 10 }}>
+            <span className="row" style={{ gap: 6 }}>
+              <button
+                className={`switch ${draft.cache_retention_24h ? "on" : ""}`}
+                role="switch"
+                aria-checked={!!draft.cache_retention_24h}
+                onClick={() => setDraft({ ...draft, cache_retention_24h: !draft.cache_retention_24h })}
+              />
+              <span style={{ fontSize: 12.5, color: "var(--text-dim)" }}>OpenAI 24h 长缓存保留</span>
+            </span>
+            <span className="hint" style={{ fontSize: 11 }}>
+              （请求携带 prompt_cache_retention:"24h"——仅 OpenAI 官方 GPT-5.x / 4.1 等支持；严格兼容网关会拒绝该参数，保持关闭）
+            </span>
+          </div>
+        )}
+
         <div className="row" style={{ marginBottom: 12 }}>
           <button className="btn small" disabled={testing || !draft.base_url} onClick={test}>
             {testing ? "测试中…" : "测试连接"}

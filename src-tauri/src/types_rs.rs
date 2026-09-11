@@ -223,6 +223,17 @@ pub struct RequestStat {
     pub output_tokens: Option<u64>,
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// Significant-miss analysis (pi-runtime parity): the stable prefix was
+    /// re-billed at full price beyond the legitimate new tail.
+    #[serde(default)]
+    pub significant_miss: bool,
+    #[serde(default)]
+    pub rebilled_tokens: u64,
+    #[serde(default)]
+    pub rebilled_cost: Option<f64>,
+    /// "upstream" | "client" | "expected" (see chat::analyze_cache_miss).
+    #[serde(default)]
+    pub miss_cause: Option<String>,
 }
 
 fn default_true_fn() -> bool {
@@ -240,6 +251,33 @@ pub struct TelemetrySummary {
     pub total_cost: f64,
     pub current_epoch: u32,
     pub prefix_bytes: usize,
+    /// Cumulative tokens re-billed by significant misses (unexpected ones).
+    #[serde(default)]
+    pub rebilled_tokens: u64,
+    /// Their cost at the uncached-minus-cached price spread (None = model
+    /// has no pricing configured; UI then shows tokens only).
+    #[serde(default)]
+    pub rebilled_cost: Option<f64>,
+    #[serde(default)]
+    pub significant_misses: u64,
+}
+
+/// Pre-compaction break-even estimate (pi pruning economics): rewriting the
+/// transcript costs the compacted summary at full input price, while every
+/// subsequent turn saves the folded tokens' cache-read price.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactEstimate {
+    /// Approximate tokens folded into the summary.
+    pub folded_tokens: u64,
+    /// Approximate tokens of the summary that replaces them.
+    pub summary_tokens: u64,
+    /// One-time rewrite cost of the new prefix (None = no pricing config).
+    pub rewrite_cost_usd: Option<f64>,
+    /// Per-turn saving once the folded tokens stop being re-read.
+    pub save_per_turn_usd: Option<f64>,
+    /// Turns needed to amortize the rewrite (None when no pricing config
+    /// or savings are zero).
+    pub payback_turns: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

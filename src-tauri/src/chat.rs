@@ -80,6 +80,11 @@ pub struct SendCtx<'a> {
     pub stop: Arc<AtomicBool>,
     /// Present only for delegated sub-agents (None in main/arena lanes).
     pub progress_tap: Option<ProgressTap>,
+    /// `x-session-affinity` header value (the lane's stable cache key) —
+    /// sent on OpenAI-compatible requests only. Providers like Fireworks use
+    /// it to route follow-ups back to the replica holding the KV cache;
+    /// every other gateway simply ignores the unknown header.
+    pub affinity: Option<String>,
 }
 
 impl SendCtx<'_> {
@@ -126,6 +131,7 @@ pub async fn stream_lane(
         .post(&endpoint_chat(ctx.provider))
         .header("Content-Type", "application/json")
         .headers(auth.headers())
+        .headers(affinity_headers(ctx))
         .body(body)
         .send()
         .await;
@@ -240,6 +246,83 @@ pub async fn stream_lane(
 
 fn find_frame_end(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2)
+}
+
+/// `x-session-affinity` header for OpenAI-compatible endpoints (pi-runtime
+/// parity): providers with replica-level KV caches (Fireworks, …) route
+/// requests carrying the same affinity value back to the same worker, which
+/// is what makes follow-up turns hit the prefix cache. Unknown headers are
+/// ignored by every other gateway, so sending it is always safe.
+fn affinity_headers(ctx: &SendCtx<'_>) -> reqwest::header::HeaderMap {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let mut hm = HeaderMap::new();
+    if !matches!(ctx.provider.kind, ProviderKind::Anthropic) {
+        if let Some(key) = &ctx.affinity {
+            if let Ok(v) = HeaderValue::from_str(key) {
+                hm.insert(HeaderName::from_static("x-session-affinity"), v);
+            }
+        }
+    }
+    hm
+}
+
+/// Outcome of the significant-miss analysis for one request (pi-runtime
+/// parity: turns provider-reported usage into "how much did this miss
+/// actually cost me").
+#[derive(Debug, Clone)]
+pub struct MissAnalysis {
+    /// The stable prefix should have hit but was re-billed at full price.
+    pub significant: bool,
+    /// Tokens billed at the uncached input rate beyond the expected new tail.
+    pub rebilled_tokens: u64,
+    /// Why: "upstream" (idle TTL / eviction / routing), "client" (local
+    /// prefix rewrite — chain broken), "expected" (new epoch / first request).
+    pub cause: &'static str,
+}
+
+/// Heuristic significant-miss detector, pi `cache-stats` style but exploiting
+/// CCHarness's exact byte accounting: the request legitimately re-bills only
+/// its new tail (`added_bytes`, ≈4 bytes/token mixed-script); everything
+/// beyond that was supposed to be a cache read. Requires the provider to
+/// report cached tokens at all — without the field there is nothing to analyze.
+pub fn analyze_cache_miss(
+    input_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    added_bytes: usize,
+    chain_ok: bool,
+    epoch_bumped: bool,
+) -> MissAnalysis {
+    let cause = if !chain_ok {
+        "client"
+    } else if epoch_bumped {
+        "expected"
+    } else {
+        "upstream"
+    };
+    let (input, cached) = match (input_tokens, cached_tokens) {
+        (Some(i), Some(c)) => (i, c),
+        _ => return MissAnalysis { significant: false, rebilled_tokens: 0, cause },
+    };
+    let uncached = input.saturating_sub(cached);
+    let expected_new = (added_bytes as u64) / 4; // mixed-script token estimate
+    // Significant: the re-billed portion dwarfs the legitimate new material
+    // (2×) AND is large in absolute terms — tiny prompts below OpenAI's
+    // 1024-token cache floor are noise, not misses.
+    let rebilled = uncached.saturating_sub(expected_new);
+    let significant = cause != "expected" && uncached >= 10_000 && uncached > expected_new.saturating_mul(2);
+    MissAnalysis { significant, rebilled_tokens: if significant { rebilled } else { 0 }, cause }
+}
+
+/// Cost of the re-billed tokens at the uncached-minus-cached spread (the
+/// money a miss wastes compared to the hit it should have been). None when
+/// the model has no pricing configured — callers then show tokens only.
+pub fn rebill_cost(rebilled_tokens: u64, p: &Provider, model: &str) -> Option<f64> {
+    let pr = p.pricing.get(model)?;
+    let spread = pr.input_per_m - pr.cached_per_m;
+    if spread <= 0.0 {
+        return None;
+    }
+    Some((rebilled_tokens as f64 / 1e6 * spread * 10000.0).round() / 10000.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -757,7 +840,9 @@ pub fn transcript_for_lane(
     let mut msgs: Vec<&MessageRecord> = sf
         .messages
         .iter()
-        .filter(|m| m.role == "user" || m.lane == lane)
+        // role="notice" records are user-facing cache warnings — display
+        // only, never model context (they must not perturb Zone H bytes)
+        .filter(|m| m.role == "user" || (m.lane == lane && m.role != "notice"))
         .filter(|m| m.status != "error")
         .collect();
     msgs.sort_by_key(|m| m.ts);

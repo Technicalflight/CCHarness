@@ -158,6 +158,13 @@ pub struct LanePrefix {
     /// means the rebuilt transcript bytes differ ⇒ caller rebuilds (and the
     /// rebuild bumps the epoch).
     pub privacy: bool,
+    /// OpenAI long cache retention (`prompt_cache_retention:"24h"`) — rides
+    /// in the byte-stable head; a toggle changes head bytes ⇒ epoch bump.
+    retention_long: bool,
+    /// Hash of the tool-schema loadout sent in the head. A loadout change
+    /// (MCP server added/removed mid-session) silently rewrites the head —
+    /// tracking it keeps the epoch honest about that rebuild.
+    tools_hash: Option<u64>,
 }
 
 impl LanePrefix {
@@ -175,6 +182,8 @@ impl LanePrefix {
             temperature: None,
             max_output: None,
             privacy: false,
+            retention_long: false,
+            tools_hash: None,
         };
         if !system_prompt.is_empty() {
             let sys = message_json(&ChatMessage::plain("system", system_prompt));
@@ -273,6 +282,32 @@ impl LanePrefix {
         self.max_output = max_output;
     }
 
+    /// Rebind OpenAI long cache retention. The flag rides in the byte-stable
+    /// head, so toggling it changes head bytes ⇒ epoch bump (same discipline
+    /// as bind_behavior). Off-by-default; the field is omitted from the
+    /// request unless the provider opts in.
+    pub fn bind_retention(&mut self, long: bool) {
+        if self.retention_long == long {
+            return;
+        }
+        self.epoch += 1;
+        self.retention_long = long;
+    }
+
+    /// Rebind the tool-schema loadout hash. MCP servers joining/leaving
+    /// mid-session rewrite the head bytes (tools serialize before messages)
+    /// without touching Zone H — tracking the hash keeps the epoch honest
+    /// about that rebuild instead of misattributing it to the upstream.
+    pub fn bind_tools_hash(&mut self, hash: Option<u64>) {
+        if self.tools_hash == hash {
+            return;
+        }
+        if self.tools_hash.is_some() || hash.is_some() {
+            self.epoch += 1;
+        }
+        self.tools_hash = hash;
+    }
+
     /// Whether Zone S already carries exactly this system text. A mismatch
     /// means settings/workspace/AGENTS.md changed ⇒ caller rebuilds (epoch+1).
     pub fn system_is(&self, system_prompt: &str) -> bool {
@@ -311,6 +346,12 @@ impl LanePrefix {
         if !self.cache_key.is_empty() {
             body.push_str(",\"prompt_cache_key\":");
             body.push_str(&serde_json::to_string(&self.cache_key).expect("cache key str"));
+        }
+        // OpenAI extended retention (opt-in per provider): keeps cached
+        // prefixes active for up to 24h instead of the ~5-10min in-memory
+        // default. Supported by GPT-5.x/4.1; must stay in the byte-stable head.
+        if self.retention_long {
+            body.push_str(",\"prompt_cache_retention\":\"24h\"");
         }
         body.push_str(",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
         // per-model sampling params ride in the byte-stable head too; the
@@ -581,6 +622,41 @@ mod tests {
         // absent → absent: no-op
         lp.bind_behavior(None, None);
         assert_eq!(lp.epoch, 3);
+    }
+
+    #[test]
+    fn retention_and_tools_bind_with_epoch_discipline() {
+        let mut lp = sys();
+        lp.bind_model("m1");
+        // retention off by default; the field is absent from the head
+        let body = lp.build_openai_body_multi("m1", &[ChatMessage::plain("user", "hi")], None);
+        assert!(!body.contains("prompt_cache_retention"), "{body}");
+        // off → on: epoch bump + field lands in the head before messages
+        lp.bind_retention(true);
+        assert_eq!(lp.epoch, 1);
+        let body = lp.build_openai_body_multi("m1", &[ChatMessage::plain("user", "hi")], None);
+        assert!(body.contains("\"prompt_cache_retention\":\"24h\""), "{body}");
+        let ret_at = body.find("\"prompt_cache_retention\"").unwrap();
+        let msgs_at = body.find("\"messages\":").unwrap();
+        assert!(ret_at < msgs_at, "retention must ride the byte-stable head");
+        // same value: no bump
+        lp.bind_retention(true);
+        assert_eq!(lp.epoch, 1);
+        // on → off: bump again, field gone
+        lp.bind_retention(false);
+        assert_eq!(lp.epoch, 2);
+        let body = lp.build_openai_body_multi("m1", &[ChatMessage::plain("user", "hi")], None);
+        assert!(!body.contains("prompt_cache_retention"), "{body}");
+
+        // tools loadout: None → Some is an expected rebuild
+        lp.bind_tools_hash(None);
+        assert_eq!(lp.epoch, 2, "no bump while no tools were ever bound");
+        lp.bind_tools_hash(Some(0xDEAD));
+        assert_eq!(lp.epoch, 3);
+        lp.bind_tools_hash(Some(0xDEAD));
+        assert_eq!(lp.epoch, 3, "same loadout must not bump epoch");
+        lp.bind_tools_hash(Some(0xBEEF));
+        assert_eq!(lp.epoch, 4, "loadout change (MCP join/leave) bumps epoch");
     }
 
     #[test]

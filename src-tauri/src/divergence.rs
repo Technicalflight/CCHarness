@@ -128,6 +128,10 @@ mod tests {
             cached_tokens: cached,
             output_tokens: Some(10),
             cost_usd: None,
+            significant_miss: false,
+            rebilled_tokens: 0,
+            rebilled_cost: None,
+            miss_cause: None,
         }
     }
 

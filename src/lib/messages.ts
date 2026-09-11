@@ -4,9 +4,10 @@
 import type { MessageRecord, UsageStat } from "../types";
 
 export interface TranscriptItem {
-  kind: "user" | "assistantGroup";
+  kind: "user" | "assistantGroup" | "notice";
   user?: MessageRecord;
   group?: MessageRecord[]; // ts-ordered assistant + tool records of one turn
+  notice?: MessageRecord; // display-only cache-miss warning (never model context)
 }
 
 export function groupTranscript(msgs: MessageRecord[]): TranscriptItem[] {
@@ -17,6 +18,9 @@ export function groupTranscript(msgs: MessageRecord[]): TranscriptItem[] {
     if (m.role === "user") {
       cur = null;
       items.push({ kind: "user", user: m });
+    } else if (m.role === "notice") {
+      cur = null;
+      items.push({ kind: "notice", notice: m });
     } else if (m.role === "assistant" || m.role === "tool") {
       if (!cur) {
         cur = [];

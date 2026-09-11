@@ -970,6 +970,7 @@ pub fn ccswitch_import(state: State<'_, AppState>) -> Result<Vec<Provider>, Stri
             context_window: None,
             pricing: std::collections::BTreeMap::new(),
             behavior: std::collections::BTreeMap::new(),
+            cache_retention_24h: false,
         });
     }
 
@@ -1286,6 +1287,10 @@ pub fn get_telemetry(state: State<'_, AppState>, session_id: String) -> Result<S
     let mut total_cost = 0f64;
     let mut hit_rates: Vec<f64> = Vec::new();
     let mut steady_rates: Vec<f64> = Vec::new();
+    let mut rebilled_tokens = 0u64;
+    let mut significant_misses = 0u64;
+    let mut rebilled_cost = 0f64;
+    let mut has_rebilled_cost = false;
     let mut prev_epoch: Option<u32> = None;
 
     for r in &requests {
@@ -1309,6 +1314,14 @@ pub fn get_telemetry(state: State<'_, AppState>, session_id: String) -> Result<S
         }
         total_output += r.output_tokens.unwrap_or(0);
         total_cost += r.cost_usd.unwrap_or(0.0);
+        if r.significant_miss {
+            significant_misses += 1;
+            rebilled_tokens += r.rebilled_tokens;
+            if let Some(c) = r.rebilled_cost {
+                rebilled_cost += c;
+                has_rebilled_cost = true;
+            }
+        }
     }
 
     let avg = |v: &[f64]| if v.is_empty() { None } else { Some(v.iter().sum::<f64>() / v.len() as f64) };
@@ -1330,6 +1343,13 @@ pub fn get_telemetry(state: State<'_, AppState>, session_id: String) -> Result<S
             total_cost: (total_cost * 10000.0).round() / 10000.0,
             current_epoch,
             prefix_bytes,
+            rebilled_tokens,
+            rebilled_cost: if has_rebilled_cost {
+                Some((rebilled_cost * 10000.0).round() / 10000.0)
+            } else {
+                None
+            },
+            significant_misses,
         },
     })
 }
@@ -1478,6 +1498,18 @@ fn summarize_input(sf: &crate::sessions::SessionFile) -> String {
     text
 }
 
+/// Stable hash of the tool-schema loadout sent in the request head. Fed to
+/// LanePrefix::bind_tools_hash so MCP join/leave mid-session is honest about
+/// the epoch rebuild it causes (tools serialize before messages).
+fn tools_hash(tools: Option<&Value>) -> Option<u64> {
+    tools.map(|t| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        t.to_string().hash(&mut h);
+        h.finish()
+    })
+}
+
 /// Run boundary compaction for a chat session: summarize everything up to
 /// now, persist the record, invalidate the lane prefix (next request
 /// rebuilds from the compacted transcript — an expected epoch bump).
@@ -1541,6 +1573,64 @@ pub fn get_session_compaction(
     session_id: String,
 ) -> Result<Option<crate::types_rs::CompactionRecord>, String> {
     Ok(state.store.load(&session_id)?.compaction)
+}
+
+/// Pre-compaction break-even estimate (pi pruning economics): the summary
+/// re-bills at the full input price once (the cache-write premium), while
+/// every later turn saves re-reading the folded tokens from cache. Sync —
+/// no model call, numbers come from byte counts + configured pricing.
+#[tauri::command]
+pub fn compact_estimate(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<crate::types_rs::CompactEstimate, String> {
+    let cfg = config::load(&state.data_dir);
+    let sf = state.store.load(&session_id)?;
+    if sf.meta.kind != "chat" {
+        return Err("竞技场会话暂不支持压缩".into());
+    }
+    let binding = sf.meta.bindings.first().cloned().ok_or("会话未绑定模型")?;
+    let provider = resolve_provider(&cfg, &binding).cloned().ok_or("Provider 未配置")?;
+    let model = binding.model.clone();
+
+    // folded = what compaction replaces: every record that would go over the
+    // wire now (content bytes + per-message overhead, same units as the tail
+    // estimator in chat.rs; ÷4 = mixed-script token approximation)
+    let folded_bytes: usize = sf
+        .messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant" || m.role == "tool")
+        .map(|m| m.content.len() + 96)
+        .sum();
+    let folded_tokens = (folded_bytes as u64) / 4;
+    let summary_tokens: u64 = 800; // 600-char summary cap ≈ 600–900 CJK tokens
+
+    let pricing = provider.pricing.get(&model);
+    let (rewrite_cost_usd, save_per_turn_usd, payback_turns) = match pricing {
+        Some(pr) => {
+            let spread = (pr.input_per_m - pr.cached_per_m).max(0.0);
+            let rewrite = summary_tokens as f64 / 1e6 * spread;
+            let save = folded_tokens as f64 / 1e6 * pr.cached_per_m;
+            let payback = if save > 0.0 && rewrite > 0.0 {
+                Some((rewrite / save).ceil() as u64)
+            } else {
+                None
+            };
+            (
+                Some((rewrite * 10000.0).round() / 10000.0),
+                Some((save * 10000.0).round() / 10000.0),
+                payback,
+            )
+        }
+        None => (None, None, None),
+    };
+    Ok(crate::types_rs::CompactEstimate {
+        folded_tokens,
+        summary_tokens,
+        rewrite_cost_usd,
+        save_per_turn_usd,
+        payback_turns,
+    })
 }
 
 // ---------- Skills ----------
@@ -2177,6 +2267,10 @@ async fn run_subagent(
         // sub agents honor the same per-model sampling params (epoch-gated)
         let beh = provider.behavior.get(&model);
         lp.bind_behavior(beh.and_then(|b| b.temperature), beh.and_then(|b| b.max_output));
+        // head-byte discipline: retention toggle and MCP loadout changes are
+        // expected rebuilds and must move the epoch, not fake an upstream miss
+        lp.bind_retention(provider.cache_retention_24h);
+        lp.bind_tools_hash(tools_hash(Some(&tools)));
         lp.clone()
     };
 
@@ -2199,6 +2293,7 @@ async fn run_subagent(
             channel: channel.clone(),
             stop: stop.clone(),
             progress_tap: Some(tap.clone()),
+            affinity: Some(cache_key.clone()),
         };
         let outcome = match chat::stream_lane(&ctx, body, chat::auth_for(&provider)).await {
             Ok(o) => o,
@@ -2219,6 +2314,10 @@ async fn run_subagent(
             cached_tokens: usage.cached,
             output_tokens: usage.output,
             cost_usd: cost,
+            significant_miss: false,
+            rebilled_tokens: 0,
+            rebilled_cost: None,
+            miss_cause: None,
         };
         let has_tools = !outcome.tool_calls.is_empty();
         let tool_wire: Option<Vec<crate::types_rs::ToolCallWire>> = if has_tools {
@@ -2948,6 +3047,8 @@ async fn run_send(
                     channel: channel.clone(),
                     stop: stop.clone(),
                     progress_tap: None,
+                    // image generation has no prefix cache — no affinity
+                    affinity: None,
                 };
                 let outcome = match chat::image_generate(&ctx, &prompt).await {
                     Ok(o) => o,
@@ -3018,6 +3119,12 @@ async fn run_send(
                         Some(cfg.settings.thinking_level.as_str())
                     });
                 lp.bind_thinking(reasoning);
+                // head-byte discipline: retention toggle and MCP loadout
+                // changes rewrite the head without touching Zone H — they
+                // must bump the epoch (expected rebuild) rather than masquer
+                // -ade as an upstream cache miss in telemetry
+                lp.bind_retention(provider.cache_retention_24h);
+                lp.bind_tools_hash(tools_hash(tools_schema.as_ref()));
                 // system change (settings/workspace/AGENTS.md) or privacy-mode
                 // toggle or restart recovery ⇒ rebuild Zone H from the
                 // persisted transcript (re-scrubbed under the new flag)
@@ -3161,6 +3268,7 @@ async fn run_send(
                     channel: channel.clone(),
                     stop: stop.clone(),
                     progress_tap: None,
+                    affinity: Some(cache_key.clone()),
                 };
                 let outcome = match chat::stream_lane(&ctx, body, chat::auth_for(&provider)).await {
                     Ok(o) => o,
@@ -3171,10 +3279,13 @@ async fn run_send(
                     }
                 };
 
-                // per-round telemetry
+                // per-round telemetry + significant-miss analysis (pi-runtime
+                // parity): the request legitimately re-bills only its new
+                // tail (added_bytes); everything beyond that was supposed to
+                // be a cache read. Needs the provider to report cached tokens.
                 let usage = outcome.usage.clone();
                 let cost = chat::cost_of(&usage, &provider, &model);
-                let stat = RequestStat {
+                let mut stat = RequestStat {
                     seq: SEQ.fetch_add(1, Ordering::Relaxed),
                     ts: now_ms(),
                     lane,
@@ -3187,7 +3298,23 @@ async fn run_send(
                     cached_tokens: usage.cached,
                     output_tokens: usage.output,
                     cost_usd: cost,
+                    significant_miss: false,
+                    rebilled_tokens: 0,
+                    rebilled_cost: None,
+                    miss_cause: None,
                 };
+                let epoch_bumped = store
+                    .load(&session_id)
+                    .ok()
+                    .and_then(|sf| sf.telemetry.iter().rev().find(|r| r.lane == lane).map(|r| r.epoch != owned_prefix.epoch))
+                    .unwrap_or(false);
+                let miss = chat::analyze_cache_miss(usage.input, usage.cached, added_bytes, chain_ok, epoch_bumped);
+                stat.miss_cause = Some(miss.cause.to_string());
+                if miss.significant {
+                    stat.significant_miss = true;
+                    stat.rebilled_tokens = miss.rebilled_tokens;
+                    stat.rebilled_cost = chat::rebill_cost(miss.rebilled_tokens, &provider, &model);
+                }
                 let _ = channel.send(StreamEvent::Usage {
                     lane,
                     message_id: message_id.clone(),
@@ -3297,6 +3424,45 @@ async fn run_send(
                     let _guard = save_lock.lock().await;
                     if let Ok(mut sf) = store.load(&session_id) {
                         sf.messages.push(record);
+                        // significant-miss notice: a user-facing record that
+                        // transcript_for_lane excludes from model context —
+                        // the model never sees it, so Zone H stays stable
+                        if stat.significant_miss && sf.meta.kind == "chat" {
+                            let cost_part = stat
+                                .rebilled_cost
+                                .map(|c| format!("，冤枉钱 ≈ ${:.4}", c))
+                                .unwrap_or_default();
+                            let hint = if stat.miss_cause.as_deref() == Some("client") {
+                                "本地前缀链断裂——有组件改写了历史请求字节，请检查本轮的模式/上下文变更。"
+                            } else {
+                                "可能原因：闲置超过缓存 TTL（命中会续期）、上游逐出或网关路由变化。持续对话命中率会回升。"
+                            };
+                            sf.messages.push(MessageRecord {
+                                id: Uuid::new_v4().to_string(),
+                                lane,
+                                role: "notice".into(),
+                                content: format!(
+                                    "缓存显著未命中：本轮输入 {} tokens 仅命中 {}，重计费 ≈ {} tokens{}。{}",
+                                    stat.input_tokens.unwrap_or(0),
+                                    stat.cached_tokens.unwrap_or(0),
+                                    stat.rebilled_tokens,
+                                    cost_part,
+                                    hint
+                                ),
+                                reasoning: None,
+                                ts: next_record_ts(),
+                                model: None,
+                                status: "ok".into(),
+                                usage: None,
+                                cost_usd: None,
+                                confidence: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                                skill_calls: None,
+                                workflow: None,
+                                images: Vec::new(),
+                            });
+                        }
                         sf.telemetry.push(stat);
                         sf.meta.updated_at = now_ms();
                         let _ = store.save(&sf);

@@ -61,6 +61,13 @@ pub struct Provider {
     /// Per-model behavior overrides, keyed by model name (like `pricing`).
     #[serde(default)]
     pub behavior: std::collections::BTreeMap<String, ModelBehavior>,
+    /// OpenAI extended prompt-cache retention: send
+    /// `prompt_cache_retention:"24h"` on chat completions (supported by
+    /// GPT-5.x / 4.1 families). Off by default — strict OpenAI-compatible
+    /// gateways reject the unknown argument, so only enable for endpoints
+    /// known to accept it.
+    #[serde(default)]
+    pub cache_retention_24h: bool,
 }
 
 fn default_true() -> bool {
@@ -440,6 +447,7 @@ impl Default for AppConfig {
                 context_window: None,
                 pricing: std::collections::BTreeMap::new(),
                 behavior: std::collections::BTreeMap::new(),
+                cache_retention_24h: false,
             }],
             mcp_servers: Vec::new(),
             subagents: Vec::new(),

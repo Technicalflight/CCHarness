@@ -19,7 +19,7 @@ import {
   aggregateStatus,
 } from "../lib/messages";
 import * as api from "../lib/api";
-import type { ChatImage, CompactionInfo, GoalInfo, MessageRecord, SessionBinding, TelemetrySummary, WtInfo } from "../types";
+import type { ChatImage, CompactEstimate, CompactionInfo, GoalInfo, MessageRecord, SessionBinding, TelemetrySummary, WtInfo } from "../types";
 
 /** Last path segment, for workspace chips. */
 const baseName = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
@@ -570,6 +570,7 @@ export function ChatView() {
   const [editingMsg, setEditingMsg] = useState<string | null>(null);
   const [compaction, setCompaction] = useState<CompactionInfo | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [compactEst, setCompactEst] = useState<CompactEstimate | null>(null);
   const [wfMode, setWfMode] = useState("agent");
   // welcome-hero: the real Composer (full feature parity with the chat page).
   // The user can pre-pick a model; Enter creates the session, then sends.
@@ -1205,6 +1206,17 @@ export function ChatView() {
 
   const doCompact = async () => {
     try {
+      // cost-engineering gate (pi pruning economics): show the rewrite
+      // premium vs the per-turn cache-read saving before doing anything
+      setCompactEst(await api.compactEstimate(meta.id));
+    } catch (e) {
+      toast("error", String(e));
+    }
+  };
+
+  const runCompact = async () => {
+    setCompactEst(null);
+    try {
       const msg = await api.compactSession(meta.id);
       toast("success", `上下文${msg} —— 可见记录未变，下一条请求从摘要重建（遥测可见新纪元）`);
       setCompaction(await api.getSessionCompaction(meta.id));
@@ -1403,6 +1415,23 @@ export function ChatView() {
               const prevTs = prev.kind === "user" ? prev.user!.ts : (prev.group![0]?.ts ?? 0);
               return prevTs < compaction.upto_ts;
             })());
+            if (item.kind === "notice") {
+              const n = item.notice!;
+              return (
+                <div
+                  key={`n-${n.id}`}
+                  className="compact-divider"
+                  style={{ color: "var(--warn)" }}
+                  title="缓存遥测提示 —— 该记录仅用于展示，永远不会进入模型上下文"
+                >
+                  <span className="md-line" />
+                  <span className="md-label">
+                    <Icon name="diamond" size={12} /> {n.content}
+                  </span>
+                  <span className="md-line" />
+                </div>
+              );
+            }
             if (item.kind === "user") {
               const u = item.user!;
               // divider ABOVE this user message when the reply that follows
@@ -1799,6 +1828,21 @@ export function ChatView() {
               toast("error", String(e));
             }
           }}
+        />
+      )}
+      {compactEst && (
+        <ConfirmDialog
+          title="压缩前成本估算"
+          description={
+            `将折叠 ≈${fmtTokens(compactEst.folded_tokens)} tokens 为 ≈${compactEst.summary_tokens} tokens 的摘要；` +
+            (compactEst.rewrite_cost_usd != null && compactEst.save_per_turn_usd != null
+              ? `一次性重写成本 ≈ ${fmtUsd(compactEst.rewrite_cost_usd)}（新前缀全价写入），此后每轮节省 ≈ ${fmtUsd(compactEst.save_per_turn_usd)}（被折叠部分不再按缓存价重读）` +
+                (compactEst.payback_turns != null ? `，约 ${compactEst.payback_turns} 轮回本。` : "。")
+              : "未配置该模型定价，无法折算金额——配置定价后此处会给出成本收益。")
+          }
+          confirmText="确认压缩"
+          onCancel={() => setCompactEst(null)}
+          onConfirm={() => void runCompact()}
         />
       )}
       {wtDiffOpen && (

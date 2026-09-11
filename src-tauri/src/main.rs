@@ -163,6 +163,7 @@ fn main() {
             commands::rollback_session,
             commands::compact_session,
             commands::get_session_compaction,
+            commands::compact_estimate,
             commands::get_todos,
             commands::mcp_status,
             commands::mcp_test,
