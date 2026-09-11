@@ -974,6 +974,7 @@ pub fn ccswitch_import(state: State<'_, AppState>) -> Result<Vec<Provider>, Stri
             behavior: std::collections::BTreeMap::new(),
             cache_tier: None,
             cache_retention_24h: None,
+            images_via_files: false,
         });
     }
 
@@ -3237,7 +3238,7 @@ async fn run_send(
                 return;
             }
 
-            let owned_prefix = {
+            let (owned_prefix, system_injection) = {
                 let mut guard = prefixes_lock();
                 let map = guard.get_or_insert_with(HashMap::new);
                 let key = (session_id.clone(), lane);
@@ -3266,9 +3267,30 @@ async fn run_send(
                 lp.bind_tools_hash(tools_hash(tools_schema.as_ref()));
                 // system change (settings/workspace/AGENTS.md) or privacy-mode
                 // toggle or restart recovery ⇒ rebuild Zone H from the
-                // persisted transcript (re-scrubbed under the new flag)
+                // persisted transcript (re-scrubbed under the new flag) —
+                // UNLESS in-history updates are on: then a system change
+                // rides as an injected system message (below) and the head
+                // keeps its cache identity
                 let privacy_changed = lp.bind_privacy(privacy_on);
-                let needs_rebuild = privacy_changed || !lp.system_is(&system_full) || lp_is_empty(lp);
+                let system_changed = !lp.system_is(&system_full);
+                let in_history_ok = cfg.settings.system_update_mode == "in-history"
+                    && provider.kind == crate::config::ProviderKind::OpenaiCompatible
+                    && !privacy_on;
+                let needs_rebuild = privacy_changed
+                    || lp_is_empty(lp)
+                    || (system_changed && !in_history_ok);
+                // adopt only when NOT rebuilding: a fresh/rebuilt prefix
+                // carries the current system text in Zone S already —
+                // injecting it again would duplicate the prompt in the
+                // same request (and then in Zone H at turn end)
+                let mut system_injection: Option<String> = None;
+                if !needs_rebuild
+                    && system_changed
+                    && in_history_ok
+                    && lp.adopt_system_in_history(&system_full)
+                {
+                    system_injection = Some(system_full.clone());
+                }
                 if needs_rebuild {
                     let mut hist = chat::transcript_for_lane(&sf_snapshot, lane, &cfg.workflows, &data_dir);
                     scrub_outbound(&mut hist);
@@ -3276,7 +3298,7 @@ async fn run_send(
                         lp.rebuild(&system_full, &hist[..hist.len() - 1]);
                     }
                 }
-                lp.clone()
+                (lp.clone(), system_injection)
             };
 
             let mut transcript = chat::transcript_for_lane(&sf_snapshot, lane, &cfg.workflows, &data_dir);
@@ -3289,6 +3311,32 @@ async fn run_send(
             // Everything sent beyond Zone H this turn, in order. The next
             // request replays it verbatim; at turn end it falls into Zone H.
             let mut sent_this_turn: Vec<ChatMessage> = vec![transcript.last().unwrap().clone()];
+            // in-history system update: the new system text rides ahead of
+            // the user turn. The message is NOT persisted — restarts rebuild
+            // Zone S from the current settings instead — and it falls into
+            // Zone H at turn end via the append below, keeping the head
+            // byte-stable for the whole run.
+            if let Some(sys) = &system_injection {
+                sent_this_turn.insert(0, ChatMessage::plain("system", sys.clone()));
+            }
+            // Files API image reuse (opt-in per provider): resolve every
+            // attached image to a server-side file id once, then reference
+            // it by id — the base64 payload never re-enters the request.
+            // Upload failures fall back to inline data URIs.
+            if provider.images_via_files
+                && provider.kind == crate::config::ProviderKind::OpenaiCompatible
+                && sent_this_turn.iter().any(|m| !m.images.is_empty())
+            {
+                crate::deepfiles::ensure_file_refs(
+                    &client,
+                    &data_dir,
+                    &provider.id,
+                    &provider.base_url,
+                    &provider.api_key,
+                    &mut sent_this_turn,
+                )
+                .await;
+            }
             let mut last_confidence: Option<u32> = None;
             // The assistant bubble is created BEFORE the slow pre-stream
             // phases below (memory recall / deep rehearsal / review experts)
@@ -3326,9 +3374,12 @@ async fn run_send(
             // suffixed message falls into Zone H — restarts simply rebuild a
             // new epoch without the garnish.
             if cfg.settings.vector_memory && !cfg.settings.embeddings_url.trim().is_empty() {
+                // find the user message by role: with an in-history system
+                // injection, sent_this_turn[0] may be the injected system
+                // message instead
                 let user_text = sent_this_turn
-                    .first()
-                    .filter(|m| m.role == "user")
+                    .iter()
+                    .find(|m| m.role == "user")
                     .map(|m| m.content.clone())
                     .unwrap_or_default();
                 let ws = sf_snapshot.meta.workspace.clone().unwrap_or_default();
@@ -3353,8 +3404,8 @@ async fn run_send(
                                     "\n\n[长期记忆参考 — 与本条消息语义相关的既往记忆]\n{}",
                                     mems.iter().map(|m| format!("- {m}")).collect::<Vec<_>>().join("\n")
                                 );
-                                if let Some(first) = sent_this_turn.first_mut() {
-                                    first.content.push_str(&block);
+                                if let Some(user_msg) = sent_this_turn.iter_mut().find(|m| m.role == "user") {
+                                    user_msg.content.push_str(&block);
                                 }
                             }
                         }
@@ -3370,7 +3421,11 @@ async fn run_send(
             // a new epoch without it). Any rehearsal failure just proceeds
             // without it.
             if deep_mode && !sent_this_turn.is_empty() {
-                let task_text = sent_this_turn[0].content.clone();
+                let task_text = sent_this_turn
+                    .iter()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
                 let _ = channel.send(StreamEvent::Reasoning {
                     lane,
                     message_id: first_message_id.clone(),
@@ -3383,8 +3438,8 @@ async fn run_send(
                     }
                     block = run_tot_rehearsal(&client, &provider, &model, &task_text) => {
                         if let Some(block) = block {
-                            if let Some(first) = sent_this_turn.first_mut() {
-                                first.content.push_str(&block);
+                            if let Some(user_msg) = sent_this_turn.iter_mut().find(|m| m.role == "user") {
+                                user_msg.content.push_str(&block);
                             }
                         }
                     }
@@ -3396,7 +3451,11 @@ async fn run_send(
             // / maintainability); the model itself reconciles their findings
             // into the final graded table. Same garnish mechanism as ToT.
             if review_mode && !sent_this_turn.is_empty() {
-                let task_text = sent_this_turn[0].content.clone();
+                let task_text = sent_this_turn
+                    .iter()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
                 let diff = workspace.as_deref().and_then(|ws| {
                     crate::worktree::git(std::path::Path::new(ws), &["diff", "HEAD"])
                         .ok()
@@ -3417,8 +3476,8 @@ async fn run_send(
                     }
                     block = run_review_rehearsal(&client, &provider, &model, &task_text, diff.as_deref(), &data_dir) => {
                         if let Some(block) = block {
-                            if let Some(first) = sent_this_turn.first_mut() {
-                                first.content.push_str(&block);
+                            if let Some(user_msg) = sent_this_turn.iter_mut().find(|m| m.role == "user") {
+                                user_msg.content.push_str(&block);
                             }
                         }
                     }
@@ -4119,6 +4178,7 @@ async fn run_send(
                                                         .map(|s| crate::prefix::ChatImage {
                                                             mime: s.mime,
                                                             b64: s.b64,
+                                                            file_ref: None,
                                                         })
                                                         .collect(),
                                                 ));

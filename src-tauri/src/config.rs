@@ -90,6 +90,14 @@ pub struct Provider {
     /// persist `cache_tier` instead.
     #[serde(default)]
     pub cache_retention_24h: Option<bool>,
+    /// Opt-in Files API image reuse: upload every attachment once
+    /// (`purpose=user_data`) and reference it by `file_id` on later requests
+    /// instead of re-sending the base64 payload. Only meaningful for
+    /// OpenAI-compatible endpoints that implement `/files` (DeepSeek does;
+    /// strict gateways without the endpoint simply fall back to inline data
+    /// URIs on upload failure). Default off.
+    #[serde(default)]
+    pub images_via_files: bool,
 }
 
 impl Provider {
@@ -250,6 +258,12 @@ pub struct AppSettings {
     /// 0 = 关闭。修剪是内容的纯函数，前缀缓存字节稳定性不受影响。
     #[serde(default = "default_spill_max_chars")]
     pub spill_max_chars: usize,
+    /// 系统提示会话内变更的处理方式："rebuild"（默认，稳妥——重建 Zone S，
+    /// 整个前缀按新纪元重计费）或 "in-history"（省 token——仅 OpenAI 兼容
+    /// 接口且未开隐私模式时，变更以历史内 system 消息注入，Zone S 字节
+    /// 稳定不重建；要求模型支持读取历史中最新 system 指令）。
+    #[serde(default = "default_system_update_mode")]
+    pub system_update_mode: String,
 }
 
 fn default_backup_cap_mb() -> u64 {
@@ -258,6 +272,10 @@ fn default_backup_cap_mb() -> u64 {
 
 fn default_spill_max_chars() -> usize {
     crate::spill::DEFAULT_SPILL_MAX_CHARS
+}
+
+fn default_system_update_mode() -> String {
+    "rebuild".to_string()
 }
 
 fn default_cmd_deny() -> Vec<String> {
@@ -304,6 +322,7 @@ impl Default for AppSettings {
             sandbox_net_block_all: false,
             sandbox_net_malicious: true,
             spill_max_chars: default_spill_max_chars(),
+            system_update_mode: default_system_update_mode(),
         }
     }
 }
@@ -501,6 +520,7 @@ impl Default for AppConfig {
                 behavior: std::collections::BTreeMap::new(),
                 cache_tier: None,
                 cache_retention_24h: None,
+                images_via_files: false,
             }],
             mcp_servers: Vec::new(),
             subagents: Vec::new(),
@@ -862,6 +882,7 @@ mod tests {
             behavior: Default::default(),
             cache_tier: Some(CacheTier::None),
             cache_retention_24h: Some(true),
+            images_via_files: false,
         };
         assert_eq!(p.cache_tier(), CacheTier::None);
 

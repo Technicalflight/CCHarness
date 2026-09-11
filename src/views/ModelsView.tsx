@@ -213,6 +213,26 @@ function ProviderCard({ provider: p }: { provider: Provider }) {
           </span>
         </div>
 
+        {draft.kind === "openai_compatible" && (
+          <div className="row" style={{ marginBottom: 10 }}>
+            <span className="row" style={{ gap: 6 }}>
+              <span style={{ fontSize: 12.5, color: "var(--text-dim)" }}>图片走 Files API</span>
+              <select
+                style={{ width: 150 }}
+                value={draft.images_via_files ? "on" : "off"}
+                title="附件图片一次性上传到 {base}/files（purpose=user_data），后续请求按 file_id 引用，base64 载荷不再重复进请求。上传失败自动回退内联发送"
+                onChange={(e) => setDraft({ ...draft, images_via_files: e.target.value === "on" })}
+              >
+                <option value="off">关闭（内联发送）</option>
+                <option value="on">开启（file_id 引用）</option>
+              </select>
+            </span>
+            <span className="hint" style={{ fontSize: 11 }}>
+              （仅 OpenAI 兼容接口且服务端实现 /files 时可用，如 DeepSeek；同图同 id，跨轮次与重启保持引用稳定）
+            </span>
+          </div>
+        )}
+
         <div className="row" style={{ marginBottom: 12 }}>
           <button className="btn small" disabled={testing || !draft.base_url} onClick={test}>
             {testing ? "测试中…" : "测试连接"}

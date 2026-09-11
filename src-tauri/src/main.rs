@@ -8,6 +8,7 @@ mod chat;
 mod commands;
 mod confidence;
 mod config;
+mod deepfiles;
 mod divergence;
 mod git_panel;
 mod guard;

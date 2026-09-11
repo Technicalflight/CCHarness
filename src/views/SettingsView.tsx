@@ -559,6 +559,29 @@ export function SettingsView() {
         </div>
 
         <div className="card">
+          <h3>系统提示更新方式</h3>
+          <div className="row" style={{ gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+            {(
+              [
+                ["rebuild", "重建前缀（稳妥）"],
+                ["in-history", "历史内注入（省 token）"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                className={`btn small ${(config.settings.system_update_mode ?? "rebuild") === value ? "primary" : ""}`}
+                onClick={() => update({ system_update_mode: value })}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="hint" style={{ marginTop: 8 }}>
+            会话中途修改系统提示（设置 / 工作区 / AGENTS.md 变化）时：「重建前缀」按新前缀整体重算缓存（最稳妥）；「历史内注入」把新指令作为历史中的 system 消息追加，前缀缓存身份保持不变——长会话下省一次全量重算。仅对 OpenAI 兼容接口生效（Anthropic / Responses 始终重建），且要求所用模型支持读取历史中最新 system 指令；隐私模式下自动回退重建。
+          </div>
+        </div>
+
+        <div className="card">
           <h3>系统通知</h3>
           <div className="row" style={{ gap: 8 }}>
             <button

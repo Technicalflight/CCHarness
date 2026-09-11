@@ -1397,6 +1397,7 @@ mod tests {
             behavior: std::collections::BTreeMap::new(),
             cache_tier: None,
             cache_retention_24h: None,
+            images_via_files: false,
         }
     }
 

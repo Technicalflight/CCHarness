@@ -25,6 +25,13 @@ use sha2::{Digest as ShaDigest, Sha256};
 pub struct ChatImage {
     pub mime: String,
     pub b64: String,
+    /// Server-side file reference (Files API upload, opt-in per provider).
+    /// When set, the OpenAI wire part becomes `{"type":"file","file_id":…}`
+    /// instead of an inline data URI — the payload never re-enters the
+    /// request bytes. Absent = classic inline data URI (all bytes preserved
+    /// for existing sessions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,18 +75,23 @@ impl ChatMessage {
         }
     }
 
-    /// OpenAI multimodal content parts: optional text, then one image_url
-    /// part per attached image (data URI). Deterministic ordering.
+    /// OpenAI multimodal content parts: optional text, then one image part
+    /// per attached image — `file` (Files API reference) when resolved,
+    /// `image_url` (data URI) otherwise. Deterministic ordering.
     fn openai_parts(&self) -> Vec<serde_json::Value> {
         let mut parts = Vec::new();
         if !self.content.is_empty() {
             parts.push(json!({ "type": "text", "text": self.content }));
         }
         for img in &self.images {
-            parts.push(json!({
-                "type": "image_url",
-                "image_url": { "url": format!("data:{};base64,{}", img.mime, img.b64) }
-            }));
+            if let Some(file_id) = &img.file_ref {
+                parts.push(json!({ "type": "file", "file_id": file_id }));
+            } else {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", img.mime, img.b64) }
+                }));
+            }
         }
         parts
     }
@@ -172,6 +184,11 @@ pub struct LanePrefix {
     /// (MCP server added/removed mid-session) silently rewrites the head —
     /// tracking it keeps the epoch honest about that rebuild.
     tools_hash: Option<u64>,
+    /// In-history system update state (opt-in, chat/completions wire only):
+    /// when set, Zone S keeps its ORIGINAL bytes and system-prompt changes
+    /// ride as in-history system messages the caller injects before the user
+    /// turn. Equality against this stored text suppresses repeat injections.
+    in_history_system: Option<String>,
 }
 
 impl LanePrefix {
@@ -192,6 +209,7 @@ impl LanePrefix {
             system_text: system_prompt.to_string(),
             cache_tier: CacheTier::Short,
             tools_hash: None,
+            in_history_system: None,
         };
         if !system_prompt.is_empty() {
             let sys = message_json(&ChatMessage::plain("system", system_prompt));
@@ -316,12 +334,34 @@ impl LanePrefix {
     }
 
     /// Whether Zone S already carries exactly this system text. A mismatch
-    /// means settings/workspace/AGENTS.md changed ⇒ caller rebuilds (epoch+1).
+    /// means settings/workspace/AGENTS.md changed ⇒ caller rebuilds (epoch+1)
+    /// — unless the caller uses the in-history adoption below, in which case
+    /// equality against the adopted text suppresses repeat injections.
     pub fn system_is(&self, system_prompt: &str) -> bool {
+        if let Some(adopted) = &self.in_history_system {
+            if adopted == system_prompt {
+                return true;
+            }
+        }
         if system_prompt.is_empty() {
             return self.system_json.is_empty();
         }
         self.system_json == message_json(&ChatMessage::plain("system", system_prompt))
+    }
+
+    /// Adopt a changed system prompt WITHOUT rewriting Zone S: the caller
+    /// injects the new text as an in-history system message (request and
+    /// Zone H then carry old-Zone-S + the update, and models that honor the
+    /// latest system message treat it as effective). Returns true the first
+    /// time a given text is adopted — the caller injects exactly then. Any
+    /// rebuild (privacy/empty/model triggers, restart) resets this state via
+    /// `new`, and the rebuilt Zone S carries the current text directly.
+    pub fn adopt_system_in_history(&mut self, system_prompt: &str) -> bool {
+        if self.system_is(system_prompt) {
+            return false;
+        }
+        self.in_history_system = Some(system_prompt.to_string());
+        true
     }
 
     /// Public accessors used by the command layer.
@@ -803,6 +843,40 @@ mod tests {
     }
 
     #[test]
+    fn adopt_system_in_history_keeps_zone_s_bytes() {
+        let mut lp = sys();
+        let bytes_before = lp.prefix_bytes();
+        let digest_before = lp.digest_hex();
+        let epoch_before = lp.epoch;
+        // changed system: adopt instead of rebuild
+        assert!(!lp.system_is("新系统提示"));
+        assert!(lp.adopt_system_in_history("新系统提示"));
+        // suppresses repeat injections, Zone S untouched, epoch untouched
+        assert!(lp.system_is("新系统提示"));
+        assert!(!lp.adopt_system_in_history("新系统提示"));
+        assert_eq!(bytes_before, lp.prefix_bytes());
+        assert_eq!(digest_before, lp.digest_hex());
+        assert_eq!(epoch_before, lp.epoch);
+        // Zone S still answers true for the ORIGINAL text (bytes unchanged)
+        assert!(lp.system_is("你是严谨的编程助手"));
+        // a second change re-adopts (latest wins)
+        assert!(lp.adopt_system_in_history("第三个提示"));
+        assert!(lp.system_is("第三个提示"));
+        assert!(!lp.system_is("新系统提示"));
+    }
+
+    #[test]
+    fn rebuild_resets_in_history_adoption() {
+        let mut lp = sys();
+        assert!(lp.adopt_system_in_history("新系统提示"));
+        lp.rebuild("新系统提示", &[ChatMessage::plain("user", "a")]);
+        // rebuilt Zone S carries the current text directly — no adoption
+        // state left behind, and adopt is a no-op for the same text
+        assert!(lp.system_is("新系统提示"));
+        assert!(!lp.adopt_system_in_history("新系统提示"));
+    }
+
+    #[test]
     fn behavior_binds_with_epoch_discipline() {
         let mut lp = sys();
         lp.bind_model("m1");
@@ -926,7 +1000,7 @@ mod tests {
         let msgs = [ChatMessage::with_images(
             "user",
             "看图",
-            vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into() }],
+            vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into(), file_ref: None }],
         )];
         let b = build_anthropic_body("claude-x", "", &msgs, None, None, CacheTier::Long);
         let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
@@ -970,7 +1044,7 @@ mod tests {
         let m = ChatMessage::with_images(
             "user",
             "看这张图",
-            vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into() }],
+            vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into(), file_ref: None }],
         );
         let j = message_json(&m);
         assert!(j.starts_with("{\"role\":\"user\",\"content\":["), "{j}");
@@ -984,7 +1058,7 @@ mod tests {
             content: "result".into(),
             tool_calls: None,
             tool_call_id: Some("t1".into()),
-            images: vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into() }],
+            images: vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into(), file_ref: None }],
         };
         let jt = message_json(&tool);
         assert!(!jt.contains("image"), "{jt}");
@@ -996,7 +1070,7 @@ mod tests {
         let msgs = [ChatMessage::with_images(
             "user",
             "看图",
-            vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into() }],
+            vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into(), file_ref: None }],
         )];
         let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long);
         assert!(b.contains("\"type\":\"image\""), "{b}");
@@ -1130,7 +1204,7 @@ mod tests {
         let m = ChatMessage::with_images(
             "user",
             "看图",
-            vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into() }],
+            vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into(), file_ref: None }],
         );
         let body = lp.build_responses_body("gpt-5.1", &[m], None);
         let v: Value = serde_json::from_str(&body).expect("valid json");

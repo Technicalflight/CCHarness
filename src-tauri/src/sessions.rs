@@ -291,6 +291,7 @@ pub fn load_attachments(
         out.push(crate::prefix::ChatImage {
             mime: mime.to_string(),
             b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            file_ref: None,
         });
     }
     out

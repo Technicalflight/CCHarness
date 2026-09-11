@@ -45,6 +45,9 @@ export interface Provider {
   /** Legacy v0.1.5 flag, superseded by cache_tier; kept so old configs
    *  load unchanged (true ⇒ long tier). */
   cache_retention_24h?: boolean | null;
+  /** Opt-in Files API image reuse: upload attachments once, reference by
+   *  file_id (OpenAI-compatible /files endpoints, e.g. DeepSeek). */
+  images_via_files?: boolean;
 }
 
 export interface AppSettings {
@@ -109,6 +112,10 @@ export interface AppSettings {
   /** 上下文体积：工具结果超过该字符数时溢出保存完整输出，上下文内只留
    *  首尾与定位标记。0 = 关闭。默认 24000。 */
   spill_max_chars: number;
+  /** 系统提示会话内变更处理："rebuild"（默认，重建前缀）| "in-history"
+   *  （仅 OpenAI 兼容接口，变更以历史内 system 消息注入，前缀缓存身份
+   *  保持不变）。 */
+  system_update_mode: string;
 }
 
 /** One line of the privacy mapping log (backend `privacy_log_tail`). */
