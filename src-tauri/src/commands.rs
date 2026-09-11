@@ -1190,7 +1190,10 @@ pub fn delete_skill(name: String) -> Result<(), String> {
 /// Wipe a session's messages, telemetry and compaction (visible history
 /// included — this is destructive and gated by a frontend confirm dialog).
 #[tauri::command]
-pub fn clear_session(state: State<'_, AppState>, session_id: String) -> Result<usize, String> {
+pub async fn clear_session(state: State<'_, AppState>, session_id: String) -> Result<usize, String> {
+    // load-modify-save under save_lock — same discipline as rollback; an
+    // in-flight lane save landing after the wipe would resurrect content
+    let _guard = state.save_lock.lock().await;
     let mut sf = state.store.load(&session_id)?;
     let removed = sf.messages.len();
     sf.messages.clear();
@@ -1198,11 +1201,14 @@ pub fn clear_session(state: State<'_, AppState>, session_id: String) -> Result<u
     sf.compaction = None;
     sf.meta.updated_at = now_ms();
     state.store.save(&sf)?;
+    // every lane's prefix and span fingerprint must go — arena/group lanes
+    // would otherwise resend the just-deleted history to the provider on
+    // the next turn (privacy and correctness both)
     if let Some(map) = prefixes_lock(&state).as_mut() {
-        map.remove(&(session_id.clone(), 0));
+        map.retain(|(sid, _), _| sid != &session_id);
     }
     if let Some(map) = state.last_span.lock().unwrap().as_mut() {
-        map.remove(&(session_id, 0));
+        map.retain(|(sid, _), _| sid != &session_id);
     }
     Ok(removed)
 }
@@ -1344,11 +1350,12 @@ pub async fn rollback_session(state: State<'_, AppState>, session_id: String, fr
     sf.telemetry.retain(|r| r.ts < from_ts);
     sf.meta.updated_at = now_ms();
     state.store.save(&sf)?;
+    // all lanes, not just lane 0 (see clear_session)
     if let Some(map) = prefixes_lock(&state).as_mut() {
-        map.remove(&(session_id.clone(), 0));
+        map.retain(|(sid, _), _| sid != &session_id);
     }
     if let Some(map) = state.last_span.lock().unwrap().as_mut() {
-        map.remove(&(session_id, 0));
+        map.retain(|(sid, _), _| sid != &session_id);
     }
     Ok(removed)
 }

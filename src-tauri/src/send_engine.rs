@@ -586,6 +586,10 @@ pub(crate) async fn run_subagent(
             tool_call_id: None,
             images: Vec::new(),
         };
+        let pending_call_ids: Vec<String> = tool_wire
+            .as_ref()
+            .map(|w| w.iter().map(|tc| tc.id.clone()).collect())
+            .unwrap_or_default();
         let record = MessageRecord {
             id: message_id,
             lane: 0,
@@ -608,6 +612,32 @@ pub(crate) async fn run_subagent(
         {
             let mut s = store.load(&sub_id)?;
             s.messages.push(record);
+            // stopped/errored mid-round: same pairing discipline as the
+            // main lane — no unpaired tool_calls may survive to a rebuild
+            if outcome.status != "ok" {
+                for cid in &pending_call_ids {
+                    {
+                        s.messages.push(MessageRecord {
+                            id: Uuid::new_v4().to_string(),
+                            lane: 0,
+                            role: "tool".into(),
+                            content: crate::chat::UNPAIRED_TOOL_NOTE.into(),
+                            reasoning: None,
+                            ts: next_record_ts(&state),
+                            model: None,
+                            status: "ok".into(),
+                            usage: None,
+                            cost_usd: None,
+                            confidence: None,
+                            tool_calls: None,
+                            tool_call_id: Some(cid.clone()),
+                            skill_calls: None,
+                            workflow: None,
+                            images: Vec::new(),
+                        });
+                    }
+                }
+            }
             s.telemetry.push(stat);
             s.meta.updated_at = now_ms();
             store.save(&s)?;
@@ -1680,6 +1710,10 @@ async fn run_send(
                 } else {
                     None
                 };
+                let pending_call_ids: Vec<String> = tool_wire
+                    .as_ref()
+                    .map(|w| w.iter().map(|tc| tc.id.clone()).collect())
+                    .unwrap_or_default();
                 let asst_msg = ChatMessage {
                     role: "assistant".into(),
                     content: outcome.content.clone(),
@@ -1765,6 +1799,35 @@ async fn run_send(
                                 workflow: None,
                                 images: Vec::new(),
                             });
+                        }
+                        // stopped/errored mid-round: pair every emitted tool
+                        // call with a synthetic "not executed" result so a
+                        // restart rebuild never carries an unpaired tool_calls
+                        // assistant record (upstream answers 400 to that shape
+                        // and the session stays poisoned until compaction)
+                        if outcome.status != "ok" {
+                            for cid in &pending_call_ids {
+                                {
+                                    sf.messages.push(MessageRecord {
+                                        id: Uuid::new_v4().to_string(),
+                                        lane,
+                                        role: "tool".into(),
+                                        content: crate::chat::UNPAIRED_TOOL_NOTE.into(),
+                                        reasoning: None,
+                                        ts: next_record_ts(&state),
+                                        model: None,
+                                        status: "ok".into(),
+                                        usage: None,
+                                        cost_usd: None,
+                                        confidence: None,
+                                        tool_calls: None,
+                                        tool_call_id: Some(cid.clone()),
+                                        skill_calls: None,
+                                        workflow: None,
+                                        images: Vec::new(),
+                                    });
+                                }
+                            }
                         }
                         sf.telemetry.push(stat);
                         sf.meta.updated_at = now_ms();

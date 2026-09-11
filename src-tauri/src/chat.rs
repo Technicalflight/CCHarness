@@ -1048,6 +1048,11 @@ pub const REVIEW_DIRECTIVE: &str = "当前处于【审阅模式】。本轮采�
 /// by BOTH the live turn and transcript rebuilds — identical bytes.
 pub const TOOL_IMAGE_NOTE: &str = "（附图：上一条工具结果携带的截图，请结合它继续任务）";
 
+/// Synthetic tool result for calls whose round was stopped/errored before
+/// execution — keeps the rebuilt transcript's tool_calls paired (OpenAI-
+/// compatible endpoints answer 400 to unpaired calls).
+pub const UNPAIRED_TOOL_NOTE: &str = "（回合被中断，该工具调用未执行）";
+
 /// Resolve a declarative-workflow state by definition id + state name.
 /// Shared by transcript assembly (directive injection) and the lane runtime
 /// (tool-surface clamping + auto-advance).
@@ -1110,6 +1115,18 @@ pub fn transcript_for_lane(
         .collect();
     msgs.sort_by_key(|m| m.ts);
 
+    // tool-call pairing inventory: an assistant record whose tool_calls lack
+    // matching tool results (round stopped or crashed between the model
+    // frame and tool execution — or a session file written by an older
+    // build) would make OpenAI-compatible endpoints reject the whole
+    // rebuilt context with 400. Missing pairs get placeholder tool
+    // messages injected in-memory below; persisted records stay untouched.
+    let paired: std::collections::HashSet<&str> = msgs
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+
     // resolve skill bodies once if any user message invokes skills — the
     // visible record stores names only; bodies are injected here so the
     // model still receives the full instruction on every subsequent turn
@@ -1133,7 +1150,13 @@ pub fn transcript_for_lane(
             out.push(ChatMessage::plain("assistant", c.summary.clone()));
         }
     }
+    // placeholders for unpaired calls flush lazily: after the assistant's
+    // real tool results, right before the next non-tool record (or the end)
+    let mut pending_syn: Vec<ChatMessage> = Vec::new();
     for m in msgs {
+        if m.role != "tool" {
+            out.append(&mut pending_syn);
+        }
         if sf.compaction.as_ref().is_some_and(|c| m.ts < c.upto_ts) {
             continue; // folded into the summary
         }
@@ -1228,7 +1251,22 @@ pub fn transcript_for_lane(
                 Vec::new()
             },
         });
+        // pairing repair (see the inventory above): queue placeholders for
+        // calls that never got a result — flushed after this assistant's
+        // real tool results, keeping the natural wire order
+        if let Some(calls) = m.tool_calls.as_ref().filter(|t| !t.is_empty()) {
+            for tc in calls.iter().filter(|c| !paired.contains(c.id.as_str())) {
+                pending_syn.push(ChatMessage {
+                    role: "tool".into(),
+                    content: UNPAIRED_TOOL_NOTE.to_string(),
+                    tool_calls: None,
+                    tool_call_id: Some(tc.id.clone()),
+                    images: Vec::new(),
+                });
+            }
+        }
     }
+    out.append(&mut pending_syn);
     out
 }
 
@@ -1656,5 +1694,67 @@ mod tests {
             &mut content, &mut reasoning, &mut usage, &mut cfilter, &mut tool_accs, &mut finish,
         );
         assert_eq!((t, r), (String::new(), String::new()));
+    }
+
+    // --- item: unpaired tool_calls are healed in the rebuilt transcript (C1)
+
+    fn transcript_sf(records: serde_json::Value) -> SessionFile {
+        serde_json::from_value(serde_json::json!({
+            "meta": { "id": "s", "title": "t", "kind": "chat",
+                      "created_at": 0, "updated_at": 0, "bindings": [] },
+            "messages": records
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn transcript_repairs_unpaired_tool_calls() {
+        let user = serde_json::json!({
+            "id": "u", "lane": 0, "role": "user", "reasoning": null,
+            "content": "go", "ts": 1, "model": null, "status": "ok",
+            "usage": null, "cost_usd": null, "confidence": null,
+            "tool_calls": null, "tool_call_id": null, "skill_calls": null,
+            "workflow": null, "images": []
+        });
+        let asst = serde_json::json!({
+            "id": "a", "lane": 0, "role": "assistant", "reasoning": null,
+            "content": "calling tools", "ts": 2, "model": "m", "status": "ok",
+            "usage": null, "cost_usd": null, "confidence": null,
+            "tool_calls": [
+                { "id": "call-1", "name": "read_file", "arguments": "{}" },
+                { "id": "call-2", "name": "list_dir", "arguments": "{}" }
+            ],
+            "tool_call_id": null, "skill_calls": null, "workflow": null,
+            "images": []
+        });
+        let tool1 = serde_json::json!({
+            "id": "t1", "lane": 0, "role": "tool", "reasoning": null,
+            "content": "done", "ts": 3, "model": null, "status": "ok",
+            "usage": null, "cost_usd": null, "confidence": null,
+            "tool_calls": null, "tool_call_id": "call-1",
+            "skill_calls": null, "workflow": null, "images": []
+        });
+
+        // call-2 never got a result (round stopped mid-tools) → healed
+        let sf = transcript_sf(serde_json::json!([user, asst, tool1]));
+        let out = transcript_for_lane(&sf, 0, &[], std::path::Path::new("."));
+        assert_eq!(out.len(), 4, "{out:?}");
+        assert_eq!(out[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(out[3].role, "tool");
+        assert_eq!(out[3].tool_call_id.as_deref(), Some("call-2"));
+        assert_eq!(out[3].content, UNPAIRED_TOOL_NOTE);
+
+        // fully paired history stays untouched — no synthetic tail
+        let tool2 = serde_json::json!({
+            "id": "t2", "lane": 0, "role": "tool", "reasoning": null,
+            "content": "listed", "ts": 4, "model": null, "status": "ok",
+            "usage": null, "cost_usd": null, "confidence": null,
+            "tool_calls": null, "tool_call_id": "call-2",
+            "skill_calls": null, "workflow": null, "images": []
+        });
+        let sf2 = transcript_sf(serde_json::json!([user, asst, tool1, tool2]));
+        let out2 = transcript_for_lane(&sf2, 0, &[], std::path::Path::new("."));
+        assert_eq!(out2.len(), 4);
+        assert!(out2.iter().all(|m| m.content != UNPAIRED_TOOL_NOTE));
     }
 }
