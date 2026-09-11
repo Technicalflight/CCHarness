@@ -91,7 +91,12 @@ pub fn maybe_spill_in(
         return result.to_string();
     }
     let total = result.chars().count();
-    if total <= max_chars {
+    // spill only when the trimmed form is well-formed: content must exceed
+    // BOTH the budget and head+tail. A budget below HEAD+TAIL (the settings
+    // UI only clamps ≥ 0) must not reach the head/tail arithmetic — it
+    // would underflow (dev panic, release wraparound) on payloads landing
+    // in the (budget, HEAD+TAIL] window. Fail-safe: oversized-but-correct.
+    if total <= max_chars || total <= SPILL_HEAD_CHARS + SPILL_TAIL_CHARS {
         return result.to_string();
     }
     let dir = session_dir(root, session_id);
@@ -192,6 +197,21 @@ mod tests {
         let once = maybe_spill_in(&root, "sid", "run_command", &s, 24_000);
         let twice = maybe_spill_in(&root, "sid", "run_command", &once, 100);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn tiny_budget_no_underflow() {
+        // budget < HEAD+TAIL: payloads in the (budget, HEAD+TAIL] window
+        // must come back intact (no dev panic / release wraparound)
+        let root = temp_root("tiny-budget");
+        let s = big(6_000);
+        assert_eq!(maybe_spill_in(&root, "sid", "run_command", &s, 5_000), s);
+        // just above HEAD+TAIL the trimmed form is well-formed again
+        let s2 = big(10_001);
+        let out = maybe_spill_in(&root, "sid", "run_command", &s2, 5_000);
+        assert!(out.contains(MARKER_PREFIX));
+        assert!(out.contains("共 10001 字符"));
+        assert!(out.contains("中段 1 字符已修剪"));
     }
 
     #[test]

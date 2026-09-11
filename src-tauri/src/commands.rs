@@ -6,7 +6,7 @@ use crate::config::{self, AppConfig, Provider};
 use crate::prefix::{message_json, ChatMessage, LanePrefix};
 use crate::sessions::{now_ms, SessionStore};
 use crate::types_rs::{
-    CompactionStat, GoalInfo, GoalState, MessageRecord, RequestStat, SessionBinding, SessionMeta,
+    GoalInfo, GoalState, MessageRecord, RequestStat, SessionBinding, SessionMeta,
     SessionTelemetry, StreamEvent, TelemetrySummary,
 };
 use serde::Serialize;
@@ -94,6 +94,23 @@ fn persist_gate(data_dir: &std::path::Path, session_id: &str, gate: Option<&str>
     if let Ok(mut sf) = store.load(session_id) {
         sf.meta.wf_gate = gate.map(|g| g.to_string());
         let _ = store.save(&sf);
+    }
+}
+
+/// Workflow tags that ride on persisted message records so every later
+/// rebuild re-injects the mode directive. chat.rs's transcript rebuild is
+/// the read side and matches the same set — keep both in lockstep (see the
+/// `record_workflow_covers_every_rebuild_mode` test): `plan` / `goal` /
+/// `deep` / `review` are stamped by run_send's user record, `subagent` by
+/// the subagent task record, `sm:<def>:<state>` by both.
+pub fn record_workflow_of(wf: &str) -> Option<String> {
+    match wf {
+        "plan" | "goal" | "deep" | "review" => Some(wf.into()),
+        // the full gate "sm:<def>:<state>" rides on the record so every
+        // later rebuild injects the directive of the state the message
+        // was actually sent under (byte-stable per record)
+        w if w.starts_with("sm:") => Some(w.into()),
+        _ => None,
     }
 }
 
@@ -677,7 +694,14 @@ pub struct GlobalStats {
 
 #[tauri::command]
 pub fn get_config(state: State<'_, AppState>) -> AppConfig {
-    config::load(&state.data_dir)
+    let mut cfg = config::load(&state.data_dir);
+    // the renderer never sees plaintext keys — one invoke would otherwise
+    // exfiltrate every provider key through any HTML-injection hole
+    for p in &mut cfg.providers {
+        p.api_key = config::mask_key(&p.api_key);
+    }
+    cfg.settings.embeddings_key = config::mask_key(&cfg.settings.embeddings_key);
+    cfg
 }
 
 #[tauri::command]
@@ -694,9 +718,25 @@ pub fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<(), 
             return Err(format!("{}: {msg}", p.name));
         }
     }
-    config::save(&state.data_dir, &config);
-    sync_sandbox_policy(&config.settings);
-    crate::privacy::set_custom_patterns(config.settings.privacy_custom_patterns.clone());
+    // mask placeholders mean "unchanged" — restore the stored value before
+    // sealing; empty = user cleared it, any other value = re-key
+    let mut cfg = config;
+    let stored = config::load(&state.data_dir);
+    for p in &mut cfg.providers {
+        if config::is_masked_key(&p.api_key) {
+            if let Some(sp) = stored.providers.iter().find(|sp| sp.id == p.id) {
+                p.api_key = sp.api_key.clone();
+            } else {
+                p.api_key = String::new();
+            }
+        }
+    }
+    if config::is_masked_key(&cfg.settings.embeddings_key) {
+        cfg.settings.embeddings_key = stored.settings.embeddings_key.clone();
+    }
+    config::save(&state.data_dir, &cfg);
+    sync_sandbox_policy(&cfg.settings);
+    crate::privacy::set_custom_patterns(cfg.settings.privacy_custom_patterns.clone());
     Ok(())
 }
 
@@ -1079,12 +1119,64 @@ pub fn rename_session(state: State<'_, AppState>, session_id: String, title: Str
 }
 
 #[tauri::command]
-pub fn update_bindings(
+pub async fn update_bindings(
     state: State<'_, AppState>,
     session_id: String,
     bindings: Vec<SessionBinding>,
 ) -> Result<SessionMeta, String> {
-    state.store.set_bindings(&session_id, bindings)
+    // Lane re-tagging on removal: records carry the lane number they were
+    // SENT under. When the list shrinks, current indices shift and older
+    // replies would visually migrate onto a different model. Match old →
+    // new by (provider_id, model) in order (the UI only removes or
+    // appends — anything else is saved as-is) and renumber records so each
+    // lane's history stays with its model. Runs under save_lock.
+    let _guard = state.save_lock.lock().await;
+    let mut sf = state.store.load(&session_id)?;
+    let old = sf.meta.bindings.clone();
+    let key = |b: &SessionBinding| (b.provider_id.clone(), b.model.clone());
+    let mut old_to_new: Vec<Option<u32>> = vec![None; old.len()];
+    let mut matched_all = true;
+    {
+        let mut cursor = 0usize;
+        for (new_idx, nb) in bindings.iter().enumerate() {
+            let k = key(nb);
+            let mut found = None;
+            while cursor < old.len() {
+                if key(&old[cursor]) == k {
+                    found = Some(cursor);
+                    cursor += 1;
+                    break;
+                }
+                cursor += 1;
+            }
+            match found {
+                Some(oi) => old_to_new[oi] = Some(new_idx as u32),
+                None => {
+                    matched_all = false;
+                    break;
+                }
+            }
+        }
+    }
+    if matched_all && old_to_new.iter().any(|m| m.is_none()) {
+        // some old lane was removed (its slot maps to nothing) — retag.
+        // Removed lanes' records get the sentinel u32::MAX: they must not
+        // display under any remaining lane, and must not collide with the
+        // shifted indices either.
+        let remap = |lane: u32| -> u32 {
+            old_to_new.get(lane as usize).copied().flatten().unwrap_or(u32::MAX)
+        };
+        for m in sf.messages.iter_mut() {
+            m.lane = remap(m.lane);
+        }
+        for r in sf.telemetry.iter_mut() {
+            r.lane = remap(r.lane);
+        }
+    }
+    sf.meta.bindings = bindings;
+    sf.meta.updated_at = now_ms();
+    state.store.save(&sf)?;
+    Ok(sf.meta)
 }
 
 #[tauri::command]
@@ -1573,6 +1665,7 @@ fn tools_hash(tools: Option<&Value>) -> Option<u64> {
 async fn compact_now(
     client: &reqwest::Client,
     data_dir: &std::path::Path,
+    save_lock: &tokio::sync::Mutex<()>,
     session_id: &str,
     provider: &Provider,
     model: &str,
@@ -1589,10 +1682,14 @@ async fn compact_now(
     let keep_budget = (window * 0.20) as usize * 4; // tokens → bytes (÷4 convention)
     let keep_from_ts = compute_keep_from_ts(&sf0.messages, keep_budget);
     // DROP rung before folding (idempotent): stale oversized outputs →
-    // stubs, so the summarizer reads a smaller input
+    // stubs, so the summarizer reads a smaller input. The load-modify-save
+    // inside runs under save_lock — a lane save landing mid-rewrite would
+    // otherwise be rolled back by the full-file write.
     let cfg = config::load(data_dir);
-    let (dropped, stubs) =
-        elide_stale_tool_records(data_dir, session_id, cfg.settings.spill_max_chars, keep_from_ts);
+    let (dropped, stubs) = {
+        let _guard = save_lock.lock().await;
+        elide_stale_tool_records(data_dir, session_id, cfg.settings.spill_max_chars, keep_from_ts)
+    };
     let sf = store.load(session_id)?;
     let prev_upto = sf.compaction.as_ref().map(|c| c.upto_ts).unwrap_or(0);
     let foldable: Vec<&MessageRecord> = sf
@@ -1639,15 +1736,21 @@ async fn compact_now(
         completed_turns,
         epoch_before,
     };
-    let mut sf = store.load(session_id)?;
-    sf.compaction = Some(record);
-    sf.meta.compactions.push(stat);
-    if sf.meta.compactions.len() > 60 {
-        let overflow = sf.meta.compactions.len() - 60;
-        sf.meta.compactions.drain(..overflow);
+    // final apply is a short critical section: reload under save_lock so a
+    // lane save that landed while the summary was in flight is preserved —
+    // the long-running summary call itself deliberately stays outside
+    {
+        let _guard = save_lock.lock().await;
+        let mut sf = store.load(session_id)?;
+        sf.compaction = Some(record);
+        sf.meta.compactions.push(stat);
+        if sf.meta.compactions.len() > 60 {
+            let overflow = sf.meta.compactions.len() - 60;
+            sf.meta.compactions.drain(..overflow);
+        }
+        sf.meta.updated_at = now_ms();
+        store.save(&sf)?;
     }
-    sf.meta.updated_at = now_ms();
-    store.save(&sf)?;
     if let Some(map) = prefixes_lock().as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
@@ -1666,7 +1769,7 @@ pub async fn compact_session(state: State<'_, AppState>, session_id: String) -> 
     }
     let binding = sf.meta.bindings.first().cloned().ok_or("会话未绑定模型")?;
     let provider = resolve_provider(&cfg, &binding).cloned().ok_or("Provider 未配置")?;
-    compact_now(&state.client, &state.data_dir, &session_id, &provider, &binding.model, "manual").await?;
+    compact_now(&state.client, &state.data_dir, &state.save_lock, &session_id, &provider, &binding.model, "manual").await?;
     Ok(sf.compaction.as_ref().map(|_| "已在旧摘要基础上再次压缩".to_string()).unwrap_or_else(|| "已压缩".into()))
 }
 
@@ -2284,7 +2387,13 @@ async fn maybe_auto_compact(
     // results without any model call. When that alone projects the request
     // back under the compaction line, skip the summary entirely; otherwise
     // fall through and let the summarizer read the now-smaller input.
-    let saved = prune_oversized_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars);
+    // free rungs run their load-modify-save under save_lock: both rewrite
+    // the session file whole, so a lane save landing mid-rewrite would be
+    // rolled back (the reviewer's lost-message scenario)
+    let saved = {
+        let _guard = state.save_lock.lock().await;
+        prune_oversized_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars)
+    };
     // free rung 2 (L6 §3): superseded stale tool outputs → stubs. The
     // recent window is everything from the last user turn onward.
     let recent_from = sf
@@ -2294,8 +2403,10 @@ async fn maybe_auto_compact(
         .find(|m| m.role == "user")
         .map(|m| m.ts)
         .unwrap_or(0);
-    let (elided, _stubs) =
-        elide_stale_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars, recent_from);
+    let (elided, _stubs) = {
+        let _guard = state.save_lock.lock().await;
+        elide_stale_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars, recent_from)
+    };
     let saved = saved + elided;
     if saved > 0 {
         let projected = last_input - (saved as f64 / 4.0);
@@ -2365,7 +2476,7 @@ async fn maybe_auto_compact(
         }
     }
     let _ =
-        compact_now(&state.client, &state.data_dir, session_id, provider, &binding.model, "auto").await;
+        compact_now(&state.client, &state.data_dir, &state.save_lock, session_id, provider, &binding.model, "auto").await;
 }
 
 #[tauri::command]
@@ -2415,9 +2526,12 @@ async fn abort_lane_pre_stream(
 
 /// Edit-and-resend support: drop the user message at `from_ts` and everything
 /// after it (its replies, tool records, telemetry), and invalidate the prefix
-/// state so the next request rebuilds from the trimmed transcript.
+/// state so the next request rebuilds from the trimmed transcript. The
+/// load-modify-save runs under save_lock — an in-flight lane save would
+/// otherwise be rolled back by the trimmed full-file write.
 #[tauri::command]
-pub fn rollback_session(state: State<'_, AppState>, session_id: String, from_ts: u64) -> Result<usize, String> {
+pub async fn rollback_session(state: State<'_, AppState>, session_id: String, from_ts: u64) -> Result<usize, String> {
+    let _guard = state.save_lock.lock().await;
     let mut sf = state.store.load(&session_id)?;
     let before = sf.messages.len();
     sf.messages.retain(|m| m.ts < from_ts);
@@ -3410,16 +3524,7 @@ async fn run_send(
         tool_calls: None,
         tool_call_id: None,
         skill_calls: if skill_calls.is_empty() { None } else { Some(skill_calls) },
-        workflow: match workflow_of_in(&session_id, &state.data_dir).as_str() {
-            "plan" => Some("plan".into()),
-            "goal" => Some("goal".into()),
-            "deep" => Some("deep".into()),
-            // the full gate "sm:<def>:<state>" rides on the record so every
-            // later rebuild injects the directive of the state the message
-            // was actually sent under (byte-stable per record)
-            w if w.starts_with("sm:") => Some(w.into()),
-            _ => None,
-        },
+        workflow: record_workflow_of(&workflow_of_in(&session_id, &state.data_dir)),
         images: image_names,
     };
     {
@@ -5179,6 +5284,7 @@ async fn run_send(
         let client = state.client.clone();
         let data_dir = state.data_dir.clone();
         let sid = session_id.clone();
+        let save_lock = state.save_lock.clone();
         tauri::async_runtime::spawn(async move {
             let store = SessionStore::new(&data_dir);
             let Ok(sf) = store.load(&sid) else { return };
@@ -5199,6 +5305,9 @@ async fn run_send(
                     .take(16)
                     .collect();
                 if !t.is_empty() {
+                    // rename is a load-modify-save on the session file —
+                    // hold save_lock or a concurrent lane save is rolled back
+                    let _guard = save_lock.lock().await;
                     let _ = store.rename(&sid, &t);
                 }
                 return;
@@ -5263,6 +5372,7 @@ async fn run_send(
                     t
                 }
             };
+            let _guard = save_lock.lock().await;
             let _ = store.rename(&sid, &title);
         });
     }
@@ -5820,6 +5930,28 @@ mod memo_tests {
         // idempotent: second run saves nothing
         assert_eq!(elide_stale_tool_records(&dir, &sid, 24_000, 9), (0, 0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod record_workflow_tests {
+    use super::record_workflow_of;
+
+    // P1 regression: "review" once fell through the `_ => None` arm at the
+    // user-record write site, leaving chat.rs's review branch unreachable
+    // (dead REVIEW_DIRECTIVE) — every mode the rebuild matches must have a
+    // write-side mapping. When chat.rs grows a new directive arm, extend
+    // this list in the same commit.
+    #[test]
+    fn record_workflow_covers_every_rebuild_mode() {
+        for m in ["plan", "goal", "deep", "review"] {
+            assert_eq!(record_workflow_of(m).as_deref(), Some(m), "{m} 缺少写入端映射");
+        }
+        assert_eq!(record_workflow_of("sm:code:rev"), Some("sm:code:rev".into()));
+        // agent / image / unnamed gates carry no directive — must stay unmapped
+        assert_eq!(record_workflow_of("agent"), None);
+        assert_eq!(record_workflow_of("image"), None);
+        assert_eq!(record_workflow_of(""), None);
     }
 }
 
