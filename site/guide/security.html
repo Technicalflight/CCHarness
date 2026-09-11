@@ -88,6 +88,33 @@
         查看 diff、整体合并或一键丢弃。即使开启自动写入，也能把爆炸半径锁在一棵可丢弃的工作树里。
       </p>
 
+      <h2 id="privacy">隐私匿名化（Pseudonymisation）</h2>
+      <p>
+        开启后，出站请求中的敏感信息在<strong>离开你的机器之前</strong>被替换为类型一致的假名，
+        模型看到的是脱敏文本，回答质量不受影响：
+      </p>
+      <ul>
+        <li><b>手机号</b>（含 <code>+86</code> 前缀）、<b>邮箱、身份证、IP、API Key（sk-…，≥16 位）</b>等 8 类内置识别；</li>
+        <li>替换用 <b>HMAC-SHA256 确定性假名</b>：同一原文在同一会话内永远映射到同一假名，保持指代一致性；手机号仍是中国号段、邮箱仍是邮箱格式；</li>
+        <li>每会话独立种子（主密钥派生），跨会话不可关联；</li>
+        <li>支持<strong>自定义正则</strong>扩充识别（如姓名、内部编号）；</li>
+        <li>所有替换写入本机 <b>JSONL 映射日志</b>，设置页可查看、可清空，替换了什么一目了然。</li>
+      </ul>
+
+      <h2 id="sandbox">策略沙箱（Policy Sandbox）</h2>
+      <p>
+        智能体的每条命令在执行前经过三态裁决：<b>放行 / 强制审批 / 直接拦截</b>。
+        你按清单划界，而不是在「全开」与「全关」之间二选一：
+      </p>
+      <table>
+        <thead><tr><th>清单</th><th>控制什么</th><th>例子</th></tr></thead>
+        <tbody>
+          <tr><td>文件 deny / allow</td><td>读写路径（支持通配符）</td><td>拦截 <code>.env</code>、<code>~/.ssh/**</code>，放行 <code>src/**</code></td></tr>
+          <tr><td>命令 deny / ask / allow</td><td>程序名</td><td>拦 <code>reg</code>、<code>schtasks</code>；<code>git push</code> 需审批；<code>cargo</code> 直接放行</td></tr>
+          <tr><td>网络 deny / allow / 全拦</td><td>目标域名</td><td>拦 <code>*.internal</code>；只放行白名单域名；恶意 URL 特征内置启发式</td></tr>
+        </tbody>
+      </table>
+
       <h2 id="injection">注入防护（Guardrails）</h2>
       <ul>
         <li>网页抓取、MCP 返回等<strong>外部内容</strong>默认经过注入检测 + 数据围栏包裹；</li>
@@ -136,6 +163,8 @@
       <a href="#permission">权限档位</a>
       <a href="#approval">审批卡</a>
       <a href="#worktree">Worktree 隔离</a>
+      <a href="#privacy">隐私匿名化</a>
+      <a href="#sandbox">策略沙箱</a>
       <a href="#injection">注入防护（Guardrails）</a>
       <a href="#ssrf">SSRF 防护</a>
       <a href="#local-first">Local-first 存储</a>

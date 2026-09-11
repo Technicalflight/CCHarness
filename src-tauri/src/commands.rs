@@ -2785,7 +2785,7 @@ async fn run_send(
             // approval — fail-safe rather than convenient. 文件白名单的可信
             // 路径在自动模式下保持免审批（见写路径的 trusted 判定）。
             let sb = crate::agent_tools::sandbox_policy();
-            let perm_mode = if sb.on && perm_base == "auto" { "approve" } else { perm_base.clone() };
+            let perm_mode = if sb.on && perm_base == "auto" { "approve" } else { perm_base };
             // plan gate: read-only tool surface, no MCP, no writes — the
             // directive itself rides on the user message (see transcript_for_lane).
             // goal gate: full surface, but more tool rounds per turn.

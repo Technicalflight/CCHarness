@@ -77,6 +77,22 @@ Zone T  尾区     本轮新增（用户消息），下一轮落入 H 成为稳�
         这正是上游前缀缓存命中的前提。
       </p>
 
+      <h2 id="ttl">Anthropic 一小时缓存标记</h2>
+      <p>
+        自 v0.1.4 起，Claude 系请求携带与 Claude Code 相同的缓存时间设定：
+        请求体在<strong>系统提示块</strong>与<strong>最新一条消息</strong>上标记
+        <code>cache_control: {"type":"ephemeral","ttl":"1h"}</code>，
+        把缓存窗口从默认的 5 分钟延长到 <strong>60 分钟</strong>——
+        会话搁置一小时以内回来继续聊，Zone S+H 前缀依然命中，
+        而不必为一次 5 分钟超时重新支付全价输入。
+      </p>
+      <pre><code>system  ─▶ [{ "type": "text", "text": …, "cache_control": { "type": "ephemeral", "ttl": "1h" } }]
+最新消息 ─▶ 内容末块追加 cache_control（增量断点：下一轮的 Zone H 前缀由此命中）</code></pre>
+      <p>
+        标记位置遵循 Anthropic 断点语义：系统块为稳定断点，最新消息为增量断点，
+        每轮随对话推进自然前移。OpenAI 兼容端点依赖上游自动缓存（无 TTL 参数），行为不变。
+      </p>
+
       <h2 id="chain">指纹链与纪元</h2>
       <ul>
         <li><b>SHA-256 增量指纹链</b>逐请求跟踪前缀演化，任何字节级劣化都无所遁形；</li>
@@ -117,6 +133,7 @@ Zone T  尾区     本轮新增（用户消息），下一轮落入 H 成为稳�
     <aside class="toc">
       <div class="toc-title">本页目录</div>
       <a href="#zones">三区模型</a>
+      <a href="#ttl">Anthropic 一小时缓存标记</a>
       <a href="#chain">指纹链与纪元</a>
       <a href="#attribution">miss 分歧定位</a>
       <a href="#auxmemo">AuxMemo 辅助调用精确缓存</a>

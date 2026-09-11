@@ -31,13 +31,13 @@ export function App() {
     void bootstrap();
   }, [bootstrap]);
 
-  // silent startup update check, throttled to once per 24h; a found update
-  // only lights the sidebar badge + a toast (manual download by design)
+  // silent startup update check, throttled to once per 60 minutes; a found
+  // update only lights the sidebar badge + a toast (manual download by design)
   useEffect(() => {
     if (localStorage.getItem("cc.autoUpdateCheck") === "off") return;
-    const DAY = 24 * 60 * 60 * 1000;
+    const CHECK_INTERVAL = 60 * 60 * 1000;
     const last = Number(localStorage.getItem("cc.lastUpdateCheck") ?? 0);
-    if (Date.now() - last < DAY) return;
+    if (Date.now() - last < CHECK_INTERVAL) return;
     localStorage.setItem("cc.lastUpdateCheck", String(Date.now()));
     void runUpdateCheck(false);
   }, [runUpdateCheck]);

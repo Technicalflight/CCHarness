@@ -386,6 +386,12 @@ impl LanePrefix {
 /// `messages` must already be role-merged (user/assistant alternating).
 /// `max_output` overrides the built-in 8192 cap; `temperature` is omitted
 /// when None (provider default).
+///
+/// Prompt caching follows Claude Code's `getCacheControl` time setting:
+/// `cache_control: {"type":"ephemeral","ttl":"1h"}` — a 60-minute cache
+/// window (the API default when the marker is absent is only 5 minutes).
+/// Markers sit on (a) the stable system block (Zone S) and (b) the newest
+/// message (incremental breakpoint: the next request's Zone H prefix hits).
 pub fn build_anthropic_body(
     model: &str,
     system_prompt: &str,
@@ -393,12 +399,13 @@ pub fn build_anthropic_body(
     max_output: Option<u32>,
     temperature: Option<f64>,
 ) -> String {
+    let cache_mark = || serde_json::json!({ "type": "ephemeral", "ttl": "1h" });
     #[derive(Serialize)]
     struct Msg {
         role: String,
         content: serde_json::Value,
     }
-    let msgs: Vec<Msg> = messages
+    let mut msgs: Vec<Msg> = messages
         .iter()
         .filter(|m| m.role == "assistant" || m.role == "user")
         .map(|m| {
@@ -426,6 +433,22 @@ pub fn build_anthropic_body(
             Msg { role: m.role.clone(), content }
         })
         .collect();
+    // incremental cache breakpoint: everything up to (and including) the
+    // newest message becomes the cached prefix for the NEXT request
+    if let Some(last) = msgs.last_mut() {
+        last.content = match std::mem::take(&mut last.content) {
+            serde_json::Value::String(s) => {
+                json!([{ "type": "text", "text": s, "cache_control": cache_mark() }])
+            }
+            serde_json::Value::Array(mut blocks) => {
+                if let Some(b) = blocks.last_mut() {
+                    b["cache_control"] = cache_mark();
+                }
+                serde_json::Value::Array(blocks)
+            }
+            other => other,
+        };
+    }
     let mut body = serde_json::json!({
         "model": model,
         "max_tokens": max_output.unwrap_or(8192),
@@ -438,7 +461,13 @@ pub fn build_anthropic_body(
         );
     }
     if !system_prompt.is_empty() {
-        body["system"] = serde_json::Value::String(system_prompt.to_string());
+        body["system"] = json!([
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": cache_mark(),
+            }
+        ]);
     }
     serde_json::to_string(&body).expect("anthropic body")
 }
@@ -565,6 +594,50 @@ mod tests {
         let b = build_anthropic_body("claude-x", "sys", &msgs, Some(2048), Some(0.5));
         assert!(b.contains("\"max_tokens\":2048"), "{b}");
         assert!(b.contains("\"temperature\":0.5"), "{b}");
+    }
+
+    #[test]
+    fn anthropic_body_marks_1h_cache() {
+        // Claude-Code time setting: cache_control ephemeral + ttl 1h (60min).
+        // Note: serde_json sorts object keys, so assertions parse the body
+        // back instead of matching raw strings in insertion order.
+        let msgs = [
+            ChatMessage::plain("user", "第一轮"),
+            ChatMessage::plain("assistant", "回答一"),
+            ChatMessage::plain("user", "第二轮"),
+        ];
+        let b = build_anthropic_body("claude-x", "系统提示", &msgs, None, None);
+        // exactly two markers: system + newest-message breakpoint
+        assert_eq!(b.matches("\"ttl\":\"1h\"").count(), 2, "{b}");
+        let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
+        // system block is a marked content-block array
+        let sys = v["system"].as_array().expect("system array");
+        assert_eq!(sys.len(), 1, "{b}");
+        assert_eq!(sys[0]["type"], "text");
+        assert_eq!(sys[0]["text"], "系统提示");
+        assert_eq!(sys[0]["cache_control"]["ttl"], "1h");
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+        // newest message was rewritten to a single text block carrying the
+        // marker (incremental breakpoint); earlier messages stay unmarked
+        let mv = v["messages"].as_array().expect("messages array");
+        let last = mv.last().unwrap();
+        let blocks = last["content"].as_array().expect("rewritten to blocks");
+        assert_eq!(blocks.len(), 1, "{b}");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "第二轮");
+        assert_eq!(blocks[0]["cache_control"]["ttl"], "1h");
+        assert!(mv[1]["content"].get("cache_control").is_none(), "{b}");
+        // image-block user message: marker lands on the last block
+        let msgs = [ChatMessage::with_images(
+            "user",
+            "看图",
+            vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into() }],
+        )];
+        let b = build_anthropic_body("claude-x", "", &msgs, None, None);
+        let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
+        let blocks = v["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.last().unwrap()["type"], "image");
+        assert_eq!(blocks.last().unwrap()["cache_control"]["ttl"], "1h");
     }
 
     #[test]
