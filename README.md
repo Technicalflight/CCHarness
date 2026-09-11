@@ -212,7 +212,8 @@ src-tauri/              Rust 后端
 
 ## 项目状态
 
-- 当前版本 v0.1.6，处于快速迭代期，更新日志见 [Releases](https://github.com/Technicalflight/CCHarness/releases)；
+- 当前版本 v0.1.7，处于快速迭代期，更新日志见 [Releases](https://github.com/Technicalflight/CCHarness/releases)；
+- v0.1.7：深度推理 / 审阅等模式首字前不再"卡住"——助手消息框即时出现并显示预演阶段进度（三方案预演 / 三专家预审 / 记忆检索）；记忆召回、深度推理预演、审阅预审、MCP 预热、自动压缩全链路响应暂停（约 0.1 秒内中止，无需刷新页面）；中止回合缓存指纹链正确收尾，不再误报"前缀链断裂"告警；
 - v0.1.6：协议适配器矩阵拓宽——新增 OpenAI Responses 与 Azure OpenAI（Responses）适配器（GPT-5.x / o 系列原生接口、Azure v1 数据面 api-key 认证）；缓存 TTL 三档位（默认 / long / short / none，模型管理页可选，原 24h 开关自动迁移）；Anthropic 缓存记账修复（输入 / 写入 / 读取三桶互斥按厂商归一，未命中检测与成本核算修正）；
 - v0.1.5：应用内更新检查节流调整为每天一次（启动静默检查 24 小时一次，发现更新仅徽标 + 提示、手动下载）；
 - v0.1.4：模型缓存时间调整为 60 分钟（Anthropic 请求携带 cache_control ttl 1h）；隐私匿名化修复 +86 国际前缀手机号识别并新增自定义正则脱敏；隐私映射 JSONL 日志（设置页可查看 / 清空）；策略沙箱文件 / 命令 / 网络三维自定义清单与三态裁决；应用内更新检查节流缩短为 60 分钟；
