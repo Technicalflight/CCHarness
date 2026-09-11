@@ -51,6 +51,24 @@ pub struct SessionMeta {
     /// goal summary bar and /goal command surface keep working.
     #[serde(default)]
     pub goal: Option<GoalState>,
+    /// Per-turn goal snapshots (iteration timeline, ZCode parity). Capped at
+    /// the last 60 entries; cleared with the goal.
+    #[serde(default)]
+    pub goal_rounds: Vec<GoalRound>,
+}
+
+/// One goal-mode round snapshot (ZCode-style iteration timeline): recorded
+/// at the end of each completed turn while the goal gate is active. The
+/// title is the first pending criterion (or a "done" marker) so scrolling
+/// the list reads as the task's progression story.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalRound {
+    pub round: u32,
+    pub title: String,
+    pub done: usize,
+    pub total: usize,
+    pub claimed: usize,
+    pub ts: u64,
 }
 
 /// Goal lifecycle record (Codex /goal parity): created by the user via the
@@ -87,6 +105,9 @@ pub struct GoalInfo {
     /// （…） bracket note) — better-harness "claimed vs exercised" grading:
     /// these completions are asserted without verifiable proof.
     pub checklist_claimed: usize,
+    /// Per-turn iteration timeline (ZCode parity), oldest first.
+    #[serde(default)]
+    pub goal_rounds: Vec<GoalRound>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

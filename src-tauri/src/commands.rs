@@ -189,20 +189,15 @@ pub fn get_workflow_mode(state: State<'_, AppState>, session_id: String) -> Stri
 /// handle_goal_tool); pause/resume/clear are user-only.
 const GOAL_STATUSES: &[&str] = &["active", "paused", "achieved", "unmet", "budget_limited"];
 
-/// Parse the LAST ```goal checklist block in an assistant reply:
-/// returns (✅ count, total criteria (✅+⬜ lines), GOAL_DONE seen).
-/// Lines without a ✅/⬜ marker (progress notes, replan remarks) are not
-/// counted as criteria.
-pub fn parse_goal_summary(content: &str) -> (usize, usize, bool) {
-    let (ok, total, done, _) = parse_goal_summary_ext(content);
-    (ok, total, done)
-}
-
-/// Extended parse (better-harness "claimed vs exercised" grading): also
-/// counts ✅ criteria whose line carries NO inline evidence — no backtick
+/// Parse the LAST ```goal checklist block in an assistant reply — extended
+/// (better-harness "claimed vs exercised" grading): counts ✅ criteria whose
+/// line carries NO inline evidence — no backtick
 /// span (`path` / `cmd` / test name) and no （…） bracket note. A ✅ without
 /// evidence is a *claim*, not a verified completion; surfaces use this to
 /// warn instead of trusting the checkmark.
+/// Returns (✅ count, total criteria (✅+⬜ lines), GOAL_DONE seen, claimed).
+/// Lines without a ✅/⬜ marker (progress notes, replan remarks) are not
+/// counted as criteria.
 pub fn parse_goal_summary_ext(content: &str) -> (usize, usize, bool, usize) {
     let mut block: Option<&str> = None;
     let mut rest = content;
@@ -263,6 +258,7 @@ fn set_goal_inner(
         updated_at: now,
     };
     sf.meta.goal = Some(g.clone());
+    sf.meta.goal_rounds.clear();
     sf.meta.updated_at = now;
     store.save(&sf)?;
     // flip the workflow gate to goal (same map + persist as
@@ -323,6 +319,7 @@ pub fn goal_get(state: State<'_, AppState>, session_id: String) -> Result<GoalIn
         checklist_total,
         checklist_all_met,
         checklist_claimed,
+        goal_rounds: sf.meta.goal_rounds.clone(),
     })
 }
 
@@ -358,6 +355,7 @@ pub fn goal_clear(
     let store = SessionStore::new(&state.data_dir);
     let mut sf = store.load(&session_id)?;
     let prev = sf.meta.goal.take();
+    sf.meta.goal_rounds.clear();
     sf.meta.updated_at = now_ms();
     store.save(&sf)?;
     Ok(prev)
@@ -1817,11 +1815,12 @@ fn binding_for_sub(
 }
 
 /// Look up an enabled named subagent profile by the delegate call's
-/// `agent` argument.
-fn find_subagent_profile<'a>(
-    cfg: &'a AppConfig,
+/// `agent` argument (settings-managed + file-defined).
+fn find_subagent_profile(
+    cfg: &AppConfig,
+    data_dir: &std::path::Path,
     args: &str,
-) -> Option<&'a crate::config::SubagentProfile> {
+) -> Option<crate::config::SubagentProfile> {
     let name = serde_json::from_str::<Value>(args)
         .ok()
         .and_then(|a| a.get("agent").and_then(|v| v.as_str()).map(|s| s.trim().to_string()))
@@ -1829,7 +1828,90 @@ fn find_subagent_profile<'a>(
     if name.is_empty() {
         return None;
     }
-    cfg.subagents.iter().find(|p| p.enabled && p.name == name)
+    all_subagents(cfg, data_dir).into_iter().find(|p| p.enabled && p.name == name)
+}
+
+/// Parse `<data_dir>/agents/*.md` into extra named-subagent profiles
+/// (ZCode-style file definitions): frontmatter carries name / description /
+/// model / tools (comma list) / max_turns / enabled; the markdown body is
+/// the role system prompt. The model must belong to an enabled provider —
+/// otherwise the file is skipped. Resolved on the fly, never persisted.
+fn file_agent_profiles(cfg: &AppConfig, data_dir: &std::path::Path) -> Vec<crate::config::SubagentProfile> {
+    let dir = data_dir.join("agents");
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&p) else { continue };
+        let Some(rest) = raw.strip_prefix("---") else { continue };
+        let Some(i) = rest.find("\n---") else { continue };
+        let fm = &rest[..i];
+        let body = rest[i + 4..].trim_start_matches(['\r', '\n']).to_string();
+        let mut name = String::new();
+        let mut description = String::new();
+        let mut model = String::new();
+        let mut tools: Vec<String> = Vec::new();
+        let mut max_turns: Option<u32> = None;
+        let mut enabled = true;
+        for line in fm.lines() {
+            let Some((k, v)) = line.split_once(':') else { continue };
+            let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+            match k.trim() {
+                "name" => name = v,
+                "description" => description = v,
+                "model" => model = v,
+                "enabled" => enabled = v != "false",
+                "max_turns" => max_turns = v.parse::<u32>().ok(),
+                "tools" => {
+                    let v = v.trim_start_matches('[').trim_end_matches(']').replace('，', ",");
+                    tools = v
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+        if name.is_empty() {
+            name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        }
+        if model.is_empty() {
+            continue;
+        }
+        let Some(provider_id) = cfg
+            .providers
+            .iter()
+            .find(|pr| pr.enabled && pr.models.iter().any(|m| *m == model))
+            .map(|pr| pr.id.clone())
+        else {
+            continue;
+        };
+        out.push(crate::config::SubagentProfile {
+            id: format!("file:{}", p.file_stem().and_then(|s| s.to_str()).unwrap_or(&name)),
+            name,
+            description,
+            provider_id,
+            model,
+            system_prompt: body,
+            enabled,
+            tools,
+            max_turns,
+            source: "file".into(),
+        });
+    }
+    out
+}
+
+/// All usable named-subagent profiles: settings-managed ones first, then
+/// file-defined ones (<data_dir>/agents/*.md).
+fn all_subagents(cfg: &AppConfig, data_dir: &std::path::Path) -> Vec<crate::config::SubagentProfile> {
+    let mut v: Vec<crate::config::SubagentProfile> = cfg.subagents.clone();
+    v.extend(file_agent_profiles(cfg, data_dir));
+    v
 }
 
 /// Max tool rounds inside one sub-agent run. Sub-agents are read-only, so
@@ -1880,7 +1962,16 @@ async fn run_subagent(
     let binding = binding_for_sub(profile, parent_binding);
     let provider = resolve_provider(cfg, &binding).cloned().ok_or("Provider 未配置或未填 API Key")?;
     let model = binding.model.clone();
-    let tools = crate::agent_tools::schema_readonly();
+    // Tool surface: whitelist from the profile when given (write tools are
+    // opt-in per profile), otherwise the safe read-only default.
+    let tools = match profile {
+        Some(p) if !p.tools.is_empty() => crate::agent_tools::schema_filtered(&p.tools),
+        _ => crate::agent_tools::schema_readonly(),
+    };
+    let max_rounds = profile
+        .and_then(|p| p.max_turns)
+        .map(|n| (n as usize).clamp(1, 40))
+        .unwrap_or(SUB_MAX_ROUNDS);
     let cache_key = format!("ccharness-{sub_id}-0");
 
     // the task record carries workflow="subagent" so transcript_for_lane
@@ -1930,7 +2021,7 @@ async fn run_subagent(
 
     let mut final_text: Option<String> = None;
     let mut turn_status = "error".to_string();
-    for _round in 1..=SUB_MAX_ROUNDS {
+    for _round in 1..=max_rounds {
         let body = chat::build_body(&provider, &model, &owned_prefix, &sent_this_turn, &system_full, Some(&tools));
         let message_id = Uuid::new_v4().to_string();
         let ctx = chat::SendCtx {
@@ -2083,6 +2174,127 @@ async fn run_subagent(
     Ok(text.chars().take(SUB_RESULT_CAP).collect())
 }
 
+// ── /wiki 仓库导读 + # 历史会话引用（ZCode 上下文层 parity）─────────────
+
+/// Where the generated repo digest lives for a workspace: co-located under
+/// `.ccharness/` (same convention as the AGENTS.md fallback) so it is
+/// visible, regenerable and trivially gitignored. sysprompt::assemble picks
+/// it up as a Zone S layer for NEW sessions (same cache discipline as
+/// AGENTS.md — mid-session generation never mutates a live prefix).
+fn wiki_path(workspace: &str) -> std::path::PathBuf {
+    std::path::Path::new(workspace).join(".ccharness").join("wiki.md")
+}
+
+/// Generate the repo digest (`/wiki`): a read-only Explore-style subagent
+/// (own hidden session, parent's model binding, read tools only) scans the
+/// workspace tree and key files, then writes a fixed five-section Markdown
+/// overview. Saved to <workspace>/.ccharness/wiki.md; the inline result is
+/// returned so the frontend can toast path + size.
+#[tauri::command]
+pub async fn wiki_generate(state: State<'_, AppState>, session_id: String) -> Result<Value, String> {
+    let data_dir = state.data_dir.clone();
+    let store = SessionStore::new(&data_dir);
+    let sf = store.load(&session_id).map_err(|e| format!("会话不存在: {e}"))?;
+    let ws = sf
+        .meta
+        .workspace
+        .clone()
+        .filter(|w| !w.trim().is_empty())
+        .ok_or("当前会话未绑定工作区 —— 先用 /workspace <路径> 绑定，再生成仓库导读")?;
+    let binding = sf.meta.bindings.first().cloned().ok_or("会话没有模型绑定")?;
+    let cfg = config::load(&data_dir);
+    let task = "为当前工作区生成一份「仓库导读」。步骤：\
+1) 用 list_dir 浏览根目录与关键子目录（跳过 node_modules / target / dist / .git 等依赖与产物目录）；\
+2) 读 README、清单文件（package.json / Cargo.toml / pyproject.toml 等）与 3-6 个核心源码入口；\
+3) 输出 Markdown 导读，固定包含五节：\
+## 项目定位（一句话）；## 技术栈与运行方式（构建/测试命令）；## 目录结构（带注释的树，只列关键目录）；\
+## 核心模块与数据流（从入口到落点，谁调用谁）；## 改动须知（约定、边界、易踩的坑）。\
+全文 500-900 字，全部基于实际读到的内容，禁止臆测；文件路径一律相对工作区根目录。只输出导读本身。";
+    let channel = tauri::ipc::Channel::<StreamEvent>::new(|_| Ok(()));
+    let text = run_subagent(
+        &state.client,
+        &data_dir,
+        &session_id,
+        task,
+        None,
+        &binding,
+        &cfg,
+        &channel,
+        0,
+        "wiki",
+    )
+    .await?;
+    let path = wiki_path(&ws);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("无法创建 .ccharness 目录: {e}"))?;
+    }
+    let stamped = format!(
+        "<!-- CCHarness /wiki 生成于 {}；重新生成会覆盖本文件 -->\n\n{text}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M")
+    );
+    fs::write(&path, &stamped).map_err(|e| format!("写入 wiki.md 失败: {e}"))?;
+    Ok(serde_json::json!({
+        "path": path.to_string_lossy(),
+        "chars": text.chars().count(),
+    }))
+}
+
+/// Deterministic digest of a past session for the `#` history-reference
+/// picker: title / time / workspace / goal / user asks (first+last three) /
+/// last conclusion. Pure text extraction — no model call, instant and free.
+/// Capped so several references cannot blow up the prompt.
+#[tauri::command]
+pub fn session_digest(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
+    let store = SessionStore::new(&state.data_dir);
+    let sf = store.load(&session_id).map_err(|e| format!("会话不存在: {e}"))?;
+    let clip = |s: &str, n: usize| {
+        let t = s.trim().replace('\n', " ");
+        let mut out: String = t.chars().take(n).collect();
+        if t.chars().count() > n {
+            out.push('…');
+        }
+        out
+    };
+    let date = chrono::DateTime::from_timestamp_millis(sf.meta.updated_at as i64)
+        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default();
+    let mut lines = vec![format!("会话「{}」({})", clip(&sf.meta.title, 60), date)];
+    if let Some(ws) = sf.meta.workspace.as_deref().filter(|w| !w.trim().is_empty()) {
+        lines.push(format!("工作区: {ws}"));
+    }
+    if let Some(g) = &sf.meta.goal {
+        lines.push(format!("目标({}): {}", g.status, clip(&g.objective, 160)));
+    }
+    let asks: Vec<String> = sf
+        .messages
+        .iter()
+        .filter(|m| m.role == "user" && m.workflow.is_none() && !m.content.trim().is_empty())
+        .map(|m| clip(&m.content, 120))
+        .collect();
+    let n = asks.len();
+    if n > 0 {
+        let shown: Vec<String> = if n <= 6 {
+            asks
+        } else {
+            let mut v: Vec<String> = asks[..3].to_vec();
+            v.push("……".into());
+            v.extend(asks[n - 3..].iter().cloned());
+            v
+        };
+        lines.push(format!("用户要求（共 {n} 条）:\n- {}", shown.join("\n- ")));
+    }
+    if let Some(last) = sf
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+    {
+        lines.push(format!("最近结论: {}", clip(&last.content, 240)));
+    }
+    let digest = lines.join("\n");
+    Ok(digest.chars().take(2400).collect())
+}
+
 /// Garnish cap per ToT candidate (chars) — keeps the rehearsal block small
 /// even when a model is verbose.
 const TOT_CANDIDATE_CAP: usize = 1_500;
@@ -2205,12 +2417,36 @@ async fn run_review_rehearsal(
     model: &str,
     task: &str,
     diff: Option<&str>,
+    data_dir: &std::path::Path,
 ) -> Option<String> {
     let clip = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    // Expert lenses can be overridden by <data_dir>/agents/review-*.md
+    // (frontmatter optional; body = role instructions). Missing/empty file
+    // falls back to the built-in lens.
+    let lens_or_file = |stem: &str, fallback: &str| -> String {
+        std::fs::read_to_string(data_dir.join("agents").join(format!("{stem}.md")))
+            .ok()
+            .map(|raw| {
+                let body = match raw.strip_prefix("---") {
+                    Some(rest) => match rest.find("\n---") {
+                        Some(i) => rest[i + 4..].to_string(),
+                        None => raw.clone(),
+                    },
+                    None => raw.clone(),
+                };
+                let b = body.trim().to_string();
+                if b.is_empty() {
+                    fallback.to_string()
+                } else {
+                    b
+                }
+            })
+            .unwrap_or_else(|| fallback.to_string())
+    };
     let experts = [
-        ("A", "正确性与逻辑缺陷：边界条件、错误处理、并发/时序、空值与溢出"),
-        ("B", "安全边界：注入、SSRF、密钥泄露、越权访问、不可信输入未校验"),
-        ("C", "可维护性与测试缺口：重复逻辑、复杂度失控、命名误导、缺失测试"),
+        ("A", "正确性", lens_or_file("review-correctness", "正确性与逻辑缺陷：边界条件、错误处理、并发/时序、空值与溢出")),
+        ("B", "安全边界", lens_or_file("review-security", "安全边界：注入、SSRF、密钥泄露、越权访问、不可信输入未校验")),
+        ("C", "可维护性", lens_or_file("review-maintainability", "可维护性与测试缺口：重复逻辑、复杂度失控、命名误导、缺失测试")),
     ];
     let subject = match diff {
         Some(d) => format!(
@@ -2222,9 +2458,9 @@ async fn run_review_rehearsal(
     };
     let prompts: Vec<String> = experts
         .iter()
-        .map(|(_tag, lens)| {
+        .map(|(_tag, _label, prompt)| {
             format!(
-                "你是代码审阅专家（只读视角，只负责：{lens}）。针对待审阅内容逐条输出发现，每条一行，格式严格为：\n- [严重度] 后果 ← 根因 @ 位置 → 验证方式\n其中严重度 ∈ 严重/主要/次要；位置写 文件:行号（无文件上下文时写 任务级）；验证方式一句话说明如何证实或复现。只输出本视角的发现，不要涉及其他视角，不要寒暄；没有发现则只输出「无发现」。"
+                "你是代码审阅专家（只读视角，只负责：{prompt}）。针对待审阅内容逐条输出发现，每条一行，格式严格为：\n- [严重度] 后果 ← 根因 @ 位置 → 验证方式\n其中严重度 ∈ 严重/主要/次要；位置写 文件:行号（无文件上下文时写 任务级）；验证方式一句话说明如何证实或复现。只输出本视角的发现，不要涉及其他视角，不要寒暄；没有发现则只输出「无发现」。"
             )
         })
         .collect();
@@ -2235,17 +2471,13 @@ async fn run_review_rehearsal(
     let results = futures_util::future::join_all(futs).await;
     let mut block = String::from("\n\n[三专家审阅预演 — 并行只读评审，待汇合定级]\n");
     let mut any = false;
-    for ((tag, lens), r) in experts.iter().zip(results) {
+    for ((tag, label, _), r) in experts.iter().zip(results) {
         let text = r.ok().map(|s| s.trim().to_string()).unwrap_or_default();
         if text.is_empty() {
             continue;
         }
         any = true;
-        block.push_str(&format!(
-            "专家{tag}（{}）：{}\n\n",
-            lens.split('：').next().unwrap_or(lens),
-            clip(&text, REVIEW_EXPERT_CAP)
-        ));
+        block.push_str(&format!("专家{tag}（{label}）：{}\n\n", clip(&text, REVIEW_EXPERT_CAP)));
     }
     if !any {
         return None;
@@ -2427,10 +2659,9 @@ async fn run_send(
                 schema_all.extend(state_mcp_tools(&data_dir));
             }
             // advertise enabled named subagents in the delegate tool so the
-            // model can pick `agent` meaningfully
+            // model can pick `agent` meaningfully (settings + file-defined)
             if tools_on && !plan_mode {
-                let names: Vec<String> = cfg
-                    .subagents
+                let names: Vec<String> = all_subagents(&cfg, &data_dir)
                     .iter()
                     .filter(|p| p.enabled)
                     .map(|p| {
@@ -2694,7 +2925,7 @@ async fn run_send(
                         .filter(|d| !d.trim().is_empty())
                 });
                 if let Some(block) =
-                    run_review_rehearsal(&client, &provider, &model, &task_text, diff.as_deref())
+                    run_review_rehearsal(&client, &provider, &model, &task_text, diff.as_deref(), &data_dir)
                         .await
                 {
                     if let Some(first) = sent_this_turn.first_mut() {
@@ -3013,7 +3244,7 @@ async fn run_send(
                         delegations += 1;
                         sub_profiles.insert(
                             tc.id.clone(),
-                            find_subagent_profile(&cfg, &tc.arguments).cloned(),
+                            find_subagent_profile(&cfg, &data_dir, &tc.arguments),
                         );
                         sub_calls.push((tc.id.clone(), task));
                     }
@@ -3578,6 +3809,51 @@ async fn run_send(
                 && cfg.settings.auto_reflect
                 && !cfg.settings.embeddings_url.trim().is_empty();
 
+            // Goal iteration timeline (ZCode parity): one snapshot per
+            // completed turn while the goal gate is active. Title = first
+            // pending criterion, so the round list reads as the task's
+            // progression story. Capped at the last 60 entries.
+            if goal_mode && lane == 0 && turn_status == "ok" && sf_snapshot.meta.goal.is_some() {
+                let (ok, total, done, claimed) = parse_goal_summary_ext(&turn_text);
+                let pending: String = turn_text
+                    .lines()
+                    .find(|l| l.trim_start().starts_with('⬜'))
+                    .map(|l| {
+                        l.trim_start()
+                            .trim_start_matches('⬜')
+                            .trim()
+                            .chars()
+                            .take(48)
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                let title = if !pending.is_empty() {
+                    pending
+                } else if done {
+                    "已申报 GOAL_DONE，等待校验收尾".to_string()
+                } else {
+                    "本轮清单全部达成".to_string()
+                };
+                let _guard = save_lock.lock().await;
+                if let Ok(mut sfr) = store.load(&session_id) {
+                    let round = sfr.meta.goal_rounds.len() as u32 + 1;
+                    sfr.meta.goal_rounds.push(crate::types_rs::GoalRound {
+                        round,
+                        title,
+                        done: ok,
+                        total,
+                        claimed,
+                        ts: now_ms(),
+                    });
+                    if sfr.meta.goal_rounds.len() > 60 {
+                        let overflow = sfr.meta.goal_rounds.len() - 60;
+                        sfr.meta.goal_rounds.drain(..overflow);
+                    }
+                    sfr.meta.updated_at = now_ms();
+                    let _ = store.save(&sfr);
+                }
+            }
+
             let _ = channel.send(StreamEvent::Done {
                 lane,
                 message_id: last_message_id,
@@ -3763,6 +4039,50 @@ pub fn get_write_diff(
     Ok(sf.writes.into_iter().find(|w| w.ts == ts))
 }
 
+/// Aggregate +/- line changes over every logged write of a session
+/// (ZCode-style change meter for the chat header). Per write: a fresh file
+/// (no `before`) counts all lines as added; otherwise a multiset line diff
+/// approximates added/removed without a full O(n²) LCS — accurate enough
+/// for a header badge, cheap for truncated snapshots. Returns None when the
+/// session has no writes (no badge).
+#[tauri::command]
+pub fn session_change_lines(state: State<'_, AppState>, session_id: String) -> Result<Option<(usize, usize)>, String> {
+    use std::collections::HashMap;
+    fn multiset_change(before: &str, after: &str) -> (usize, usize) {
+        let mut counts: HashMap<&str, i64> = HashMap::new();
+        for l in before.lines() {
+            *counts.entry(l).or_insert(0) += 1;
+        }
+        for l in after.lines() {
+            *counts.entry(l).or_insert(0) -= 1;
+        }
+        let (mut added, mut removed) = (0usize, 0usize);
+        for v in counts.values() {
+            if *v > 0 {
+                removed += *v as usize; // lines present only in `before`
+            } else if *v < 0 {
+                added += (-*v) as usize; // lines present only in `after`
+            }
+        }
+        (added, removed)
+    }
+    let sf = state.store.load(&session_id)?;
+    if sf.writes.is_empty() {
+        return Ok(None);
+    }
+    let mut total = (0usize, 0usize);
+    for w in &sf.writes {
+        let (a, r) = match (&w.before, &w.after) {
+            (None, Some(after)) => (after.lines().count(), 0), // fresh file
+            (Some(before), Some(after)) => multiset_change(before, after),
+            _ => (0, 0),
+        };
+        total.0 += a;
+        total.1 += r;
+    }
+    Ok(Some(total))
+}
+
 // ---------- worktree isolation ----------
 
 /// One changed file inside the session's isolation worktree.
@@ -3935,52 +4255,50 @@ pub fn get_aux_stats(state: State<'_, AppState>) -> crate::auxmemo::AuxStats {
 
 #[cfg(test)]
 mod goal_tests {
-    use super::{parse_goal_summary, parse_goal_summary_ext};
+    use super::parse_goal_summary_ext as pgs;
 
     #[test]
     fn parses_last_goal_block_only() {
         let content = "开头一个旧清单 ```goal\n✅ 旧一\n⬜ 旧二\n``` 中间说明，最终交付清单：\n```goal\n✅ 标准一\n⬜ 标准二\n⬜ 标准三\n```";
-        assert_eq!(parse_goal_summary(content), (1, 3, false));
+        assert_eq!(pgs(content), (1, 3, false, 1));
     }
 
     #[test]
     fn detects_goal_done_marker() {
         let content = "全部完成：\n```goal\n✅ a\n✅ b\nGOAL_DONE\n```";
-        assert_eq!(parse_goal_summary(content), (2, 2, true));
+        assert_eq!(pgs(content), (2, 2, true, 2));
     }
 
     #[test]
     fn unterminated_block_counts_to_end() {
         // 缺收尾围栏时取块尾之后的所有内容（与实现一致）。
         let content = "```goal\n✅ a\n⬜ b\n";
-        assert_eq!(parse_goal_summary(content), (1, 2, false));
+        assert_eq!(pgs(content), (1, 2, false, 1));
     }
 
     #[test]
     fn no_block_yields_zeroes() {
-        assert_eq!(parse_goal_summary("没有任何清单"), (0, 0, false));
-        assert_eq!(parse_goal_summary(""), (0, 0, false));
+        assert_eq!(pgs("没有任何清单"), (0, 0, false, 0));
+        assert_eq!(pgs(""), (0, 0, false, 0));
     }
 
     #[test]
     fn progress_notes_without_marker_not_counted() {
         // 无 ✅/⬜ 前缀的进展说明行不计入总数。
         let content = "```goal\n已完成编译检查\n测试全部通过\n```";
-        assert_eq!(parse_goal_summary(content), (0, 0, false));
+        assert_eq!(pgs(content), (0, 0, false, 0));
     }
 
     #[test]
     fn claimed_counts_ok_rows_without_inline_evidence() {
         // ✅ 行内无反引号且无（…）括注 = claimed（未验证声明）。
         let content = "```goal\n✅ 实现增量计算\n✅ 通过测试 `cargo test 12 通过`\n✅ 覆盖边界（见 src/prefix.rs）\n⬜ 剩余项\n```";
-        assert_eq!(parse_goal_summary(content), (3, 4, false));
-        let (ok, total, done, claimed) = parse_goal_summary_ext(content);
-        assert_eq!((ok, total, done, claimed), (3, 4, false, 1));
+        assert_eq!(pgs(content), (3, 4, false, 1));
     }
 
     #[test]
     fn claimed_zero_when_all_rows_evidenced() {
         let content = "```goal\n✅ 修复断裂 `git diff --check`\n✅ 复跑通过（cargo test 全绿）\nGOAL_DONE\n```";
-        assert_eq!(parse_goal_summary_ext(content), (2, 2, true, 0));
+        assert_eq!(pgs(content), (2, 2, true, 0));
     }
 }

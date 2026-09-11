@@ -83,6 +83,16 @@ export interface GoalState {
   updated_at: number;
 }
 
+/** One goal-mode round snapshot (iteration timeline, ZCode parity). */
+export interface GoalRound {
+  round: number;
+  title: string;
+  done: number;
+  total: number;
+  claimed: number;
+  ts: number;
+}
+
 /** Goal snapshot: state + session cost + last checklist parse. */
 export interface GoalInfo {
   goal: GoalState | null;
@@ -92,6 +102,8 @@ export interface GoalInfo {
   checklist_all_met: boolean;
   /** ✅ rows with no inline evidence (claimed, not verified). */
   checklist_claimed: number;
+  /** Per-turn iteration timeline, oldest first (capped at 60). */
+  goal_rounds: GoalRound[];
 }
 
 /** Miss-divergence localization entry (see divergence.rs). */

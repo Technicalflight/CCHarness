@@ -4,8 +4,10 @@
 // permission surface exists.
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 pub const MAX_TOOL_RESULT_CHARS: usize = 8_000;
 const READ_FILE_CAP: u64 = 256 * 1024;
@@ -33,6 +35,7 @@ pub const WRITE_TOOLS: &[&str] = &[
     "move_path",
     "run_command",
     "take_screenshot",
+    "kill_background",
 ];
 
 pub fn is_write_tool(name: &str) -> bool {
@@ -141,14 +144,39 @@ pub fn schema() -> Value {
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": "在工作区根目录执行一条 shell 命令并返回合并输出（需要用户批准）。适合构建、测试、git 等短任务；超时上限 120 秒，超时进程会被终止；输出超长会被截断",
+                "description": "在工作区根目录执行一条 shell 命令并返回合并输出（需要用户批准）。适合构建、测试、git 等短任务；超时上限 120 秒，超时进程会被终止；输出超长会被截断。run_in_background=true 时立即返回 shell_id，之后用 read_background_output 读取增量输出、kill_background 终止 —— 适合 dev server / 长构建 / 监听类命令",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "要执行的命令行（Windows 走 cmd /C，其他走 sh -c）" },
-                        "timeout_secs": { "type": "integer", "description": "可选超时秒数，1–120，默认 60" }
+                        "timeout_secs": { "type": "integer", "description": "可选超时秒数，1–120，默认 60（后台模式忽略）" },
+                        "run_in_background": { "type": "boolean", "description": "true 时后台运行：立即返回 shell_id，不等待结束（默认 false）" }
                     },
                     "required": ["command"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_background_output",
+                "description": "读取一个后台 shell 自上次读取以来的新增输出（stdout+stderr 合并）。返回运行状态（running / exited(code)）与新增文本；重复调用返回增量。shell_id 来自 run_command 的 run_in_background 返回值",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "shell_id": { "type": "integer", "description": "后台 shell 编号" } },
+                    "required": ["shell_id"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "kill_background",
+                "description": "终止一个仍在运行的后台 shell 进程（需要用户批准）。shell_id 来自 run_command 的 run_in_background 返回值",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "shell_id": { "type": "integer", "description": "后台 shell 编号" } },
+                    "required": ["shell_id"]
                 }
             }
         },
@@ -307,6 +335,7 @@ const EXCLUDED_FROM_READONLY: &[&str] = &[
     "run_command",
     "take_screenshot",
     "delegate_subagent",
+    "kill_background",
 ];
 
 /// The read-only subset — used when the session's permission mode is
@@ -320,6 +349,27 @@ pub fn schema_readonly() -> Value {
                 .filter(|t| {
                     let name = t.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or("");
                     !EXCLUDED_FROM_READONLY.contains(&name)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(filtered)
+}
+
+/// Whitelist filter for named-subagent tool surfaces (ZCode-style profile
+/// `tools` field): keep only the named tools from the FULL schema. Write
+/// tools are included only when explicitly listed — the caller (delegate
+/// surface) is opt-in per profile. Unknown names are silently dropped.
+pub fn schema_filtered(allow: &[String]) -> Value {
+    let all = schema();
+    let filtered: Vec<Value> = all
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|t| {
+                    let name = t.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or("");
+                    allow.iter().any(|a| a == name)
                 })
                 .cloned()
                 .collect()
@@ -391,6 +441,9 @@ pub fn execute(workspace: &str, name: &str, args: &Value) -> String {
         "glob_files" => glob_files(workspace, &str_arg(args, "pattern")),
         "grep_files" => grep_files(workspace, &str_arg(args, "pattern"), &str_arg(args, "glob")),
         "web_fetch" => web_fetch(&str_arg(args, "url")),
+        "read_background_output" => read_background_output(
+            args.get("shell_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        ),
         "load_skill" => crate::skills::load_body(
             if workspace.is_empty() { None } else { Some(workspace) },
             &str_arg(args, "name"),
@@ -443,10 +496,19 @@ pub fn approval_preview(workspace: &str, name: &str, args: &Value) -> String {
         }
         "run_command" => {
             let cmd = str_arg(args, "command");
-            let timeout = args.get("timeout_secs").and_then(|t| t.as_u64()).unwrap_or(60);
-            format!(
-                "在工作区执行命令（超时 {timeout} 秒）\n\n```sh\n{cmd}\n```"
-            )
+            let bg = args.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
+            if bg {
+                format!("在工作区后台执行命令（立即返回，不等待完成）\n\n```sh\n{cmd}\n```")
+            } else {
+                let timeout = args.get("timeout_secs").and_then(|t| t.as_u64()).unwrap_or(60);
+                format!(
+                    "在工作区执行命令（超时 {timeout} 秒）\n\n```sh\n{cmd}\n```"
+                )
+            }
+        }
+        "kill_background" => {
+            let id = args.get("shell_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("终止后台 shell #{id}（仍在运行则杀掉其进程）")
         }
         "take_screenshot" => {
             "截取当前整个屏幕画面（PNG）并发送给模型查看 —— 截图保存在本会话的附件目录".to_string()
@@ -492,10 +554,24 @@ pub fn execute_write(workspace: &str, name: &str, args: &Value) -> String {
             &str_arg(args, "old_text"),
             &str_arg(args, "new_text"),
         ),
-        "run_command" => run_command(
-            workspace,
-            &str_arg(args, "command"),
-            args.get("timeout_secs").and_then(|t| t.as_u64()).unwrap_or(60),
+        "run_command" => {
+            if args.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false) {
+                match spawn_background(workspace, &str_arg(args, "command")) {
+                    Ok(id) => Ok(format!(
+                        "已在后台启动（shell_id={id}）—— 用 read_background_output(shell_id={id}) 读取增量输出；不再需要时用 kill_background 终止。输出过多时仅保留尾部。"
+                    )),
+                    Err(e) => Err(e),
+                }
+            } else {
+                run_command(
+                    workspace,
+                    &str_arg(args, "command"),
+                    args.get("timeout_secs").and_then(|t| t.as_u64()).unwrap_or(60),
+                )
+            }
+        }
+        "kill_background" => kill_background(
+            args.get("shell_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         ),
         "apply_patch" => {
             let hunks = args.get("hunks").and_then(|h| h.as_array()).cloned().unwrap_or_default();
@@ -702,6 +778,203 @@ fn run_command(workspace: &str, command: &str, timeout_secs: u64) -> Result<Stri
         body.push_str("\n（无输出）");
     }
     Ok(format!("{head}{body}"))
+}
+
+// ---- background shells (run_in_background, ZCode parity) ----------------
+
+/// One live background shell: output buffer + read cursor under one lock,
+/// the child behind its own mutex (kill/wait serialize on it), exit state
+/// flipped by a 200ms poll thread.
+struct BgShell {
+    child: Mutex<std::process::Child>,
+    out: Mutex<OutBuf>,
+    done: std::sync::atomic::AtomicBool,
+    exit_code: Mutex<Option<i32>>,
+    command: String,
+}
+
+struct OutBuf {
+    bytes: Vec<u8>,
+    read_pos: usize,
+}
+
+static BG_SHELLS: Mutex<Option<HashMap<u32, BgShell>>> = Mutex::new(None);
+static BG_NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+/// Buffer ceiling per shell — past it the head is dropped (tail kept).
+const BG_BUF_CAP: usize = 512 * 1024;
+/// Registry ceiling: shells beyond this drop the oldest finished ones.
+const BG_SHELL_CAP: usize = 32;
+
+fn bg_lock() -> std::sync::MutexGuard<'static, Option<HashMap<u32, BgShell>>> {
+    BG_SHELLS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Spawn a long-running command detached from the tool call: returns the
+/// shell_id immediately; output accumulates for read_background_output.
+pub fn spawn_background(workspace: &str, command: &str) -> Result<u32, String> {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return Err("命令为空".into());
+    }
+    if cmd.len() > 8 * 1024 {
+        return Err("命令过长（>8KB）".into());
+    }
+    let root = Path::new(workspace);
+    if !root.is_dir() {
+        return Err("工作区不存在".into());
+    }
+    let mut c = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+    if cfg!(windows) {
+        c.args(["/C", &format!("chcp 65001>nul & {cmd}")]);
+    } else {
+        c.args(["-c", cmd]);
+    }
+    c.current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = c.spawn().map_err(|e| format!("启动失败: {e}"))?;
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    let id = BG_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let shell = BgShell {
+        child: Mutex::new(child),
+        out: Mutex::new(OutBuf { bytes: Vec::new(), read_pos: 0 }),
+        done: std::sync::atomic::AtomicBool::new(false),
+        exit_code: Mutex::new(None),
+        command: cmd.chars().take(200).collect(),
+    };
+
+    // pump stdout/stderr into the shell's buffer until the process ends
+    {
+        let mut guard = bg_lock();
+        let map = guard.get_or_insert_with(HashMap::new);
+        // capacity: drop oldest finished shells first
+        while map.len() >= BG_SHELL_CAP {
+            if let Some(oldest_done) = map
+                .iter()
+                .filter(|(_, s)| s.done.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|(k, _)| *k)
+                .min()
+            {
+                map.remove(&oldest_done);
+            } else {
+                break;
+            }
+        }
+        map.insert(id, shell);
+    }
+
+    // poll thread: flip done + record the exit code
+    // (child was moved into the registry above; fetch it back for polling)
+    std::thread::spawn(move || loop {
+        let finished = {
+            let guard = bg_lock();
+            let map = guard.as_ref().unwrap();
+            match map.get(&id) {
+                None => true, // evicted: stop polling
+                Some(s) => {
+                    let mut c = s.child.lock().unwrap_or_else(|p| p.into_inner());
+                    match c.try_wait() {
+                        Ok(Some(st)) => {
+                            *s.exit_code.lock().unwrap_or_else(|p| p.into_inner()) = st.code();
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+            }
+        };
+        if finished {
+            let guard = bg_lock();
+            if let Some(s) = guard.as_ref().and_then(|m| m.get(&id)) {
+                s.done.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    });
+
+    // wire the pipes to the registry entry's buffer
+    pipe_into_shell(id, stdout);
+    pipe_into_shell(id, stderr);
+    Ok(id)
+}
+
+/// Continuously append one pipe's bytes into a shell's output buffer until
+/// the stream ends (process exit or kill).
+fn pipe_into_shell<R: std::io::Read + Send + 'static>(id: u32, r: R) {
+    std::thread::spawn(move || {
+        let mut r = r;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match r.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let guard = bg_lock();
+                    let Some(s) = guard.as_ref().and_then(|m| m.get(&id)) else { break };
+                    let mut b = s.out.lock().unwrap_or_else(|p| p.into_inner());
+                    if b.bytes.len() + n > BG_BUF_CAP {
+                        let keep = BG_BUF_CAP * 3 / 4;
+                        let cut = b.bytes.len().saturating_sub(keep);
+                        b.bytes.drain(..cut);
+                        b.read_pos = b.read_pos.saturating_sub(cut);
+                    }
+                    b.bytes.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
+    });
+}
+
+/// read_background_output tool: incremental new bytes since the last call
+/// plus the shell's liveness state. Unknown id ⇒ an explanatory error.
+pub fn read_background_output(shell_id: u32) -> Result<String, String> {
+    let guard = bg_lock();
+    let map = guard.as_ref().ok_or("shell_id 不存在 —— 没有任何后台 shell")?;
+    let s = map.get(&shell_id).ok_or_else(|| format!("shell_id {shell_id} 不存在（可能已被清理）"))?;
+    let mut b = s.out.lock().unwrap_or_else(|p| p.into_inner());
+    let new_bytes: Vec<u8> = b.bytes[b.read_pos.min(b.bytes.len())..].to_vec();
+    b.read_pos = b.bytes.len();
+    drop(b);
+    let state = if s.done.load(std::sync::atomic::Ordering::Relaxed) {
+        let code = *s.exit_code.lock().unwrap_or_else(|p| p.into_inner());
+        match code {
+            Some(0) => "exited(0) — 已成功结束".to_string(),
+            Some(c) => format!("exited({c}) — 已结束"),
+            None => "exited(被终止或信号退出)".to_string(),
+        }
+    } else {
+        "running — 仍在运行".to_string()
+    };
+    let text = String::from_utf8_lossy(&new_bytes);
+    let body = if text.trim().is_empty() {
+        "（无新增输出）".to_string()
+    } else {
+        text.chars().take(MAX_TOOL_RESULT_CHARS).collect()
+    };
+    Ok(format!("[{state}]\n{body}"))
+}
+
+/// kill_background tool: terminate a still-running shell. Returns a status
+/// line either way; the entry stays readable until it is evicted.
+pub fn kill_background(shell_id: u32) -> Result<String, String> {
+    let guard = bg_lock();
+    let map = guard.as_ref().ok_or("shell_id 不存在 —— 没有任何后台 shell")?;
+    let s = map.get(&shell_id).ok_or_else(|| format!("shell_id {shell_id} 不存在（可能已被清理）"))?;
+    if s.done.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(format!("shell {shell_id} 已退出，无需终止"));
+    }
+    let mut c = s.child.lock().unwrap_or_else(|p| p.into_inner());
+    match c.kill() {
+        Ok(()) => Ok(format!("shell {shell_id}（{}）已终止", s.command)),
+        Err(e) => Err(format!("终止失败: {e}")),
+    }
 }
 
 /// Post-write verification hook (better-harness style feedback loop): run the
@@ -1166,6 +1439,32 @@ pub fn search_files(workspace: &str, query: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_shell_lifecycle() {
+        // spawn an instant echo in a temp workspace, poll reads until the
+        // shell reports exit, and confirm the marker text was observed
+        let ws = std::env::temp_dir().join(format!("cch_bg_test_{}", std::process::id()));
+        fs::create_dir_all(&ws).unwrap();
+        let id = spawn_background(ws.to_str().unwrap(), "echo bg-ok-marker").unwrap();
+        let mut saw_marker = false;
+        let mut finished = false;
+        for _ in 0..50 {
+            let out = read_background_output(id).unwrap();
+            if out.contains("bg-ok-marker") {
+                saw_marker = true;
+            }
+            if out.contains("已结束") || out.contains("已成功结束") {
+                finished = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(saw_marker, "echo 输出未被捕获");
+        assert!(finished, "shell 未在时限内退出");
+        // killing an already-exited shell is a graceful no-op
+        assert!(kill_background(id).unwrap().contains("已退出"));
+    }
 
     #[test]
     fn rejects_escape_paths() {

@@ -319,6 +319,8 @@ function GoalSummaryBar({
       ? ` ${info.checklist_done}/${info.checklist_total}`
       : "";
   const claimed = info.checklist_claimed ?? 0;
+  const [tlOpen, setTlOpen] = useState(false);
+  const rounds = info.goal_rounds ?? [];
   return (
     <div className={`goal-summary ${s.cls}`}>
       <Icon name="target" size={13} />
@@ -344,6 +346,15 @@ function GoalSummaryBar({
         </span>
       )}
       {st === "paused" && !gateIsGoal && <span className="gs-flag">目标模式未激活</span>}
+      {rounds.length > 0 && (
+        <button
+          className="btn small ghost"
+          onClick={() => setTlOpen((o) => !o)}
+          title="按轮次查看目标推进过程（每轮标题 = 当时最靠前的待办）"
+        >
+          时间线 · {rounds.length} 轮
+        </button>
+      )}
       <span className="gs-actions" style={{ marginLeft: "auto" }}>
         {running && (
           <button className="btn small ghost" onClick={onPause} title="暂停后不再自动继续，模型也无权恢复">
@@ -368,6 +379,23 @@ function GoalSummaryBar({
           清除
         </button>
       </span>
+      {tlOpen && rounds.length > 0 && (
+        <div className="goal-timeline" role="list">
+          {[...rounds].reverse().map((r) => (
+            <div key={r.round} className="gt-row" role="listitem">
+              <span className="gt-round">#{r.round}</span>
+              <span className="gt-title" title={r.title}>
+                {r.title}
+              </span>
+              <span className="gt-counts">
+                {r.done}/{r.total}
+                {r.claimed > 0 ? ` · ${r.claimed} 待补` : ""}
+              </span>
+              <span className="gt-time">{new Date(r.ts).toLocaleTimeString()}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -377,11 +405,14 @@ function AssistantGroup({
   toolIndex,
   planActions,
   showGoal,
+  onBranch,
 }: {
   records: MessageRecord[];
   toolIndex: Map<string, string>;
   planActions?: { onApprove: () => void; onRevise: () => void } | null;
   showGoal?: boolean;
+  /** Offered only for fully-completed groups (ZCode-style fork anchor). */
+  onBranch?: () => void;
 }) {
   const assistants = groupAssistants(records);
   if (assistants.length === 0) return null;
@@ -445,6 +476,15 @@ function AssistantGroup({
         {goal && <GoalCard body={goal.body} done={goal.done} />}
       </div>
       <div className="m-meta">
+        {onBranch && (
+          <button
+            className="branch-chip"
+            title="从这条回复分叉一个新会话：历史与工作区原样带过去，原会话不动（ZCode 式会话分叉）"
+            onClick={onBranch}
+          >
+            <Icon name="branch" size={12} /> 分叉
+          </button>
+        )}
         {confidence != null && (
           <span className="chip" title="上游返回的置信度标记（已从正文中剥离）">
             置信度 {confidence}%
@@ -572,6 +612,13 @@ export function ChatView() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const lastSessionRef = useRef<string | null>(null);
+  // 划选追问 (selection-ask): mouseup over the transcript with a live
+  // selection floats a "追问" button near the selection; picking it pushes
+  // a quoted snippet into the composer via the `injected` prop (nonce-keyed)
+  const [selAsk, setSelAsk] = useState<{ text: string; x: number; y: number } | null>(null);
+  const [composerInject, setComposerInject] = useState<{ text: string; nonce: number } | null>(null);
+  // ZCode-style change meter: aggregate +/- lines over the session's writes
+  const [changeLines, setChangeLines] = useState<[number, number] | null>(null);
   // compaction state follows the selected session (hook BEFORE any early
   // return — conditional hooks are a Rules-of-Hooks violation)
   const compactionSessionId = activeSessionId;
@@ -581,6 +628,16 @@ export function ChatView() {
       void api.getSessionCompaction(compactionSessionId).then(setCompaction).catch(() => {});
     }
   }, [compactionSessionId]);
+  // refresh the +/- badge when the transcript grows (a turn that wrote
+  // files just ended) or the session switches
+  useEffect(() => {
+    setChangeLines(null);
+    if (!activeSessionId) return;
+    void api
+      .sessionChangeLines(activeSessionId)
+      .then(setChangeLines)
+      .catch(() => {});
+  }, [activeSessionId, msgs.length]);
 
   // session-cumulative prefix hit rate for the header badge (Σcached/Σinput
   // over the whole request ledger — same scope as the telemetry page; the
@@ -1134,9 +1191,9 @@ export function ChatView() {
     }
   };
 
-  const branchFrom = async (orig: MessageRecord) => {
+  const branchFrom = async (fromTs: number) => {
     try {
-      const branched = await api.branchSession(meta.id, orig.ts);
+      const branched = await api.branchSession(meta.id, fromTs);
       await refreshSessions();
       await selectSession(branched.id);
       toast("success", `已创建分支会话「${branched.title}」—— 原会话未改动`);
@@ -1186,6 +1243,20 @@ export function ChatView() {
       case "skills": {
         const skills = await api.getSkills(meta.workspace);
         toast("info", skills.length ? `可用技能: ${skills.map((s) => "/" + s.name).join("、")}` : "当前没有发现技能");
+        break;
+      }
+      case "wiki": {
+        if (!meta.workspace) {
+          toast("error", "当前会话未绑定工作区 —— 先用 /workspace <路径> 绑定，再生成仓库导读");
+          break;
+        }
+        toast("info", "正在生成仓库导读 —— 后台子智能体正在扫描工作区（只读，约需十几秒）…");
+        try {
+          const r = await api.wikiGenerate(meta.id);
+          toast("success", `仓库导读已写入 ${r.path}（约 ${r.chars} 字）—— 新会话自动注入上下文`);
+        } catch (e) {
+          toast("error", `生成失败: ${String(e)}`);
+        }
         break;
       }
       case "goal": {
@@ -1273,6 +1344,14 @@ export function ChatView() {
         >
           <Icon name="folder" size={13} /> {meta.workspace ? meta.workspace.split(/[\\/]/).pop() : "绑定工作区"}
         </button>
+        {changeLines && (
+          <span
+            className="chip changes-chip"
+            title="本会话写入工具累计改动行数（新建文件整文件计 +；编辑按内容差异估算）"
+          >
+            <span className="ch-add">+{changeLines[0]}</span> <span className="ch-del">−{changeLines[1]}</span>
+          </span>
+        )}
         {sessHit && sessHit.total_input > 0 && sessHit.total_cached > 0 ? (
           <span
             className={`chip ${sessHit.total_cached / sessHit.total_input >= 0.9 ? "good" : "warn"}`}
@@ -1297,6 +1376,21 @@ export function ChatView() {
         onScroll={(e) => {
           const el = e.currentTarget;
           stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+          setSelAsk(null);
+        }}
+        onMouseUp={() => {
+          const sel = window.getSelection();
+          const text = sel?.toString().trim() ?? "";
+          if (!sel || sel.isCollapsed || text.length < 2 || text.length > 4000 || sel.rangeCount === 0) {
+            setSelAsk(null);
+            return;
+          }
+          const rect = sel.getRangeAt(0).getBoundingClientRect();
+          if (!rect || (rect.width === 0 && rect.height === 0)) {
+            setSelAsk(null);
+            return;
+          }
+          setSelAsk({ text, x: rect.left + rect.width / 2, y: rect.top });
         }}
       >
         <div className="chat-scroll">
@@ -1348,7 +1442,7 @@ export function ChatView() {
                     onEditStart={() => setEditingMsg(u.id)}
                     onEditCancel={() => setEditingMsg(null)}
                     onResend={(t) => void resendFrom(u, t)}
-                    onBranch={() => void branchFrom(u)}
+                    onBranch={() => void branchFrom(u.ts)}
                   />
                 </Fragment>
               );
@@ -1359,6 +1453,11 @@ export function ChatView() {
                 records={item.group!}
                 toolIndex={toolIndex}
                 showGoal={wfMode === "goal"}
+                onBranch={
+                  item.group!.every((r) => r.status === "ok")
+                    ? () => void branchFrom(Math.max(...item.group!.map((r) => r.ts)))
+                    : undefined
+                }
                 planActions={
                   wfMode === "plan" && !(busy[meta.id] ?? false)
                     ? {
@@ -1456,6 +1555,25 @@ export function ChatView() {
           onResume={() => void resumeGoal()}
           onClear={() => void clearGoal()}
         />
+      )}
+      {selAsk && (
+        <button
+          className="sel-ask-btn"
+          style={{ left: Math.min(Math.max(selAsk.x - 40, 12), window.innerWidth - 100), top: Math.max(selAsk.y - 40, 12) }}
+          title="把选中的内容引用到输入框继续追问"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => {
+            const quote = selAsk.text.length > 600 ? selAsk.text.slice(0, 600) + "…" : selAsk.text;
+            setComposerInject({
+              text: `针对下面这段内容继续分析：\n> ${quote.replace(/\n/g, "\n> ")}`,
+              nonce: Date.now(),
+            });
+            window.getSelection()?.removeAllRanges();
+            setSelAsk(null);
+          }}
+        >
+          <Icon name="spark" size={12} /> 追问
+        </button>
       )}
       <Composer
         topSlot={
@@ -1615,6 +1733,7 @@ export function ChatView() {
         }
         disabled={!binding}
         busy={busy[meta.id] ?? false}
+        injected={composerInject}
         onStop={() => {
           goalStoppedRef.current = true;
           setGoalPaused(true);

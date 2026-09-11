@@ -172,6 +172,19 @@ pub struct SubagentProfile {
     pub system_prompt: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional tool whitelist (tool names as in the schema). Empty list =
+    /// the safe read-only default surface. Non-empty = exactly these tools
+    /// (write tools included only when explicitly listed).
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Optional cap on tool rounds for this profile (clamped 1..=40).
+    /// None = the global SUB_MAX_ROUNDS default.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    /// Origin marker: "config" (settings-managed, persisted) or "file"
+    /// (<data_dir>/agents/*.md — resolved on the fly, never written back).
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

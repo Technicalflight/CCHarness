@@ -337,6 +337,24 @@ export async function goalClear(sessionId: string): Promise<void> {
   await invoke("goal_clear", { sessionId });
 }
 
+// ---- context layer: /wiki repo digest + # history-session reference ----
+
+/** Generate the repo digest (/wiki): an Explore-style read-only subagent
+ *  scans the session's workspace and writes .ccharness/wiki.md. */
+export async function wikiGenerate(sessionId: string): Promise<{ path: string; chars: number }> {
+  return invoke("wiki_generate", { sessionId });
+}
+
+/** Deterministic digest of a past session for the # reference picker. */
+export async function sessionDigest(sessionId: string): Promise<string> {
+  return invoke<string>("session_digest", { sessionId });
+}
+
+/** Aggregate +/- line changes over the session's logged workspace writes. */
+export async function sessionChangeLines(sessionId: string): Promise<[number, number] | null> {
+  return invoke<[number, number] | null>("session_change_lines", { sessionId });
+}
+
 // ---- declarative state machine (sm:<def>:<state>) ----
 
 /** Full gate "sm:<def_id>:<state>" for the session, or "" when not in one. */

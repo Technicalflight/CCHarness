@@ -86,6 +86,7 @@ impl SessionStore {
             wt: None,
             wf_gate: None,
             goal: None,
+            goal_rounds: Vec::new(),
         };
         let sf = SessionFile {
             meta,

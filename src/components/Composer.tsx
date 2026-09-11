@@ -8,7 +8,7 @@ import { BrandMark, ModelMark } from "../lib/lobeIcon";
 import { Icon } from "../lib/icons";
 import { fmtBytes, fmtHit, fmtTokens } from "../lib/format";
 import * as api from "../lib/api";
-import type { ChatImage, EnhanceOutcome, SessionBinding, SessionTelemetry, SkillInfo } from "../types";
+import type { ChatImage, EnhanceOutcome, SessionBinding, SessionMeta, SessionTelemetry, SkillInfo } from "../types";
 
 interface SlashItem {
   name: string;
@@ -28,6 +28,7 @@ const BUILTINS: SlashItem[] = [
     desc: "目标管理：/goal <目标> 创建 · /goal 查看 · /goal pause|resume|clear",
     kind: "builtin",
   },
+  { name: "wiki", desc: "生成仓库导读 —— 子智能体扫描工作区，写入 .ccharness/wiki.md（新会话自动注入）", kind: "builtin" },
 ];
 
 interface Attachment {
@@ -177,6 +178,7 @@ export function Composer({
   onPermChange,
   imageMode,
   topSlot,
+  injected,
   children,
 }: {
   placeholder: string;
@@ -206,6 +208,9 @@ export function Composer({
   /** Floating chrome rendered inside the composer box (position:relative)
    *  — e.g. the mode-switch pill anchored to its top-right edge. */
   topSlot?: React.ReactNode;
+  /** Selection-ask (划选追问): ChatView pushes a quoted snippet here with a
+   *  fresh nonce; the composer appends it to the draft and focuses. */
+  injected?: { text: string; nonce: number } | null;
   children?: React.ReactNode;
 }) {
   const sendOnEnter = useApp((s) => s.config?.settings.send_on_enter ?? true);
@@ -223,12 +228,23 @@ export function Composer({
   const fileRef = useRef<HTMLInputElement>(null);
   const [slash, setSlash] = useState<{ items: SlashItem[]; hl: number } | null>(null);
   const [atMenu, setAtMenu] = useState<{ items: string[]; hl: number; start: number; end: number } | null>(null);
+  // # 会话引用菜单：列出最近的 chat 会话，选中后插入确定性摘要
+  // （session_digest 命令：目标 + 用户要求 + 最近结论，无模型调用）
+  const [hashMenu, setHashMenu] = useState<null | { sessions: SessionMeta[]; q: string; loading: boolean }>(null);
   const skillsCache = useRef<Map<string, SkillInfo[]>>(new Map());
 
   // permission mode is per-session, in-memory, default "approve"
   useEffect(() => {
     setPermMode("approve");
   }, [sessionId]);
+
+  // selection-ask injection: append the quoted snippet to the draft
+  useEffect(() => {
+    if (!injected?.nonce) return;
+    setText((cur) => (cur.trim() ? cur + "\n\n" : "") + injected.text);
+    requestAnimationFrame(() => ref.current?.focus());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [injected?.nonce]);
 
   // slash menu: active while the text starts with "/"; items = builtin
   // commands + project/global skills, filtered by the token after "/"
@@ -455,6 +471,40 @@ export function Composer({
     }
   };
 
+  // ---- # 历史会话引用（ZCode parity）：打开菜单 → 选中会话 → 插入摘要 ----
+  const openHashMenu = async () => {
+    setHashMenu({ sessions: [], q: "", loading: true });
+    try {
+      const all = await api.listSessions();
+      const sessions = all
+        .filter((s) => s.kind === "chat" && !s.archived)
+        .sort((a, b) => b.updated_at - a.updated_at)
+        .slice(0, 40);
+      setHashMenu({ sessions, q: "", loading: false });
+    } catch (e) {
+      setHashMenu(null);
+      toast("error", `读取会话列表失败: ${String(e)}`);
+    }
+  };
+  const pickSession = async (s: SessionMeta) => {
+    setHashMenu(null);
+    try {
+      const digest = await api.sessionDigest(s.id);
+      const block = `#历史会话引用\n${digest}`;
+      setText((cur) => (cur.trim() ? cur + "\n\n" : "") + block);
+      requestAnimationFrame(() => ref.current?.focus());
+    } catch (e) {
+      toast("error", `生成会话摘要失败: ${String(e)}`);
+    }
+  };
+  const relTime = (ts: number) => {
+    const diff = Date.now() - ts;
+    if (diff < 60_000) return "刚刚";
+    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+    return `${Math.floor(diff / 86_400_000)} 天前`;
+  };
+
   const setThinking = (level: string) => {
     if (!useApp.getState().config) return;
     void persistConfig({
@@ -602,6 +652,44 @@ export function Composer({
             </div>
           </div>
         )}
+        {hashMenu && (
+          <div className="slash-menu">
+            <div className="at-head"># 引用历史会话（选中后插入其摘要，Esc 关闭）</div>
+            <input
+              className="hash-search"
+              autoFocus
+              placeholder="搜索会话标题…"
+              value={hashMenu.q}
+              onChange={(e) => setHashMenu((s) => (s ? { ...s, q: e.target.value } : s))}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setHashMenu(null);
+                }
+                if (e.key === "Enter" && hashMenu.sessions.length > 0) {
+                  e.preventDefault();
+                  void pickSession(hashMenu.sessions[0]);
+                }
+              }}
+            />
+            {hashMenu.loading && <div className="slash-desc" style={{ padding: "6px 10px" }}>读取中…</div>}
+            {hashMenu.sessions
+              .filter((s) => !hashMenu.q || s.title.toLowerCase().includes(hashMenu.q.toLowerCase()))
+              .map((s) => (
+                <button
+                  key={s.id}
+                  className="slash-item"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => void pickSession(s)}
+                >
+                  <span className="mono slash-name" style={{ maxWidth: 340, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    <Icon name="chat" size={13} /> {s.title}
+                  </span>
+                  <span className="slash-desc">{relTime(s.updated_at)}</span>
+                </button>
+              ))}
+          </div>
+        )}
         <textarea
           ref={ref}
           rows={1}
@@ -618,10 +706,36 @@ export function Composer({
               if (imgs.length > 0) {
                 e.preventDefault();
                 void addImages(imgs);
+                return;
+              }
+            }
+            // overlong text paste → auto-attach (ZCode parity): a huge dump
+            // would wreck the draft box; as an attachment it rides as a
+            // fenced block appended at send time, removable via its chip
+            if (!imageMode) {
+              const txt = e.clipboardData?.getData("text/plain") ?? "";
+              if (txt.length > 12_000) {
+                e.preventDefault();
+                const size = new Blob([txt]).size;
+                setAttachments((cur) => [
+                  ...cur,
+                  {
+                    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                    name: `粘贴文本 ${txt.length} 字`,
+                    size,
+                    text: txt,
+                  },
+                ]);
+                toast("info", `粘贴内容过长（${txt.length} 字符）—— 已自动转为附件注入，可点标签移除`);
+                return;
               }
             }
           }}
           onKeyDown={(e) => {
+            if (hashMenu && e.key === "Escape") {
+              setHashMenu(null);
+              return;
+            }
             if (atMenu && atMenu.items.length > 0) {
               if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                 e.preventDefault();
@@ -725,6 +839,15 @@ export function Composer({
                 e.currentTarget.value = "";
               }}
             />
+            {sessionId && !imageMode && (
+              <button
+                className="foot-btn"
+                title="# 引用历史会话 —— 把某个旧会话的摘要（目标 / 用户要求 / 最近结论）插入当前消息"
+                onClick={() => (hashMenu ? setHashMenu(null) : void openHashMenu())}
+              >
+                <span className="mono" style={{ fontSize: 14, fontWeight: 700, lineHeight: 1 }}>#</span>
+              </button>
+            )}
             {imageMode && (
               <span className="img-mode-tag" title="生图模式 —— 仅图像模型，不使用工具与工作区">
                 <Icon name="image" size={12} /> 生图模式

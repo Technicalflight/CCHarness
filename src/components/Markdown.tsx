@@ -1,8 +1,70 @@
-// Markdown rendering with GFM, code-block headers and copy buttons.
-import { memo, useState } from "react";
+// Markdown rendering with GFM, code-block headers, copy buttons and
+// Mermaid diagram rendering (```mermaid blocks render as SVG, with a
+// source toggle and graceful fallback when the diagram fails to parse).
+import { memo, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ComponentPropsWithoutRef } from "react";
+
+// mermaid is heavy (~1MB): loaded on demand — the first ```mermaid block
+// in a session triggers the dynamic import, everything else never pays.
+let mermaidMod: Promise<{ default: typeof import("mermaid").default }> | null = null;
+function loadMermaid() {
+  if (!mermaidMod) {
+    mermaidMod = import("mermaid");
+    mermaidMod.then(({ default: mermaid }) => {
+      const light = document.documentElement.getAttribute("data-theme") === "light";
+      mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: "strict",
+        theme: light ? "neutral" : "dark",
+      });
+    });
+  }
+  return mermaidMod;
+}
+
+function MermaidBlock({ code }: { code: string }) {
+  const [svg, setSvg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [showSource, setShowSource] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    setSvg(null);
+    setErr(null);
+    loadMermaid()
+      .then(({ default: mermaid }) => mermaid.render(`mmd-${Math.random().toString(36).slice(2)}`, code))
+      .then(({ svg: out }) => {
+        if (!cancelled) setSvg(out);
+      })
+      .catch((e) => {
+        if (!cancelled) setErr(String(e?.message ?? e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [code]);
+  return (
+    <div className="code-block mermaid-block">
+      <div className="code-head">
+        <span>mermaid</span>
+        <button onClick={() => setShowSource((s) => !s)}>{showSource ? "图表" : "源码"}</button>
+      </div>
+      {showSource || err ? (
+        <pre>
+          <code>{code}</code>
+        </pre>
+      ) : svg ? (
+        <div className="mermaid-view" dangerouslySetInnerHTML={{ __html: svg }} />
+      ) : (
+        <div className="mermaid-view" style={{ opacity: 0.6, padding: "18px 14px", fontSize: 12 }}>
+          正在渲染图表…
+        </div>
+      )}
+      {err && <div className="mermaid-err">图表解析失败：{err.slice(0, 160)}</div>}
+    </div>
+  );
+}
 
 function CodeBlock({ lang, code }: { lang: string; code: string }) {
   const [copied, setCopied] = useState(false);
@@ -57,6 +119,9 @@ const components = {
       code = extractText(props?.children);
     } else {
       code = extractText(child);
+    }
+    if (lang === "mermaid") {
+      return <MermaidBlock code={code.replace(/\n$/, "")} />;
     }
     return <CodeBlock lang={lang} code={code.replace(/\n$/, "")} />;
   },
