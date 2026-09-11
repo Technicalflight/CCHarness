@@ -364,7 +364,37 @@ fn spawn_server(
     if !cfg.cwd.trim().is_empty() {
         cmd.current_dir(cfg.cwd.trim());
     }
-    // minimal env — provider keys must not leak into MCP servers
+    // minimal env — provider keys must not leak into MCP servers. A child
+    // process inherits the FULL parent environment by default (the comment
+    // below used to claim otherwise while the code did nothing): clear it
+    // and re-add only what stdio servers commonly need to run (runtimes,
+    // temp dirs, locale), then the user-configured vars.
+    cmd.env_clear();
+    const KEEP: &[&str] = &[
+        "PATH",
+        "PATHEXT",
+        "COMSPEC",
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "HOME",
+        "USER",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+    ];
+    for (k, v) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        if KEEP.iter().any(|allow| name.eq_ignore_ascii_case(allow)) {
+            cmd.env(k, v);
+        }
+    }
     for (k, v) in &cfg.env {
         cmd.env(k, v);
     }
@@ -414,6 +444,18 @@ fn headers_of(cfg: &McpServerConfig) -> reqwest::header::HeaderMap {
 async fn request_http(cfg: &McpServerConfig, msg: Value, timeout_secs: u64) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
+        // user-configured endpoints are trusted-ish, but redirects must not
+        // quietly walk a request into loopback/private space (P2 SSRF)
+        .redirect(reqwest::redirect::Policy::custom(|att| {
+            if att.previous().len() > 5 {
+                return att.error("重定向过多");
+            }
+            let host = att.url().host_str().unwrap_or("");
+            if crate::urlguard::is_loopback_or_private(host) {
+                return att.error("重定向目标位于本机/内网，已拒绝");
+            }
+            att.follow()
+        }))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client

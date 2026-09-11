@@ -268,7 +268,8 @@ pub fn git_branches(workspace: String) -> Result<Vec<GitBranch>, String> {
 /// git itself refuses anything unsafe, e.g. a branch held by a worktree).
 #[tauri::command]
 pub fn git_switch(workspace: String, name: String) -> Result<(), String> {
-    crate::worktree::git(Path::new(&workspace), &["checkout", "-q", &name]).map(|_| ())
+    sane_token("分支名", name.trim(), false)?;
+    crate::worktree::git(Path::new(&workspace), &["checkout", "-q", name.trim()]).map(|_| ())
 }
 
 // ---------- remote repositories (push/pull/fetch + remote management) ----------
@@ -300,6 +301,19 @@ pub fn git_remotes(workspace: String) -> Result<Vec<GitRemote>, String> {
     Ok(remotes)
 }
 
+/// Refuse option-looking operands: a renderer-compromised value starting
+/// with `-` would be parsed as a git FLAG, not a name (P2 hardening).
+/// Remote names additionally get a strict charset (git ref/remote rules).
+fn sane_token(kind: &str, v: &str, strict: bool) -> Result<(), String> {
+    if v.is_empty() || v.starts_with('-') {
+        return Err(format!("非法{kind}: {v}"));
+    }
+    if strict && !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        return Err(format!("非法{kind}（仅允许字母数字 . _ -）: {v}"));
+    }
+    Ok(())
+}
+
 /// Register a remote (name + URL). Git rejects duplicate names — the error
 /// surfaces so the user can remove the old one or pick another name.
 #[tauri::command]
@@ -309,13 +323,16 @@ pub fn git_remote_add(workspace: String, name: String, url: String) -> Result<()
     if name.is_empty() || url.is_empty() {
         return Err("远程名称和 URL 都不能为空".into());
     }
+    sane_token("远程名", name, true)?;
+    sane_token("URL", url, false)?;
     crate::worktree::git(Path::new(&workspace), &["remote", "add", name, url]).map(|_| ())
 }
 
 /// Remove a configured remote (local files are untouched).
 #[tauri::command]
 pub fn git_remote_remove(workspace: String, name: String) -> Result<(), String> {
-    crate::worktree::git(Path::new(&workspace), &["remote", "remove", &name]).map(|_| ())
+    sane_token("远程名", name.trim(), true)?;
+    crate::worktree::git(Path::new(&workspace), &["remote", "remove", name.trim()]).map(|_| ())
 }
 
 /// Push the current branch to a remote. `set_upstream` (-u) links the local
@@ -328,12 +345,16 @@ pub fn git_push(
     branch: String,
     set_upstream: bool,
 ) -> Result<String, String> {
+    sane_token("远程名", remote.trim(), true)?;
+    sane_token("分支名", branch.trim(), false)?;
+    let remote = remote.trim();
+    let branch = branch.trim();
     let mut args: Vec<&str> = vec!["push"];
     if set_upstream {
         args.push("-u");
     }
-    args.push(&remote);
-    args.push(&branch);
+    args.push(remote);
+    args.push(branch);
     crate::worktree::git_net(Path::new(&workspace), &args)
 }
 

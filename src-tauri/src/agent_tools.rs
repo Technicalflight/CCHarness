@@ -1335,8 +1335,36 @@ fn web_fetch(url: &str) -> Result<String, String> {
     // dedicated thread: blocking client would otherwise run on a tokio worker
     let url_owned = url.to_string();
     let handle = std::thread::spawn(move || -> Result<(String, String), String> {
+        // resolve-then-pin (P2 SSRF hardening): the lexical host check loses
+        // to DNS rebinding — a name can answer public at check time and
+        // loopback at connect time. Resolve here, vet EVERY answer, and pin
+        // the connection to the first vetted address so reqwest cannot
+        // re-resolve around us. Redirect hops keep the host-string check
+        // below (per-hop pinning is not expressible in reqwest's API).
+        use std::net::ToSocketAddrs;
+        let parsed = reqwest::Url::parse(&url_owned).map_err(|e| format!("URL 无效: {e}"))?;
+        let host = parsed
+            .host_str()
+            .ok_or("URL 缺少主机名")?
+            .trim_matches(['[', ']'])
+            .to_string();
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let mut pinned: Option<std::net::SocketAddr> = None;
+        for sa in (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|e| format!("DNS 解析失败: {e}"))?
+        {
+            if crate::urlguard::is_loopback_or_private(&sa.ip().to_string()) {
+                return Err(format!("解析结果 {} 位于本机/内网，请求已拒绝", sa.ip()));
+            }
+            if pinned.is_none() {
+                pinned = Some(sa);
+            }
+        }
+        let pinned = pinned.ok_or_else(|| "DNS 解析未返回地址".to_string())?;
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
+            .resolve(&host, pinned)
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() > 5 {
                     return attempt.error("重定向过多");

@@ -172,14 +172,18 @@ fn load_master_key(data_dir: &Path) -> Option<[u8; 32]> {
     Some(key)
 }
 
-/// SHA-256 counter-mode keystream XOR. This is at-rest encryption against
-/// casual disk scans / synced folders — not against a process that can read
-/// the key file next to it (no local scheme can be).
-fn keystream_xor(key: &[u8; 32], data: &mut [u8]) {
+/// SHA-256 counter-mode keystream XOR over (master key ‖ per-file nonce ‖
+/// counter). The per-file nonce is what makes this sound: a fixed keystream
+/// reused across files is a many-time-pad — passive possession of the cache
+/// directory would XOR any two files to recover their plaintext difference.
+/// Still at-rest encryption against casual disk scans / synced folders, not
+/// against a process that can read the key file next to it.
+fn keystream_xor(key: &[u8; 32], nonce: &[u8; 16], data: &mut [u8]) {
     let mut counter: u64 = 0;
     for chunk in data.chunks_mut(32) {
         let mut h = Sha256::new();
         h.update(key);
+        h.update(nonce);
         h.update(counter.to_be_bytes());
         let ks = h.finalize();
         for (b, k) in chunk.iter_mut().zip(ks.iter()) {
@@ -189,6 +193,11 @@ fn keystream_xor(key: &[u8; 32], data: &mut [u8]) {
     }
 }
 
+/// Random per-file nonce (UUIDv4 is getrandom-backed).
+fn random_nonce() -> [u8; 16] {
+    uuid::Uuid::new_v4().into_bytes()
+}
+
 fn l2_put(data_dir: &Path, ns: &str, key: &str, e: &EntryMeta) -> std::io::Result<()> {
     let Some(mk) = load_master_key(data_dir) else {
         return Ok(()); // key unavailable → skip disk layer silently
@@ -196,8 +205,13 @@ fn l2_put(data_dir: &Path, ns: &str, key: &str, e: &EntryMeta) -> std::io::Resul
     let dir = l2_dir(data_dir, ns);
     fs::create_dir_all(&dir)?;
     let json = serde_json::to_vec(e).map_err(|e| std::io::Error::other(e))?;
-    let mut payload = [MAGIC as &[u8], &json].concat();
-    keystream_xor(&mk, &mut payload[MAGIC.len()..]);
+    // layout: MAGIC ‖ nonce(16, plaintext) ‖ ciphertext
+    let nonce = random_nonce();
+    let mut payload: Vec<u8> = Vec::with_capacity(MAGIC.len() + 16 + json.len());
+    payload.extend_from_slice(MAGIC);
+    payload.extend_from_slice(&nonce);
+    payload.extend_from_slice(&json);
+    keystream_xor(&mk, &nonce, &mut payload[MAGIC.len() + 16..]);
     let path = key_file(data_dir, ns, key);
     let tmp = dir.join(format!(".{key}.tmp"));
     fs::write(&tmp, &payload)?;
@@ -216,8 +230,23 @@ fn l2_get(data_dir: &Path, ns: &str, key: &str) -> Option<EntryMeta> {
     let Some(mk) = load_master_key(data_dir) else {
         return None;
     };
-    keystream_xor(&mk, &mut payload[MAGIC.len()..]);
-    match serde_json::from_slice::<EntryMeta>(&payload[MAGIC.len()..]) {
+    let body = payload.len() - MAGIC.len();
+    // plaintext start: where the EntryMeta JSON lives after decryption
+    let plaintext_at = if body >= 16 {
+        // current format: per-file random nonce → unique keystream per file
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&payload[MAGIC.len()..MAGIC.len() + 16]);
+        keystream_xor(&mk, &nonce, &mut payload[MAGIC.len() + 16..]);
+        MAGIC.len() + 16
+    } else {
+        // legacy pre-nonce format (zero nonce = the old fixed keystream);
+        // real entries always exceed 16 bytes of body, so in practice they
+        // fail the nonce parse above and are dropped, then rewritten with a
+        // fresh nonce by the next put
+        keystream_xor(&mk, &[0u8; 16], &mut payload[MAGIC.len()..]);
+        MAGIC.len()
+    };
+    match serde_json::from_slice::<EntryMeta>(&payload[plaintext_at..]) {
         Ok(e) => Some(e),
         Err(_) => {
             // corrupt or foreign-format entry: delete, treat as miss

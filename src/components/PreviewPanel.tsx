@@ -257,6 +257,26 @@ function BrowserTab() {
     let v = u.trim();
     if (!v) return;
     if (!/^https?:\/\//i.test(v)) v = `http://${v}`;
+    // sandbox hardening (P2): this panel is for LOCAL dev servers only. The
+    // app's own origin (tauri.localhost) must never be framed — same-origin
+    // content in the frame could reach the IPC surface.
+    let host = "";
+    try {
+      host = new URL(v).hostname;
+    } catch {
+      toast("error", "非法地址");
+      return;
+    }
+    if (host === location.hostname) {
+      toast("error", "不能内嵌应用自身来源");
+      return;
+    }
+    const local =
+      host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host.endsWith(".localhost");
+    if (!local) {
+      toast("error", "内嵌预览仅支持本地服务（localhost / 127.0.0.1）");
+      return;
+    }
     setInput(v);
     setUrl(v);
     setReloadKey((k) => k + 1);
@@ -321,7 +341,10 @@ function BrowserTab() {
           className="pv-frame"
           src={url}
           title="预览"
-          sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+          // no allow-same-origin: framed pages run in an opaque origin, so
+          // even a malicious local server cannot touch the app's IPC
+          // surface (MDN flags scripts+same-origin together as unsafe)
+          sandbox="allow-scripts allow-forms allow-popups"
         />
       )}
     </div>

@@ -126,10 +126,23 @@ pub fn create(workspace: &str, data_dir: &Path, session_id: &str) -> Result<WtSt
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let branch = format!("cch-{sid}-{ts}");
-    let dir = data_dir.join("worktrees").join(session_id);
+    // the PATH component needs the same sanitizing as the branch label: a
+    // raw session_id with separators/dots would aim the remove_dir_all
+    // below OUTSIDE the worktrees root (P2 hardening; same discipline as
+    // sessions::sanitize_id)
+    let sid_path: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    let sid_path = if sid_path.is_empty() { "unknown".to_string() } else { sid_path };
+    let dir = data_dir.join("worktrees").join(&sid_path);
     // a leftover from an earlier crash would make `worktree add` fail —
     // clear the directory and let git drop its stale registry entry first
     if dir.exists() {
+        // belt & suspenders: never recurse-delete outside the worktrees root
+        if !dir.starts_with(data_dir.join("worktrees")) {
+            return Err("非法会话标识".into());
+        }
         let _ = std::fs::remove_dir_all(&dir);
         let _ = git(root, &["worktree", "prune"]);
     }
