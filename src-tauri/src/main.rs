@@ -15,6 +15,7 @@ mod importer;
 mod mcp;
 mod memvector;
 mod prefix;
+mod privacy;
 mod sessions;
 mod skillhub;
 mod skills;
@@ -181,6 +182,7 @@ fn main() {
             commands::wiki_generate,
             commands::session_digest,
             commands::session_change_lines,
+            commands::open_backup_dir,
             commands::goal_status,
             commands::goal_clear,
             commands::sm_get,

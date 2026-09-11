@@ -541,4 +541,9 @@ export async function openDataDir(): Promise<void> {
   await invoke("open_data_dir");
 }
 
+/** Open the sandbox auto-backup directory in the OS file manager. */
+export async function openBackupDir(): Promise<void> {
+  await invoke("open_backup_dir");
+}
+
 export type { ProviderKind };

@@ -130,6 +130,39 @@ pub struct AppSettings {
     /// verification immediately. None/empty = disabled.
     #[serde(default)]
     pub post_write_command: Option<String>,
+    /// 伪匿名化安全模式（pseudonymisation, NOT anonymisation）：所有出站
+    /// 文本（用户消息/工具结果/历史重放）先经 privacy.rs 做类型一致的
+    /// 替代值替换（HMAC 确定性映射，同会话同值同替身），模型回复写盘前
+    /// 还原。映射表只存在本机。可能影响模型结果；并非 100% 安全。默认关。
+    #[serde(default)]
+    pub privacy_mode: bool,
+    /// 沙箱模式总开关（默认关）：开启后下列子策略才生效。被拦截的操作
+    /// 会以 ERROR 返回给模型——可能影响任务完成度。
+    #[serde(default)]
+    pub sandbox_mode: bool,
+    /// 沙箱·文件安全：删除类工具（delete_file）一律拒绝。
+    #[serde(default = "default_true")]
+    pub sandbox_files: bool,
+    /// 沙箱·命令安全：高危 shell 命令黑名单拦截（rm -rf / del /s / format
+    /// / reg / shutdown / taskkill /f / git push --force / git reset --hard
+    /// 等）。
+    #[serde(default = "default_true")]
+    pub sandbox_commands: bool,
+    /// 沙箱·网络安全：web_fetch 外网抓取在会话内被拒绝（MCP 不受此控，
+    /// 请按需自行关闭 MCP 开关）。
+    #[serde(default = "default_true")]
+    pub sandbox_network: bool,
+    /// 沙箱·自动备份：每次 write/edit/apply_patch 落盘前，把目标文件原样
+    /// 快照到 <data_dir>/backups/<session_id>/。
+    #[serde(default)]
+    pub sandbox_backup: bool,
+    /// 自动备份总上限（MB）：超过后从最旧开始清理。
+    #[serde(default = "default_backup_cap_mb")]
+    pub sandbox_backup_cap_mb: u64,
+}
+
+fn default_backup_cap_mb() -> u64 {
+    500
 }
 
 impl Default for AppSettings {
@@ -151,6 +184,13 @@ impl Default for AppSettings {
             guardrails_extra: Vec::new(),
             goal_budget_usd: None,
             post_write_command: None,
+            privacy_mode: false,
+            sandbox_mode: false,
+            sandbox_files: true,
+            sandbox_commands: true,
+            sandbox_network: true,
+            sandbox_backup: false,
+            sandbox_backup_cap_mb: 500,
         }
     }
 }

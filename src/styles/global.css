@@ -3295,6 +3295,12 @@ kbd {
   bottom: calc(100% + 2px);
   z-index: 6;
 }
+/* sandbox capsule: danger accent while active — it changes tool policy */
+.sandbox-pill.on {
+  color: var(--bad, #e05666);
+  border-color: var(--bad, #e05666);
+  background: color-mix(in srgb, var(--bad, #e05666) 12%, transparent);
+}
 .wf-btn {
   display: inline-flex;
   align-items: center;

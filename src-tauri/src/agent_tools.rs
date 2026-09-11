@@ -42,6 +42,96 @@ pub fn is_write_tool(name: &str) -> bool {
     WRITE_TOOLS.contains(&name)
 }
 
+// ---- sandbox mode (沙箱模式：文件 / 命令 / 网络三类访问策略) -----------
+//
+// Tool-level isolation, NOT a VM/container: the agent keeps running in
+// process, but its destructive surface is cut down by policy —
+//   文件策略  delete-class tools are refused outright; writes stay inside
+//             the workspace guard and every write still needs approval
+//   命令策略  a destructive-command blocklist (rm -rf / del /s / format /
+//             reg / shutdown / git push --force / git reset --hard …)
+//   网络策略  web_fetch refused; common network-fetching shell commands
+//             blocked as well
+// plus: the per-session permission mode "auto" degrades to "approve"
+// (enforced at send time). Fail-closed: unknown risk = block.
+// A global policy loaded from settings on startup and on every save_config.
+// `on` gates everything; the three sub-policies mirror the settings page.
+// Backup snapshots live in commands.rs (needs data_dir).
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SandboxPolicy {
+    pub on: bool,
+    pub files: bool,
+    pub commands: bool,
+    pub network: bool,
+}
+
+static SANDBOX: Mutex<SandboxPolicy> = Mutex::new(SandboxPolicy {
+    on: false,
+    files: false,
+    commands: false,
+    network: false,
+});
+
+/// Called on startup and whenever the config is saved.
+pub fn set_sandbox_policy(on: bool, files: bool, commands: bool, network: bool) {
+    let mut p = SANDBOX.lock().unwrap_or_else(|p| p.into_inner());
+    *p = SandboxPolicy { on, files, commands, network };
+}
+
+pub fn sandbox_policy() -> SandboxPolicy {
+    *SANDBOX.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Destructive / network shell patterns (lowercase, substring match).
+const SANDBOX_CMD_BLOCKLIST: &[&str] = &[
+    // file destruction
+    "rm -rf", "rm -fr", "rm -r ", "rd /s", "rmdir /s", "del /s", "del /f", "del /q",
+    "remove-item", "format ", "diskpart", "mkfs", "dd if=", "cipher /w", "vssadmin delete",
+    "attrib -s -h", "schtasks /create",
+    // registry / system
+    "reg delete", "reg add", "reg import", "regedit /s", "shutdown", "logoff",
+    "stop-computer", "restart-computer",
+    "taskkill /f", "taskkill /im", "stop-process", "stop-service",
+    // git destructive
+    "git push --force", "git push -f", "git reset --hard", "git clean -f",
+    "git clean -fd", "git checkout -- .", "git branch -d", "git branch -D",
+    // network fetching (命令策略内一并拦截，降低外联风险)
+    "curl ", "wget ", "invoke-webrequest", "iwr ", "certutil -urlcache", "bitsadmin",
+    "nc ", "ncat ", "telnet ", "ftp ",
+    // fork bomb / eval tricks
+    ":(){", "| sh", "| bash", "|sh", "|bash", "invoke-expression", "iex ",
+];
+
+/// Pre-execution guard for mutating / network tools. `Ok(())` = proceed
+/// (approval flow still applies); `Err(reason)` = the tool returns ERROR to
+/// the model without ever reaching the approval card.
+pub fn sandbox_check(name: &str, args: &Value) -> Result<(), String> {
+    let p = sandbox_policy();
+    if !p.on {
+        return Ok(());
+    }
+    // 文件策略: deletion is refused outright
+    if p.files && name == "delete_file" {
+        return Err("沙箱模式已拦截：删除类操作被禁止（文件策略）。如需删除，请关闭沙箱模式或手动执行。".into());
+    }
+    // 网络策略: no outbound fetch tool
+    if p.network && name == "web_fetch" {
+        return Err("沙箱模式已拦截：网络访问被禁止（网络策略）。web_fetch 在沙箱内不可用。".into());
+    }
+    // 命令策略: destructive / network shell commands are blocked
+    if p.commands && name == "run_command" {
+        let cmd = str_arg(args, "command").to_lowercase();
+        if let Some(hit) = SANDBOX_CMD_BLOCKLIST.iter().find(|pat| cmd.contains(*pat)) {
+            return Err(format!(
+                "沙箱模式已拦截：命令命中高危策略「{}」（命令策略）。可关闭沙箱模式后重试，或自行在终端执行。",
+                hit.trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The OpenAI `tools` array. Constant bytes per build — it sits in the
 /// request head ahead of `messages`, inside the cacheable prefix.
 pub fn schema() -> Value {

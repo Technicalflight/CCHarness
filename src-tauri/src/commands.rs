@@ -613,6 +613,8 @@ impl AppState {
             .build()
             .expect("http client");
         let store = SessionStore::new(&data_dir);
+        // mirror the sandbox policy into the tool guard before any turn runs
+        sync_sandbox_policy(&config::load(&data_dir).settings);
         // The request sequence must survive restarts: seed the global counter
         // from the highest seq already recorded in any session file, or old
         // and new records collide on the same numbers.
@@ -681,6 +683,122 @@ pub fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<(), 
         }
     }
     config::save(&state.data_dir, &config);
+    sync_sandbox_policy(&config.settings);
+    Ok(())
+}
+
+/// Mirror the sandbox settings into the agent-tools guard (startup +
+/// every save).
+fn sync_sandbox_policy(s: &config::AppSettings) {
+    crate::agent_tools::set_sandbox_policy(
+        s.sandbox_mode,
+        s.sandbox_files,
+        s.sandbox_commands,
+        s.sandbox_network,
+    );
+}
+
+/// Recursively restore surrogates inside a tool-call argument JSON so the
+/// tool operates on REAL values while the model only ever saw surrogates.
+fn restore_args(session_id: &str, seed: &[u8; 32], v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            let restored = crate::privacy::restore(session_id, s);
+            if &restored != s {
+                *s = restored;
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                restore_args(session_id, seed, item);
+            }
+        }
+        Value::Object(map) => {
+            for (_k, val) in map.iter_mut() {
+                restore_args(session_id, seed, val);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Sandbox auto-backup: copy the file about to be modified into
+/// <data_dir>/backups/<session_id>/<ts>-<name>, then trim the whole backups
+/// dir down to the cap (oldest first). Best-effort — a backup failure never
+/// blocks the write itself.
+fn backup_snapshot(
+    data_dir: &std::path::Path,
+    session_id: &str,
+    file: &std::path::Path,
+    cap_mb: u64,
+) -> Result<(), String> {
+    let dir = data_dir.join("backups").join(session_id);
+    fs::create_dir_all(&dir).map_err(|e| format!("backup dir: {e}"))?;
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f");
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file.bin");
+    let dest = dir.join(format!("{ts}-{name}"));
+    fs::copy(file, &dest).map_err(|e| format!("backup copy: {e}"))?;
+    // trim: while the backups tree exceeds the cap, delete its oldest file
+    let cap = cap_mb.saturating_mul(1024 * 1024);
+    let mut files: Vec<(std::time::SystemTime, PathBuf, u64)> = vec![];
+    fn walk(dir: &std::path::Path, out: &mut Vec<(std::time::SystemTime, PathBuf, u64)>) {
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if let Ok(md) = e.metadata() {
+                    out.push((md.modified().unwrap_or(std::time::UNIX_EPOCH), p, md.len()));
+                }
+            }
+        }
+    }
+    walk(&data_dir.join("backups"), &mut files);
+    let total: u64 = files.iter().map(|(_, _, l)| l).sum();
+    if total > cap {
+        files.sort_by_key(|(t, _, _)| *t);
+        let mut acc = total;
+        for (_, p, l) in files {
+            if acc <= cap {
+                break;
+            }
+            if fs::remove_file(&p).is_ok() {
+                acc = acc.saturating_sub(l);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open the sandbox backup directory in the OS file manager.
+#[tauri::command]
+pub fn open_backup_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let dir = state.data_dir.join("backups");
+    fs::create_dir_all(&dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -2615,6 +2733,10 @@ async fn run_send(
                 }
             }
             let perm_mode = permission_of(&session_id);
+            // sandbox: the risky "auto" write tier degrades to per-action
+            // approval — fail-safe rather than convenient
+            let sb = crate::agent_tools::sandbox_policy();
+            let perm_mode = if sb.on && perm_mode == "auto" { "approve" } else { perm_mode };
             // plan gate: read-only tool surface, no MCP, no writes — the
             // directive itself rides on the user message (see transcript_for_lane).
             // goal gate: full surface, but more tool rounds per turn.
@@ -2737,6 +2859,17 @@ async fn run_send(
 
             // ---- prefix state (synchronous, brief lock) ----
             let cache_key = format!("ccharness-{session_id}-{lane}");
+            // privacy scrub context: outbound messages get type-consistent
+            // surrogates; records keep the originals (see privacy.rs)
+            let privacy_on = cfg.settings.privacy_mode;
+            let pseed = crate::privacy::session_seed(&data_dir, &session_id);
+            let scrub_outbound = |msgs: &mut [crate::prefix::ChatMessage]| {
+                if privacy_on {
+                    for m in msgs.iter_mut() {
+                        m.content = crate::privacy::outbound(&session_id, &pseed, &m.content);
+                    }
+                }
+            };
             let sf_snapshot = match store.load(&session_id) {
                 Ok(sf) => sf,
                 Err(e) => {
@@ -2836,11 +2969,14 @@ async fn run_send(
                         Some(cfg.settings.thinking_level.as_str())
                     });
                 lp.bind_thinking(reasoning);
-                // system change (settings/workspace/AGENTS.md) or restart
-                // recovery ⇒ rebuild Zone H from the persisted transcript
-                let needs_rebuild = !lp.system_is(&system_full) || lp_is_empty(lp);
+                // system change (settings/workspace/AGENTS.md) or privacy-mode
+                // toggle or restart recovery ⇒ rebuild Zone H from the
+                // persisted transcript (re-scrubbed under the new flag)
+                let privacy_changed = lp.bind_privacy(privacy_on);
+                let needs_rebuild = privacy_changed || !lp.system_is(&system_full) || lp_is_empty(lp);
                 if needs_rebuild {
-                    let hist = chat::transcript_for_lane(&sf_snapshot, lane, &cfg.workflows, &data_dir);
+                    let mut hist = chat::transcript_for_lane(&sf_snapshot, lane, &cfg.workflows, &data_dir);
+                    scrub_outbound(&mut hist);
                     if hist.len() > 1 {
                         lp.rebuild(&system_full, &hist[..hist.len() - 1]);
                     }
@@ -2848,7 +2984,8 @@ async fn run_send(
                 lp.clone()
             };
 
-            let transcript = chat::transcript_for_lane(&sf_snapshot, lane, &cfg.workflows, &data_dir);
+            let mut transcript = chat::transcript_for_lane(&sf_snapshot, lane, &cfg.workflows, &data_dir);
+            scrub_outbound(&mut transcript);
             if transcript.is_empty() {
                 let _ = channel.send(StreamEvent::Error { lane, message: "会话内容为空".into() });
                 return;
@@ -3071,12 +3208,29 @@ async fn run_send(
                     tool_call_id: None,
                     images: Vec::new(),
                 };
+                // privacy: the record keeps the RESTORED text (user reads
+                // real values); the live wire message above keeps the model's
+                // own bytes (surrogates) so Zone H stays byte-stable — a
+                // restart rebuild re-scrubs the restored text to the very
+                // same surrogates (deterministic mapping).
+                let (restored_content, restored_reasoning) = if privacy_on {
+                    (
+                        crate::privacy::restore(&session_id, &outcome.content),
+                        if outcome.reasoning.is_empty() {
+                            None
+                        } else {
+                            Some(crate::privacy::restore(&session_id, &outcome.reasoning))
+                        },
+                    )
+                } else {
+                    (outcome.content.clone(), if outcome.reasoning.is_empty() { None } else { Some(outcome.reasoning.clone()) })
+                };
                 let record = MessageRecord {
                     id: message_id,
                     lane,
                     role: "assistant".into(),
-                    reasoning: if outcome.reasoning.is_empty() { None } else { Some(outcome.reasoning.clone()) },
-                    content: outcome.content.clone(),
+                    reasoning: restored_reasoning,
+                    content: restored_content,
                     ts: next_record_ts(),
                     model: Some(model.clone()),
                     status: outcome.status.clone(),
@@ -3168,10 +3322,13 @@ async fn run_send(
                             .ok()
                             .and_then(|a| a.get("state").and_then(|t| t.as_str()).map(|s| s.to_string()))
                             .unwrap_or_default();
-                        let result = match res {
+                        let mut result = match res {
                             Ok(summary) => format!("【并行分支 {st_name} 完成】\n\n{summary}"),
                             Err(e) => format!("ERROR: 并行分支 {st_name} 失败: {e}"),
                         };
+                        if privacy_on {
+                            result = crate::privacy::outbound(&session_id, &pseed, &result);
+                        }
                         let preview: String =
                             result.lines().next().unwrap_or("").chars().take(120).collect();
                         let _ = channel.send(StreamEvent::ToolResult {
@@ -3542,14 +3699,32 @@ async fn run_send(
                                 {
                                     handle_goal_tool(&data_dir, &session_id, &tc.name, &args)
                                 } else if !crate::agent_tools::is_write_tool(&tc.name) {
-                                    crate::agent_tools::execute(
-                                        workspace.as_deref().unwrap_or(""),
-                                        &tc.name,
-                                        &args,
-                                    )
+                                    // sandbox network policy: web_fetch refused
+                                    if let Err(reason) = crate::agent_tools::sandbox_check(&tc.name, &args) {
+                                        reason
+                                    } else {
+                                        crate::agent_tools::execute(
+                                            workspace.as_deref().unwrap_or(""),
+                                            &tc.name,
+                                            &args,
+                                        )
+                                    }
                                 } else if perm_mode == "readonly" || plan_mode {
                                     "DENIED: 当前为只读或规划模式，写入工具不可用".to_string()
                                 } else {
+                                    // sandbox guard: refuse before the approval
+                                    // card is ever raised (delete / dangerous
+                                    // commands / blocked network paths)
+                                    if let Err(reason) = crate::agent_tools::sandbox_check(&tc.name, &args) {
+                                        reason
+                                    } else {
+                                    // privacy: tool arguments may carry
+                                    // surrogates the model echoed back — the
+                                    // tool must operate on REAL values
+                                    let mut exec_args = args.clone();
+                                    if privacy_on {
+                                        restore_args(&session_id, &pseed, &mut exec_args);
+                                    }
                                     // ---- approval gate (fail-closed) ----
                                     // "auto" mode skips the card; still
                                     // workspace-bound, still session-scoped
@@ -3563,11 +3738,11 @@ async fn run_send(
                                         true
                                     } else {
                                         let approval_id = Uuid::new_v4().to_string();
-                                        let path = args
+                                        let path = exec_args
                                             .get("path")
                                             .and_then(|p| p.as_str())
-                                            .or_else(|| args.get("command").and_then(|c| c.as_str()))
-                                            .or_else(|| args.get("from").and_then(|f| f.as_str()))
+                                            .or_else(|| exec_args.get("command").and_then(|c| c.as_str()))
+                                            .or_else(|| exec_args.get("from").and_then(|f| f.as_str()))
                                             .unwrap_or("?")
                                             .to_string();
                                         let rx = open_approval(&approval_id);
@@ -3579,7 +3754,7 @@ async fn run_send(
                                             preview: crate::agent_tools::approval_preview(
                                                 workspace.as_deref().unwrap_or(""),
                                                 &tc.name,
-                                                &args,
+                                                &exec_args,
                                             ),
                                         });
                                         // 120s deny — a dropped channel denies too
@@ -3598,7 +3773,7 @@ async fn run_send(
                                         // snapshots of the target file (only
                                         // for file tools — run_command has none)
                                         let rel =
-                                            args.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                                            exec_args.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
                                         let abs = if rel.is_empty() {
                                             None
                                         } else {
@@ -3608,6 +3783,20 @@ async fn run_send(
                                             )
                                             .ok()
                                         };
+                                        // sandbox auto-backup: snapshot the
+                                        // existing file BEFORE it is modified
+                                        if cfg.settings.sandbox_backup {
+                                            if let Some(p) = abs.as_ref().filter(|p| p.is_file()) {
+                                                if let Err(e) = backup_snapshot(
+                                                    &data_dir,
+                                                    &session_id,
+                                                    p,
+                                                    cfg.settings.sandbox_backup_cap_mb,
+                                                ) {
+                                                    eprintln!("[sandbox-backup] {e}");
+                                                }
+                                            }
+                                        }
                                         let snap = |p: &std::path::Path| -> Option<String> {
                                             std::fs::read_to_string(p).ok().map(|s| {
                                                 s.chars().take(WRITE_LOG_CAP).collect::<String>()
@@ -3617,7 +3806,7 @@ async fn run_send(
                                         let mut exec = crate::agent_tools::execute_write(
                                             workspace.as_deref().unwrap_or(""),
                                             &tc.name,
-                                            &args,
+                                            &exec_args,
                                         );
                                         if exec.starts_with("OK") && !rel.is_empty() {
                                             let after = abs.as_ref().and_then(|p| snap(p));
@@ -3667,6 +3856,7 @@ async fn run_send(
                                     } else {
                                         "DENIED: 用户拒绝或审批超时（120 秒）——本次写入未执行".into()
                                     }
+                                    } // sandbox_check passed
                                 }
                             }
                         }
@@ -3734,6 +3924,14 @@ async fn run_send(
                             sf.meta.updated_at = now_ms();
                             let _ = store.save(&sf);
                         }
+                    }
+                    // live wire: the record above stores the REAL tool
+                    // output (user-readable); the outbound copy is scrubbed
+                    // so the model keeps seeing surrogates. Restart rebuilds
+                    // produce the same bytes (deterministic mapping).
+                    let mut result = result;
+                    if privacy_on {
+                        result = crate::privacy::outbound(&session_id, &pseed, &result);
                     }
                     tool_msgs.push(ChatMessage {
                         role: "tool".into(),

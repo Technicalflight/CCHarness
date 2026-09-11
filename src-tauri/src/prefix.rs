@@ -154,6 +154,10 @@ pub struct LanePrefix {
     /// (Anthropic callers fall back to their required default). Change ⇒
     /// epoch bump.
     max_output: Option<u32>,
+    /// Privacy-mode flag this prefix's Zone H was scrubbed under. A change
+    /// means the rebuilt transcript bytes differ ⇒ caller rebuilds (and the
+    /// rebuild bumps the epoch).
+    pub privacy: bool,
 }
 
 impl LanePrefix {
@@ -170,6 +174,7 @@ impl LanePrefix {
             thinking: None,
             temperature: None,
             max_output: None,
+            privacy: false,
         };
         if !system_prompt.is_empty() {
             let sys = message_json(&ChatMessage::plain("system", system_prompt));
@@ -180,6 +185,17 @@ impl LanePrefix {
         }
         lp.digest = hex::encode(lp.hasher.clone().finalize());
         lp
+    }
+
+    /// Rebind the privacy flag. Returns true when it changed — the caller
+    /// must rebuild Zone H from the (re-scrubbed) transcript; the rebuild
+    /// bumps the epoch.
+    pub fn bind_privacy(&mut self, on: bool) -> bool {
+        if self.privacy == on {
+            return false;
+        }
+        self.privacy = on;
+        true
     }
 
     /// Rebind to a model. A model change rebuilds Zone H (re-serializing the

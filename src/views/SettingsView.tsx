@@ -301,6 +301,135 @@ export function SettingsView() {
         </div>
 
         <div className="card">
+          <h3>沙箱安全</h3>
+          <div className="row" style={{ marginTop: 10, marginBottom: 6 }}>
+            <button
+              className={`switch ${config.settings.sandbox_mode ? "on" : ""}`}
+              role="switch"
+              aria-checked={config.settings.sandbox_mode}
+              onClick={() => update({ sandbox_mode: !config.settings.sandbox_mode })}
+            />
+            <span style={{ fontSize: 13 }}>AI 运行于沙箱策略之下，并按下列文件、命令、网络策略拦截高风险操作</span>
+          </div>
+          <div
+            style={{
+              opacity: config.settings.sandbox_mode ? 1 : 0.45,
+              pointerEvents: config.settings.sandbox_mode ? "auto" : "none",
+              borderLeft: "2px solid var(--border)",
+              paddingLeft: 14,
+              marginTop: 10,
+              display: "grid",
+              gap: 12,
+            }}
+          >
+            <div className="row" style={{ marginBottom: 0 }}>
+              <button
+                className={`switch ${config.settings.sandbox_files ? "on" : ""}`}
+                role="switch"
+                aria-checked={config.settings.sandbox_files}
+                onClick={() => update({ sandbox_files: !config.settings.sandbox_files })}
+              />
+              <span style={{ fontSize: 13 }}>
+                <strong>文件安全</strong>
+                <span style={{ color: "var(--text-dim)" }}> —— 删除类工具（delete_file）一律拒绝；写入仍逐条审批</span>
+              </span>
+            </div>
+            <div className="row" style={{ marginBottom: 0 }}>
+              <button
+                className={`switch ${config.settings.sandbox_commands ? "on" : ""}`}
+                role="switch"
+                aria-checked={config.settings.sandbox_commands}
+                onClick={() => update({ sandbox_commands: !config.settings.sandbox_commands })}
+              />
+              <span style={{ fontSize: 13 }}>
+                <strong>命令安全</strong>
+                <span style={{ color: "var(--text-dim)" }}>
+                  {" "}—— 拦截高危命令（rm -rf / del /s / format / reg / shutdown / git push --force / git reset --hard / curl|sh 等）
+                </span>
+              </span>
+            </div>
+            <div className="row" style={{ marginBottom: 0 }}>
+              <button
+                className={`switch ${config.settings.sandbox_network ? "on" : ""}`}
+                role="switch"
+                aria-checked={config.settings.sandbox_network}
+                onClick={() => update({ sandbox_network: !config.settings.sandbox_network })}
+              />
+              <span style={{ fontSize: 13 }}>
+                <strong>网络安全</strong>
+                <span style={{ color: "var(--text-dim)" }}> —— 禁用 web_fetch 外网抓取（MCP 工具请另行关闭）</span>
+              </span>
+            </div>
+            <div className="row" style={{ marginBottom: 0 }}>
+              <button
+                className={`switch ${config.settings.sandbox_backup ? "on" : ""}`}
+                role="switch"
+                aria-checked={config.settings.sandbox_backup}
+                onClick={() => update({ sandbox_backup: !config.settings.sandbox_backup })}
+              />
+              <span style={{ fontSize: 13 }}>
+                <strong>自动备份</strong>
+                <span style={{ color: "var(--text-dim)" }}> —— 每次写入 / 编辑文件之前自动备份原文件</span>
+              </span>
+            </div>
+            {config.settings.sandbox_backup && (
+              <div className="row" style={{ marginBottom: 0, gap: 10, flexWrap: "wrap" }}>
+                <label style={{ fontSize: 12, color: "var(--text-dim)", display: "flex", alignItems: "center", gap: 8 }}>
+                  备份总上限
+                  <input
+                    className="input mono"
+                    type="number"
+                    min="50"
+                    step="50"
+                    style={{ width: 90 }}
+                    value={config.settings.sandbox_backup_cap_mb ?? 500}
+                    onChange={(e) =>
+                      update({ sandbox_backup_cap_mb: Math.max(50, Number(e.target.value) || 500) })
+                    }
+                  />
+                  MB
+                </label>
+                <button
+                  className="btn small ghost"
+                  onClick={() => void api.openBackupDir().catch((e) => toast("error", String(e)))}
+                >
+                  打开备份目录
+                </button>
+              </div>
+            )}
+          </div>
+          <div className="hint" style={{ marginTop: 10, color: "var(--warn, #d29922)" }}>
+            ⚠️ 免责声明：沙箱模式是策略级拦截而非容器级隔离，无法覆盖所有风险形态；开启后模型的部分操作会被拒绝，
+            <strong>可能影响任务完成度与最终结果</strong>。请继续保留逐条审批习惯，重要目录提前做好版本管理。
+          </div>
+        </div>
+
+        <div className="card">
+          <h3>伪匿名化安全模式</h3>
+          <div className="row" style={{ marginTop: 10, marginBottom: 6 }}>
+            <button
+              className={`switch ${config.settings.privacy_mode ? "on" : ""}`}
+              role="switch"
+              aria-checked={config.settings.privacy_mode}
+              onClick={() => update({ privacy_mode: !config.settings.privacy_mode })}
+            />
+            <span style={{ fontSize: 13 }}>
+              发送给模型的文本先做<b>类型一致替代</b>：API Key、密钥、身份证、手机号、邮箱、银行卡、用户路径、IP
+              会替换为格式合法的假值，回复落地时自动还原，本地记录始终保存真实值
+            </span>
+          </div>
+          <div className="hint" style={{ marginTop: 8 }}>
+            替代值按会话确定性生成（同一会话内同一原文永远映射同一替身，跨会话隔离），映射表只存在于本机
+            data_dir 下，不会上传。
+          </div>
+          <div className="hint" style={{ marginTop: 8, color: "var(--warn, #d29922)" }}>
+            ⚠️ 免责声明：① 开启后模型看到的是替代值，<strong>可能影响模型结果</strong>（涉及真实凭据的操作请让工具执行而非模型转述）；
+            ② 伪匿名化基于模式匹配，<strong>并不是 100% 完全安全</strong>——自由文本中的隐式敏感信息（姓名、地址、内网拓扑等）可能无法被识别，
+            理论上仍存在通过上下文推断的可能；③ 本功能属于<b>伪匿名化</b>而非匿名化，映射关系仍然存在，请勿因此放松对高敏感信息的判断。
+          </div>
+        </div>
+
+        <div className="card">
           <h3>目标模式</h3>
           <div className="row" style={{ marginTop: 10, gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
             <label style={{ fontSize: 12, color: "var(--text-dim)", minWidth: 240 }}>

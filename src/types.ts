@@ -62,6 +62,15 @@ export interface AppSettings {
    *  after every successful file-mutating tool and append its output to the
    *  tool result. Null/empty = disabled. */
   post_write_command?: string | null;
+  /** 伪匿名化安全模式：出站文本类型一致替代（默认关）。 */
+  privacy_mode: boolean;
+  /** 沙箱模式总开关（默认关），以下子策略仅在总开关开启时生效。 */
+  sandbox_mode: boolean;
+  sandbox_files: boolean;
+  sandbox_commands: boolean;
+  sandbox_network: boolean;
+  sandbox_backup: boolean;
+  sandbox_backup_cap_mb: number;
 }
 
 /** Result of an update check (backend `check_update`). */

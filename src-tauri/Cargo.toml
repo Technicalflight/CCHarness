@@ -21,7 +21,10 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "block
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
+# privacy mode: PII detection patterns (keys / phones / emails / IDs / IPs)
+regex = "1"
 base64 = "0.22"
 chrono = "0.4"
 url = "2"

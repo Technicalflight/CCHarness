@@ -564,6 +564,7 @@ export function ChatView() {
     refreshSessions,
     selectSession,
     config,
+    persistConfig,
   } = useApp();
 
   const [editingMsg, setEditingMsg] = useState<string | null>(null);
@@ -1595,6 +1596,26 @@ export function ChatView() {
                   <Icon name={smDef ? "branch" : (WF_ICON[wfMode] ?? "branch")} size={13} />
                   {smDef ? smDef.name : WF_LABEL[wfMode] ?? "智能体"}
                   <span className="wf-caret" />
+                </button>
+                {/* sandbox capsule — lives at the composer's top-left edge,
+                    next to the workflow pill; toggles settings.sandbox_mode */}
+                <button
+                  className={`wf-btn sandbox-pill ${config?.settings.sandbox_mode ? "on" : ""}`}
+                  title="沙箱模式 —— 拦截删除类操作与高危命令、禁外网抓取（可在 设置 → 隐私与安全 细化策略）。注意：可能影响任务完成度"
+                  aria-pressed={!!config?.settings.sandbox_mode}
+                  onClick={() => {
+                    if (!config) return;
+                    const next = !config.settings.sandbox_mode;
+                    void persistConfig({ ...config, settings: { ...config.settings, sandbox_mode: next } });
+                    toast(
+                      next ? "success" : "info",
+                      next
+                        ? "沙箱模式已开启 —— 删除/高危命令/外网抓取将被拦截，自动写入降级为逐条审批"
+                        : "沙箱模式已关闭 —— 工具操作恢复常规审批策略"
+                    );
+                  }}
+                >
+                  <Icon name="shield" size={13} /> 沙箱 {config?.settings.sandbox_mode ? "开" : "关"}
                 </button>
                 {wfOpen && (
                   <div className="wf-menu" role="menu">
