@@ -26,7 +26,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use tokio::task::JoinHandle;
 
 /// Delay before the keepalive fires: a margin under the ~5min Short-TTL
 /// window, so the refreshed cache still has useful lifetime when the user

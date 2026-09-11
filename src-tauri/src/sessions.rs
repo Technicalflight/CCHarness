@@ -90,6 +90,8 @@ impl SessionStore {
             rolling_memo: None,
             rolling_memo_rev: 0,
             rolling_memo_injected_rev: 0,
+            compactions: Vec::new(),
+            compact_boost_until_turn: 0,
         };
         let sf = SessionFile {
             meta,

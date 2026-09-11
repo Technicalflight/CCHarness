@@ -69,6 +69,15 @@ pub struct SessionMeta {
     /// re-injects regardless (the rebuilt Zone H carries no memo messages).
     #[serde(default)]
     pub rolling_memo_injected_rev: u64,
+    /// Boundary-compaction ledger (L6 §6.1) — the third book, disjoint
+    /// from RequestStat and the AuxMemo aux-ledger. Ring-capped at 60.
+    #[serde(default)]
+    pub compactions: Vec<CompactionStat>,
+    /// Thrash guard (L6 §6.2): while completed user turns are below this
+    /// number, the session's auto-compaction trigger line sits at 80%
+    /// instead of 70%. Engaged automatically on rapid repeat compactions.
+    #[serde(default)]
+    pub compact_boost_until_turn: u64,
 }
 
 /// RollingMemo (L6 §4): session-internal rolling state block, rule-extracted
@@ -170,6 +179,32 @@ pub struct ToolCallWire {
     pub id: String,
     pub name: String,
     pub arguments: String,
+}
+
+/// Boundary-compaction event stats (L6 §6.1): what fired, what it cost,
+/// what it saved — the numbers the thrash detector and the payback
+/// realization check consume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionStat {
+    pub ts: u64,
+    /// "auto" | "manual".
+    pub trigger: String,
+    /// Tokens folded by the summary (FOLD bucket, post-elision).
+    pub folded_tokens: u64,
+    /// Bytes saved by stale-output elision (DROP bucket), ÷4 = tokens.
+    pub dropped_tokens: u64,
+    /// Stubs written by the elision rung.
+    pub stubs: u32,
+    /// Summary size (approx tokens, fixed estimate).
+    pub summary_tokens: u64,
+    /// RollingMemo render size at compaction time.
+    pub memo_chars: usize,
+    /// Payback estimate at fire time (None = no pricing data).
+    pub payback_turns: Option<u64>,
+    /// Completed user turns when it fired (thrash window base).
+    pub completed_turns: u64,
+    /// Lane-prefix epoch before the rebuild (payback realization checks).
+    pub epoch_before: u32,
 }
 
 /// Boundary compaction record: the visible transcript is NEVER rewritten;

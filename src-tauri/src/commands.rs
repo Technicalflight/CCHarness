@@ -1481,14 +1481,22 @@ pub fn app_quit(app: tauri::AppHandle) {
 
 /// Build the text fed to the summarizer: previous summary (if any) plus a
 /// bounded excerpt of the transcript.
-fn summarize_input(sf: &crate::sessions::SessionFile) -> String {
+fn summarize_input(
+    sf: &crate::sessions::SessionFile,
+    keep_from_ts: u64,
+    memo: Option<&str>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
+    if let Some(m) = memo {
+        parts.push(format!("[当前会话备忘]\n{m}"));
+    }
     if let Some(prev) = &sf.compaction {
         parts.push(format!("[上次摘要]\n{}", prev.summary));
     }
     let upto = sf.compaction.as_ref().map(|c| c.upto_ts).unwrap_or(0);
     for m in &sf.messages {
-        if m.ts < upto || m.status == "error" {
+        // fold range: after the previous boundary, strictly before KEEP
+        if m.ts < upto || m.ts >= keep_from_ts || m.status == "error" {
             continue;
         }
         let role = match m.role.as_str() {
@@ -1497,7 +1505,7 @@ fn summarize_input(sf: &crate::sessions::SessionFile) -> String {
             "tool" => "工具",
             _ => continue,
         };
-        let head: String = m.content.chars().take(600).collect();
+        let head: String = m.content.chars().take(1200).collect();
         parts.push(format!("{role}: {head}"));
     }
     let mut text = parts.join("\n\n");
@@ -1505,6 +1513,43 @@ fn summarize_input(sf: &crate::sessions::SessionFile) -> String {
         text = text.chars().take(SUMMARIZE_INPUT_CAP).collect::<String>() + "\n…[已截断]";
     }
     text
+}
+
+/// Structured-summary prompt (L6 §5.2): the output shape mirrors
+/// RollingMemo so the summary can be re-consumed by the same machinery,
+/// and `CompactionRecord` needs no format migration.
+const COMPACT_PROMPT: &str = "你是对话摘要器。把输入的历史压缩为信息密集的 YAML 会话备忘（全部内容合计不超过 1200 字符），字段固定：goal（当前目标，一行）、decisions（已确定的决定，每条一行）、files（涉及文件路径及其最后动作）、errors_fixed（已修复的错误）、open_items（未尽事项）。必须保留具体文件路径与数值。只输出 YAML 本身，不要代码块围栏。";
+
+/// KEEP-bucket boundary (L6 §5.1): walk user turns newest-first and keep
+/// including whole turns while the accumulated bytes fit the budget;
+/// always keep at least the newest turn. Returns the ts such that every
+/// record with ts ≥ it belongs to KEEP (byte accounting matches the
+/// request estimator: content bytes + 96 overhead).
+fn compute_keep_from_ts(messages: &[MessageRecord], keep_budget_bytes: usize) -> u64 {
+    let starts: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user")
+        .map(|(i, _)| i)
+        .collect();
+    if starts.is_empty() {
+        return messages.first().map(|m| m.ts).unwrap_or(0);
+    }
+    let mut acc = 0usize;
+    let mut kept = 0usize;
+    let mut boundary = messages.last().map(|m| m.ts).unwrap_or(0);
+    for n in (0..starts.len()).rev() {
+        let start = starts[n];
+        let end = starts.get(n + 1).copied().unwrap_or(messages.len());
+        let span: usize = messages[start..end].iter().map(|m| m.content.len() + 96).sum();
+        if kept > 0 && acc + span > keep_budget_bytes {
+            break;
+        }
+        acc += span;
+        kept += 1;
+        boundary = messages[start].ts;
+    }
+    boundary
 }
 
 /// Stable hash of the tool-schema loadout sent in the request head. Fed to
@@ -1528,30 +1573,76 @@ async fn compact_now(
     session_id: &str,
     provider: &Provider,
     model: &str,
+    trigger: &str,
 ) -> Result<(), String> {
     let store = SessionStore::new(data_dir);
-    let sf = store.load(session_id)?;
-    if sf.messages.len() < COMPACT_MIN_MESSAGES {
-        return Err(format!("对话过短（{} 条），无需压缩", sf.messages.len()));
+    let sf0 = store.load(session_id)?;
+    if sf0.messages.len() < COMPACT_MIN_MESSAGES {
+        return Err(format!("对话过短（{} 条），无需压缩", sf0.messages.len()));
     }
-    let input = summarize_input(&sf);
-    let outcome = chat::complete_once(
-        client,
-        provider,
-        model,
-        "你是对话摘要器。把输入的对话压缩为一段信息密集的中文摘要（不超过 600 字），必须保留：用户目标、已做出的决定、涉及的关键文件与路径、未尽事项。只输出摘要本身。",
-        &input,
-    )
-    .await?;
-    let summary = outcome.text;
-    let upto_ts = sf.messages.last().map(|m| m.ts).unwrap_or(0);
+    let window = provider.context_window.unwrap_or(131_072) as f64;
+    // KEEP bucket (L6 §5.1): recent user turns within window × 20%, always
+    // at least the newest turn — records from keep_from_ts on stay verbatim.
+    let keep_budget = (window * 0.20) as usize * 4; // tokens → bytes (÷4 convention)
+    let keep_from_ts = compute_keep_from_ts(&sf0.messages, keep_budget);
+    // DROP rung before folding (idempotent): stale oversized outputs →
+    // stubs, so the summarizer reads a smaller input
+    let cfg = config::load(data_dir);
+    let (dropped, stubs) =
+        elide_stale_tool_records(data_dir, session_id, cfg.settings.spill_max_chars, keep_from_ts);
+    let sf = store.load(session_id)?;
+    let prev_upto = sf.compaction.as_ref().map(|c| c.upto_ts).unwrap_or(0);
+    let foldable: Vec<&MessageRecord> = sf
+        .messages
+        .iter()
+        .filter(|m| m.ts >= prev_upto && m.ts < keep_from_ts)
+        .filter(|m| matches!(m.role.as_str(), "user" | "assistant" | "tool"))
+        .collect();
+    // nothing to fold → the elision rung was the whole job
+    if foldable.is_empty() {
+        return Ok(());
+    }
+    let memo_render = sf.meta.rolling_memo.as_ref().and_then(render_memo);
+    let memo_chars = memo_render.as_ref().map(|t| t.chars().count()).unwrap_or(0);
+    let input = summarize_input(&sf, keep_from_ts, memo_render.as_deref());
+    let outcome = chat::complete_once(client, provider, model, COMPACT_PROMPT, &input).await?;
+    let summary: String = outcome.text.trim().chars().take(1600).collect();
     let record = crate::types_rs::CompactionRecord {
-        summary: summary.trim().to_string(),
-        upto_ts,
+        summary,
+        upto_ts: keep_from_ts,
         created_at: now_ms(),
+    };
+    // third ledger (L6 §6.1): what fired, what it folded, what it saved
+    let folded_tokens =
+        (foldable.iter().map(|m| m.content.len() + 96).sum::<usize>() as u64) / 4;
+    let completed_turns = sf.messages.iter().filter(|m| m.role == "user").count() as u64;
+    let epoch_before = prefixes_lock()
+        .as_ref()
+        .and_then(|m| m.get(&(session_id.to_string(), 0)))
+        .map(|lp| lp.epoch)
+        .unwrap_or(0);
+    let stat = crate::types_rs::CompactionStat {
+        ts: now_ms(),
+        trigger: trigger.to_string(),
+        folded_tokens,
+        dropped_tokens: (dropped as u64) / 4,
+        stubs,
+        summary_tokens: 800,
+        memo_chars,
+        payback_turns: provider
+            .pricing
+            .get(model)
+            .and_then(|pr| payback_turns(folded_tokens, 800, pr)),
+        completed_turns,
+        epoch_before,
     };
     let mut sf = store.load(session_id)?;
     sf.compaction = Some(record);
+    sf.meta.compactions.push(stat);
+    if sf.meta.compactions.len() > 60 {
+        let overflow = sf.meta.compactions.len() - 60;
+        sf.meta.compactions.drain(..overflow);
+    }
     sf.meta.updated_at = now_ms();
     store.save(&sf)?;
     if let Some(map) = prefixes_lock().as_mut() {
@@ -1572,7 +1663,7 @@ pub async fn compact_session(state: State<'_, AppState>, session_id: String) -> 
     }
     let binding = sf.meta.bindings.first().cloned().ok_or("会话未绑定模型")?;
     let provider = resolve_provider(&cfg, &binding).cloned().ok_or("Provider 未配置")?;
-    compact_now(&state.client, &state.data_dir, &session_id, &provider, &binding.model).await?;
+    compact_now(&state.client, &state.data_dir, &session_id, &provider, &binding.model, "manual").await?;
     Ok(sf.compaction.as_ref().map(|_| "已在旧摘要基础上再次压缩".to_string()).unwrap_or_else(|| "已压缩".into()))
 }
 
@@ -2019,19 +2110,19 @@ fn prune_oversized_tool_records(
 /// persisted record is rewritten once, the live prefix is dropped, and
 /// restart rebuilds read the rewritten bytes. The stub keeps role=tool +
 /// tool_call_id, so call/result pairing survives (design invariant I1).
-/// Returns the saved char count (0 = nothing changed).
+/// Returns (saved chars, stubs written); (0, 0) = nothing changed.
 fn elide_stale_tool_records(
     data_dir: &std::path::Path,
     session_id: &str,
     max_chars: usize,
     keep_from_ts: u64,
-) -> usize {
+) -> (usize, u32) {
     if max_chars == 0 {
-        return 0;
+        return (0, 0);
     }
     let store = SessionStore::new(data_dir);
     let Ok(mut sf) = store.load(session_id) else {
-        return 0;
+        return (0, 0);
     };
     let min_chars = (max_chars / 2).max(1);
     // tool_call_id → (tool name, target) from the assistant batches
@@ -2059,6 +2150,7 @@ fn elide_stale_tool_records(
         }
     }
     let mut saved = 0usize;
+    let mut stubs = 0u32;
     let mut changed = false;
     for m in sf.messages.iter_mut() {
         if m.role != "tool" || m.ts >= keep_from_ts {
@@ -2082,16 +2174,17 @@ fn elide_stale_tool_records(
         let after = stub.chars().count();
         if after < before {
             saved += before - after;
+            stubs += 1;
             m.content = stub;
             changed = true;
         }
     }
     if !changed {
-        return 0;
+        return (0, 0);
     }
     sf.meta.updated_at = now_ms();
     if store.save(&sf).is_err() {
-        return 0;
+        return (0, 0);
     }
     if let Some(map) = prefixes_lock().as_mut() {
         map.remove(&(session_id.to_string(), 0));
@@ -2099,7 +2192,7 @@ fn elide_stale_tool_records(
     if let Some(map) = LAST_SPAN.lock().unwrap().as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
-    saved
+    (saved, stubs)
 }
 
 /// Payback math shared by the manual estimate UI and the automatic gate
@@ -2168,7 +2261,15 @@ async fn maybe_auto_compact(
         .filter_map(|r| r.input_tokens)
         .next_back()
         .unwrap_or(0) as f64;
-    if last_input < window * COMPACT_AT_FRACTION {
+    let completed_turns = sf.messages.iter().filter(|m| m.role == "user").count() as u64;
+    // thrash guard (L6 §6.2): while boosted, this session's trigger line
+    // sits at 80% so rapid re-compaction can't loop
+    let trigger_line = if sf.meta.compact_boost_until_turn > completed_turns {
+        0.80
+    } else {
+        COMPACT_AT_FRACTION
+    };
+    if last_input < window * trigger_line {
         return;
     }
     // the summary call is a full one-shot completion (up to 120s) — never
@@ -2190,8 +2291,9 @@ async fn maybe_auto_compact(
         .find(|m| m.role == "user")
         .map(|m| m.ts)
         .unwrap_or(0);
-    let saved = saved
-        + elide_stale_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars, recent_from);
+    let (elided, _stubs) =
+        elide_stale_tool_records(&state.data_dir, session_id, cfg.settings.spill_max_chars, recent_from);
+    let saved = saved + elided;
     if saved > 0 {
         let projected = last_input - (saved as f64 / 4.0);
         // hysteresis: free rungs count as "rescued" only below the TARGET
@@ -2213,7 +2315,6 @@ async fn maybe_auto_compact(
             .sum();
         (bytes as u64) / 4
     };
-    let completed_turns = sf.messages.iter().filter(|m| m.role == "user").count() as u64;
     if !auto_compact_payback_ok(
         provider.pricing.get(&binding.model),
         folded_tokens,
@@ -2222,7 +2323,46 @@ async fn maybe_auto_compact(
     ) {
         return;
     }
-    let _ = compact_now(&state.client, &state.data_dir, session_id, provider, &binding.model).await;
+    // thrash engage (L6 §6.2): this is the ≥2nd auto compaction within the
+    // last 10 user turns → raise the trigger line for 30 turns and surface
+    // a one-time notice alongside the compaction
+    let recent_auto = sf
+        .meta
+        .compactions
+        .iter()
+        .filter(|c| c.trigger == "auto" && c.completed_turns + 10 > completed_turns)
+        .count();
+    if recent_auto >= 1 {
+        let _guard = state.save_lock.lock().await;
+        if let Ok(mut s) = state.store.load(session_id) {
+            s.meta.compact_boost_until_turn = completed_turns + 30;
+            s.messages.push(MessageRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                lane: 0,
+                role: "notice".into(),
+                content: format!(
+                    "缓存压缩抖动：近 10 轮内第 {} 次自动压缩。上下文增长过快——建议检查是否有循环读取大文件，或调高设置中的溢出阈值。已将本会话压缩触发线临时上调至 80%，30 轮后自动回落。",
+                    recent_auto + 1
+                ),
+                reasoning: None,
+                ts: next_record_ts(),
+                model: None,
+                status: "ok".into(),
+                usage: None,
+                cost_usd: None,
+                confidence: None,
+                tool_calls: None,
+                tool_call_id: None,
+                skill_calls: None,
+                workflow: None,
+                images: Vec::new(),
+            });
+            s.meta.updated_at = now_ms();
+            let _ = state.store.save(&s);
+        }
+    }
+    let _ =
+        compact_now(&state.client, &state.data_dir, session_id, provider, &binding.model, "auto").await;
 }
 
 #[tauri::command]
@@ -5662,8 +5802,9 @@ mod memo_tests {
         s.messages.push(rec(0, "user", "第二轮", 9));
         store.save(&s).unwrap();
 
-        let saved = elide_stale_tool_records(&dir, &sid, 24_000, 9);
+        let (saved, stubs) = elide_stale_tool_records(&dir, &sid, 24_000, 9);
         assert!(saved > 40_000 - 200);
+        assert_eq!(stubs, 1);
 
         let s2 = store.load(&sid).unwrap();
         let stubbed = s2.messages.iter().find(|m| m.tool_call_id.as_deref() == Some("c1")).unwrap();
@@ -5674,7 +5815,90 @@ mod memo_tests {
         let kept = s2.messages.iter().find(|m| m.tool_call_id.as_deref() == Some("c3")).unwrap();
         assert_eq!(kept.content, big_keep);
         // idempotent: second run saves nothing
-        assert_eq!(elide_stale_tool_records(&dir, &sid, 24_000, 9), 0);
+        assert_eq!(elide_stale_tool_records(&dir, &sid, 24_000, 9), (0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::*;
+    use crate::types_rs::{MessageRecord, SessionBinding};
+
+    fn rec(role: &str, content: &str, ts: u64) -> MessageRecord {
+        MessageRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            lane: 0,
+            role: role.into(),
+            content: content.into(),
+            reasoning: None,
+            ts,
+            model: None,
+            status: "ok".into(),
+            usage: None,
+            cost_usd: None,
+            confidence: None,
+            tool_calls: None,
+            tool_call_id: None,
+            skill_calls: None,
+            workflow: None,
+            images: Vec::new(),
+        }
+    }
+
+    fn big_tool(ts: u64, n: usize) -> MessageRecord {
+        MessageRecord {
+            tool_call_id: Some(format!("t{ts}")),
+            ..rec("tool", &"x".repeat(n), ts)
+        }
+    }
+
+    #[test]
+    fn keep_boundary_respects_budget_but_keeps_newest_turn() {
+        let msgs = vec![
+            rec("user", "第一轮", 1),
+            rec("assistant", "回复一", 2),
+            rec("user", "第二轮", 3),
+            big_tool(4, 20_000),
+            rec("user", "第三轮", 5),
+            rec("assistant", "回复三", 6),
+        ];
+        // tiny budget: only the newest turn fits → boundary at its user ts
+        assert_eq!(compute_keep_from_ts(&msgs, 1_000), 5);
+        // generous budget: all three turns kept → boundary at the first ts
+        assert_eq!(compute_keep_from_ts(&msgs, 1_000_000), 1);
+    }
+
+    #[test]
+    fn keep_boundary_keeps_at_least_one_turn_even_when_it_alone_exceeds() {
+        let msgs = vec![
+            rec("user", "第一轮", 1),
+            rec("user", "第二轮超大", 2),
+            big_tool(3, 50_000),
+        ];
+        assert_eq!(compute_keep_from_ts(&msgs, 1_000), 2);
+    }
+
+    #[test]
+    fn summarize_input_covers_fold_range_only_and_prepends_memo() {
+        let dir = std::env::temp_dir().join(format!("ccharness-bucket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SessionStore::new(&dir);
+        let sf = store
+            .create("chat", vec![SessionBinding { provider_id: "p".into(), model: "m".into() }], "t")
+            .unwrap();
+        let sid = sf.meta.id.clone();
+        let mut s = store.load(&sid).unwrap();
+        s.messages.push(rec("user", "第一轮旧内容", 1));
+        s.messages.push(rec("assistant", "旧回复", 2));
+        s.messages.push(rec("user", "最新一轮保留", 9));
+        store.save(&s).unwrap();
+        let sf = store.load(&sid).unwrap();
+        let input = summarize_input(&sf, 9, Some("[会话备忘]\nfiles:/n- /a ← read"));
+        assert!(input.starts_with("[当前会话备忘]"));
+        assert!(input.contains("第一轮旧内容"));
+        assert!(!input.contains("最新一轮保留"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
