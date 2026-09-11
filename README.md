@@ -224,6 +224,10 @@ src-tauri/              Rust 后端
 
 本项目在 AI 模型协作下开发。
 
+## 社区联系
+
+[Linux.Do](https://linux.do) — 一个分享和讨论技术的社区。
+
 ## ☕ 赞助 / Sponsor
 
 如果 CCHarness 对你有帮助，欢迎请作者喝杯咖啡或可乐 ☕🥤——每一杯都是持续开发的动力。
