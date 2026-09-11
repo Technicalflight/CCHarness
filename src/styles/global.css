@@ -1200,6 +1200,12 @@ table.data td {
 table.data td.plain { font-family: var(--font); }
 table.data tr:hover td { background: var(--bg-hover); }
 
+/* 卡片内横向滚动容器：nowrap 账本表的最小内容宽度远超窄主区（右侧功能区
+   开启时主区被压到 320px 下限），没有它表格会撑破卡片边框、把整个
+   view-body 拖成页级横向滚动，连带把所有卡片左缘裁掉。让溢出留在卡片
+   内部消化 —— 卡片边框与页面布局不再被表格的最小宽度绑架 */
+.tbl-scroll { overflow-x: auto; }
+
 /* wrap 变体：说明列换行、不撑破卡片；前三列定宽，末列吃剩余宽度 */
 table.data.wrap {
   table-layout: fixed;

@@ -227,78 +227,80 @@ export function TelemetryView() {
           {reqs.length === 0 ? (
             <div className="desc">暂无数据。</div>
           ) : (
-            <table className="data">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>时间</th>
-                  <th>模型</th>
-                  <th>泳道</th>
-                  <th>纪元</th>
-                  <th title="本地字节链连续性：✓ 表示本请求稳定区完整覆盖上一次请求（append-only），客户端无改写">链</th>
-                  <th>前缀字节</th>
-                  <th>新增字节</th>
-                  <th>输入</th>
-                  <th>缓存命中</th>
-                  <th>命中率</th>
-                  <th>输出</th>
-                  <th>成本</th>
-                  <th>重计费</th>
-                </tr>
-              </thead>
-              <tbody>
-                {reqs
-                  .slice()
-                  .reverse()
-                  .map((r) => (
-                    <tr key={r.seq}>
-                      <td>{r.seq}</td>
-                      <td className="plain">{fmtTime(r.ts)}</td>
-                      <td>{r.model}</td>
-                      <td>#{r.lane + 1}</td>
-                      <td>{r.epoch + 1}</td>
-                      <td
-                        title={r.chain_ok ? "本地字节链连续" : "本地链断裂——出现客户端改写（应视为缺陷上报）"}
-                        style={{ color: r.chain_ok ? "var(--good)" : "var(--bad)" }}
-                      >
-                        {r.chain_ok ? "✓" : "✗"}
-                      </td>
-                      <td>{fmtBytes(r.prefix_bytes)}</td>
-                      <td>{fmtBytes(r.added_bytes)}</td>
-                      <td>{fmtTokens(r.input_tokens)}</td>
-                      <td>{fmtTokens(r.cached_tokens)}</td>
-                      <td
-                        style={{
-                          color:
-                            r.cached_tokens != null && r.input_tokens
-                              ? r.cached_tokens / r.input_tokens >= 0.9
-                                ? "var(--good)"
-                                : "var(--warn)"
-                              : undefined,
-                        }}
-                      >
-                        {fmtHit(r.cached_tokens, r.input_tokens)}
-                      </td>
-                      <td>{fmtTokens(r.output_tokens)}</td>
-                      <td>{fmtUsd(r.cost_usd)}</td>
-                      <td
-                        title={
-                          r.significant_miss
-                            ? `显著 miss（${r.miss_cause === "client" ? "客户端改写" : "上游"}）：重计费 ≈ ${fmtTokens(r.rebilled_tokens ?? 0)} tokens`
-                            : "无显著 miss——纪元首轮（预期重建）与未上报缓存字段的请求不计入"
-                        }
-                        style={{ color: r.significant_miss ? "var(--warn)" : undefined }}
-                      >
-                        {r.significant_miss
-                          ? r.rebilled_cost != null
-                            ? fmtUsd(r.rebilled_cost)
-                            : `${fmtTokens(r.rebilled_tokens ?? 0)} tok`
-                          : "—"}
-                      </td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
+            <div className="tbl-scroll">
+              <table className="data">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>时间</th>
+                    <th>模型</th>
+                    <th>泳道</th>
+                    <th>纪元</th>
+                    <th title="本地字节链连续性：✓ 表示本请求稳定区完整覆盖上一次请求（append-only），客户端无改写">链</th>
+                    <th>前缀字节</th>
+                    <th>新增字节</th>
+                    <th>输入</th>
+                    <th>缓存命中</th>
+                    <th>命中率</th>
+                    <th>输出</th>
+                    <th>成本</th>
+                    <th>重计费</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {reqs
+                    .slice()
+                    .reverse()
+                    .map((r) => (
+                      <tr key={r.seq}>
+                        <td>{r.seq}</td>
+                        <td className="plain">{fmtTime(r.ts)}</td>
+                        <td>{r.model}</td>
+                        <td>#{r.lane + 1}</td>
+                        <td>{r.epoch + 1}</td>
+                        <td
+                          title={r.chain_ok ? "本地字节链连续" : "本地链断裂——出现客户端改写（应视为缺陷上报）"}
+                          style={{ color: r.chain_ok ? "var(--good)" : "var(--bad)" }}
+                        >
+                          {r.chain_ok ? "✓" : "✗"}
+                        </td>
+                        <td>{fmtBytes(r.prefix_bytes)}</td>
+                        <td>{fmtBytes(r.added_bytes)}</td>
+                        <td>{fmtTokens(r.input_tokens)}</td>
+                        <td>{fmtTokens(r.cached_tokens)}</td>
+                        <td
+                          style={{
+                            color:
+                              r.cached_tokens != null && r.input_tokens
+                                ? r.cached_tokens / r.input_tokens >= 0.9
+                                  ? "var(--good)"
+                                  : "var(--warn)"
+                                : undefined,
+                          }}
+                        >
+                          {fmtHit(r.cached_tokens, r.input_tokens)}
+                        </td>
+                        <td>{fmtTokens(r.output_tokens)}</td>
+                        <td>{fmtUsd(r.cost_usd)}</td>
+                        <td
+                          title={
+                            r.significant_miss
+                              ? `显著 miss（${r.miss_cause === "client" ? "客户端改写" : "上游"}）：重计费 ≈ ${fmtTokens(r.rebilled_tokens ?? 0)} tokens`
+                              : "无显著 miss——纪元首轮（预期重建）与未上报缓存字段的请求不计入"
+                          }
+                          style={{ color: r.significant_miss ? "var(--warn)" : undefined }}
+                        >
+                          {r.significant_miss
+                            ? r.rebilled_cost != null
+                              ? fmtUsd(r.rebilled_cost)
+                              : `${fmtTokens(r.rebilled_tokens ?? 0)} tok`
+                            : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
 
@@ -367,43 +369,45 @@ export function TelemetryView() {
                     暂无压缩记录 —— 会话输入达到上下文窗口 70% 时在轮边界自动触发，也可手动压缩。压缩前会先跑两档免费清理（回溯剪枝 + 过时输出降级），能救回就不调摘要。
                   </div>
                 ) : (
-                  <table className="data">
-                    <thead>
-                      <tr>
-                        <th>时间</th>
-                        <th>触发</th>
-                        <th title="FOLD 桶：中段历史折叠为结构化摘要的 token 数">折叠</th>
-                        <th title="DROP 桶：过时大块工具输出降级为存根省下的 token 数（含存根数）">降级</th>
-                        <th>摘要</th>
-                        <th title="压缩时 RollingMemo 渲染字符数">备忘</th>
-                        <th title="回本估算：摘要重算成本 ÷ 每轮缓存节省">回本</th>
-                        <th title="触发时的已完成用户轮数">轮次</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {comps
-                        .slice()
-                        .reverse()
-                        .map((c, i) => (
-                          <tr key={`${c.ts}-${i}`}>
-                            <td className="plain">{fmtTime(c.ts)}</td>
-                            <td style={{ color: c.trigger === "auto" ? undefined : "var(--info)" }}>
-                              {c.trigger === "auto" ? "自动" : "手动"}
-                            </td>
-                            <td>{fmtTokens(c.folded_tokens)}</td>
-                            <td>
-                              {c.dropped_tokens > 0
-                                ? `${fmtTokens(c.dropped_tokens)}（${c.stubs} 存根）`
-                                : "—"}
-                            </td>
-                            <td>{fmtTokens(c.summary_tokens)}</td>
-                            <td>{c.memo_chars > 0 ? `${c.memo_chars} 字` : "—"}</td>
-                            <td>{c.payback_turns != null ? `${c.payback_turns} 轮` : "—"}</td>
-                            <td>{c.completed_turns}</td>
-                          </tr>
-                        ))}
-                    </tbody>
-                  </table>
+                  <div className="tbl-scroll">
+                    <table className="data">
+                      <thead>
+                        <tr>
+                          <th>时间</th>
+                          <th>触发</th>
+                          <th title="FOLD 桶：中段历史折叠为结构化摘要的 token 数">折叠</th>
+                          <th title="DROP 桶：过时大块工具输出降级为存根省下的 token 数（含存根数）">降级</th>
+                          <th>摘要</th>
+                          <th title="压缩时 RollingMemo 渲染字符数">备忘</th>
+                          <th title="回本估算：摘要重算成本 ÷ 每轮缓存节省">回本</th>
+                          <th title="触发时的已完成用户轮数">轮次</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {comps
+                          .slice()
+                          .reverse()
+                          .map((c, i) => (
+                            <tr key={`${c.ts}-${i}`}>
+                              <td className="plain">{fmtTime(c.ts)}</td>
+                              <td style={{ color: c.trigger === "auto" ? undefined : "var(--info)" }}>
+                                {c.trigger === "auto" ? "自动" : "手动"}
+                              </td>
+                              <td>{fmtTokens(c.folded_tokens)}</td>
+                              <td>
+                                {c.dropped_tokens > 0
+                                  ? `${fmtTokens(c.dropped_tokens)}（${c.stubs} 存根）`
+                                  : "—"}
+                              </td>
+                              <td>{fmtTokens(c.summary_tokens)}</td>
+                              <td>{c.memo_chars > 0 ? `${c.memo_chars} 字` : "—"}</td>
+                              <td>{c.payback_turns != null ? `${c.payback_turns} 轮` : "—"}</td>
+                              <td>{c.completed_turns}</td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
                 )}
               </>
             );
@@ -460,41 +464,43 @@ export function TelemetryView() {
                   );
                 })()}
               </div>
-              <table className="data">
-                <thead>
-                  <tr>
-                    <th>时间</th>
-                    <th>类型</th>
-                    <th>模型</th>
-                    <th>来源</th>
-                    <th>输入</th>
-                    <th>输出</th>
-                    <th>计费</th>
-                    <th>节省</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {aux.recent.map((r, i) => {
-                    const om = AUX_ORIGIN_META[r.origin] ?? { label: r.origin, color: undefined };
-                    return (
-                      <tr key={`${r.ts}-${i}`}>
-                        <td className="plain">{fmtTime(r.ts)}</td>
-                        <td>{AUX_KIND_LABEL[r.kind] ?? r.kind}</td>
-                        <td>{r.model}</td>
-                        <td style={{ color: om.color }}>{om.label}</td>
-                        <td>{fmtTokens(r.input_tokens)}</td>
-                        <td>{fmtTokens(r.output_tokens)}</td>
-                        <td style={{ color: r.origin === "miss" ? undefined : "var(--good)" }}>
-                          {fmtUsd(r.origin === "miss" ? r.billed_usd : 0)}
-                        </td>
-                        <td style={{ color: r.origin !== "miss" ? "var(--good)" : undefined }}>
-                          {r.origin !== "miss" ? fmtUsd(r.saved_usd) : "—"}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+              <div className="tbl-scroll">
+                <table className="data">
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>类型</th>
+                      <th>模型</th>
+                      <th>来源</th>
+                      <th>输入</th>
+                      <th>输出</th>
+                      <th>计费</th>
+                      <th>节省</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {aux.recent.map((r, i) => {
+                      const om = AUX_ORIGIN_META[r.origin] ?? { label: r.origin, color: undefined };
+                      return (
+                        <tr key={`${r.ts}-${i}`}>
+                          <td className="plain">{fmtTime(r.ts)}</td>
+                          <td>{AUX_KIND_LABEL[r.kind] ?? r.kind}</td>
+                          <td>{r.model}</td>
+                          <td style={{ color: om.color }}>{om.label}</td>
+                          <td>{fmtTokens(r.input_tokens)}</td>
+                          <td>{fmtTokens(r.output_tokens)}</td>
+                          <td style={{ color: r.origin === "miss" ? undefined : "var(--good)" }}>
+                            {fmtUsd(r.origin === "miss" ? r.billed_usd : 0)}
+                          </td>
+                          <td style={{ color: r.origin !== "miss" ? "var(--good)" : undefined }}>
+                            {r.origin !== "miss" ? fmtUsd(r.saved_usd) : "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </>
           ) : (
             <div className="desc" style={{ marginBottom: 0 }}>
