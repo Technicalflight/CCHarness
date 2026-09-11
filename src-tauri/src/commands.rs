@@ -6,8 +6,8 @@ use crate::config::{self, AppConfig, Provider};
 use crate::prefix::{message_json, ChatMessage, LanePrefix};
 use crate::sessions::{now_ms, SessionStore};
 use crate::types_rs::{
-    GoalInfo, GoalState, MessageRecord, RequestStat, SessionBinding, SessionMeta, SessionTelemetry,
-    StreamEvent, TelemetrySummary,
+    CompactionStat, GoalInfo, GoalState, MessageRecord, RequestStat, SessionBinding, SessionMeta,
+    SessionTelemetry, StreamEvent, TelemetrySummary,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -1341,6 +1341,9 @@ pub fn get_telemetry(state: State<'_, AppState>, session_id: String) -> Result<S
         session_id,
         epochs,
         divergences: crate::divergence::classify(&requests),
+        completed_turns: sf.messages.iter().filter(|m| m.role == "user").count() as u64,
+        boost_until_turn: sf.meta.compact_boost_until_turn,
+        compactions: sf.meta.compactions.clone(),
         requests,
         summary: TelemetrySummary {
             requests: sf.telemetry.len() as u64,

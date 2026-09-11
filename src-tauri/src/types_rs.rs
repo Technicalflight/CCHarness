@@ -370,6 +370,16 @@ pub struct SessionTelemetry {
     /// miss/drop while the local chain looked intact (see divergence.rs).
     #[serde(default)]
     pub divergences: Vec<crate::divergence::Divergence>,
+    /// Completed user turns right now (thrash/boost display base).
+    #[serde(default)]
+    pub completed_turns: u64,
+    /// While completed turns are below this, the session's auto-compaction
+    /// trigger line is temporarily raised to 80% (L6 §6.2). 0 = inactive.
+    #[serde(default)]
+    pub boost_until_turn: u64,
+    /// Boundary-compaction ledger, newest last (L6 §6.1).
+    #[serde(default)]
+    pub compactions: Vec<crate::types_rs::CompactionStat>,
 }
 
 // ---- streaming events ----

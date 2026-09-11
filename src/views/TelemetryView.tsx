@@ -302,6 +302,114 @@ export function TelemetryView() {
           )}
         </div>
 
+        {/* Compaction ledger — the third book (L6 §6), disjoint from the
+            request ledger above and the AuxMemo book below */}
+        <div className="card">
+          <h3>压缩账本</h3>
+          <div className="desc">
+            每行 = 一次边界压缩的单独口径。三桶对账：KEEP 最近轮次逐字节保留，FOLD 中段历史折叠为结构化摘要，DROP
+            过时大块工具输出降级为存根。回本 = 摘要重算成本 ÷ 每轮缓存节省，只有预期剩余轮数足够摊薄时自动压缩才会执行。10
+            轮内出现第 2 次自动压缩会将会话触发线临时上调至 80%（30 轮后回落）并在会话中插入提示。
+          </div>
+          {(() => {
+            const comps = tel?.compactions ?? [];
+            const boosting =
+              tel != null && tel.boost_until_turn > 0 && tel.boost_until_turn > tel.completed_turns;
+            const tot = comps.reduce(
+              (a, c) => ({
+                folded: a.folded + c.folded_tokens,
+                dropped: a.dropped + c.dropped_tokens,
+                stubs: a.stubs + c.stubs,
+              }),
+              { folded: 0, dropped: 0, stubs: 0 }
+            );
+            return (
+              <>
+                {boosting && (
+                  <div className="desc" style={{ color: "var(--warn)", marginBottom: 10 }}>
+                    ⚠ 本会话处于压缩抖动保护中：触发线临时上调至 80%（第 {tel!.boost_until_turn} 轮回落，当前第{" "}
+                    {tel!.completed_turns} 轮）。
+                  </div>
+                )}
+                {comps.length > 0 && (
+                  <div className="stat-cards" style={{ marginBottom: 14 }}>
+                    <div className="stat-card">
+                      <div className="label">压缩次数</div>
+                      <div className="value">{comps.length}</div>
+                      <div className="sub">
+                        自动 {comps.filter((c) => c.trigger === "auto").length} · 手动{" "}
+                        {comps.filter((c) => c.trigger !== "auto").length}
+                      </div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="label">累计折叠</div>
+                      <div className="value">{fmtTokens(tot.folded)}</div>
+                      <div className="sub">FOLD 桶进入摘要</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="label">累计降级</div>
+                      <div className="value">{fmtTokens(tot.dropped)}</div>
+                      <div className="sub">{tot.stubs} 个存根（免费档）</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="label">最近回本</div>
+                      <div className="value">
+                        {comps[comps.length - 1].payback_turns != null
+                          ? `${comps[comps.length - 1].payback_turns} 轮`
+                          : "—"}
+                      </div>
+                      <div className="sub">无定价数据时显示 —</div>
+                    </div>
+                  </div>
+                )}
+                {comps.length === 0 ? (
+                  <div className="desc" style={{ marginBottom: 0 }}>
+                    暂无压缩记录 —— 会话输入达到上下文窗口 70% 时在轮边界自动触发，也可手动压缩。压缩前会先跑两档免费清理（回溯剪枝 + 过时输出降级），能救回就不调摘要。
+                  </div>
+                ) : (
+                  <table className="data">
+                    <thead>
+                      <tr>
+                        <th>时间</th>
+                        <th>触发</th>
+                        <th title="FOLD 桶：中段历史折叠为结构化摘要的 token 数">折叠</th>
+                        <th title="DROP 桶：过时大块工具输出降级为存根省下的 token 数（含存根数）">降级</th>
+                        <th>摘要</th>
+                        <th title="压缩时 RollingMemo 渲染字符数">备忘</th>
+                        <th title="回本估算：摘要重算成本 ÷ 每轮缓存节省">回本</th>
+                        <th title="触发时的已完成用户轮数">轮次</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {comps
+                        .slice()
+                        .reverse()
+                        .map((c, i) => (
+                          <tr key={`${c.ts}-${i}`}>
+                            <td className="plain">{fmtTime(c.ts)}</td>
+                            <td style={{ color: c.trigger === "auto" ? undefined : "var(--info)" }}>
+                              {c.trigger === "auto" ? "自动" : "手动"}
+                            </td>
+                            <td>{fmtTokens(c.folded_tokens)}</td>
+                            <td>
+                              {c.dropped_tokens > 0
+                                ? `${fmtTokens(c.dropped_tokens)}（${c.stubs} 存根）`
+                                : "—"}
+                            </td>
+                            <td>{fmtTokens(c.summary_tokens)}</td>
+                            <td>{c.memo_chars > 0 ? `${c.memo_chars} 字` : "—"}</td>
+                            <td>{c.payback_turns != null ? `${c.payback_turns} 轮` : "—"}</td>
+                            <td>{c.completed_turns}</td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                )}
+              </>
+            );
+          })()}
+        </div>
+
         {/* AuxMemo — a separate book from the main-loop ledger above */}
         <div className="card">
           <h3>辅助调用精确缓存（AuxMemo）</h3>

@@ -456,6 +456,35 @@ export interface SessionTelemetry {
   epochs: number[];
   summary: TelemetrySummary;
   divergences: Divergence[];
+  /** 当前已完成用户轮数（抖动/临时阈值展示基准）。 */
+  completed_turns: number;
+  /** 大于 0 且高于 completed_turns 时，自动压缩触发线临时上调至 80%。 */
+  boost_until_turn: number;
+  /** 边界压缩账本（第三本账），时间升序。 */
+  compactions: CompactionStat[];
+}
+
+/** 一次边界压缩事件（L6 §6.1）。 */
+export interface CompactionStat {
+  ts: number;
+  /** "auto" | "manual"。 */
+  trigger: string;
+  /** FOLD 桶折叠的 token（降级后口径）。 */
+  folded_tokens: number;
+  /** DROP 桶降级省下的 token（字节 ÷4）。 */
+  dropped_tokens: number;
+  /** 降级存根数。 */
+  stubs: number;
+  /** 摘要产出估算 token。 */
+  summary_tokens: number;
+  /** 压缩时 RollingMemo 渲染字符数。 */
+  memo_chars: number;
+  /** 回本估算（轮）；null = 无定价数据。 */
+  payback_turns: number | null;
+  /** 触发时的已完成轮数。 */
+  completed_turns: number;
+  /** 重建前的前缀纪元。 */
+  epoch_before: number;
 }
 
 export interface GlobalStats {
