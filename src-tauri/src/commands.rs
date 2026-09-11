@@ -93,7 +93,16 @@ fn persist_gate(data_dir: &std::path::Path, session_id: &str, gate: Option<&str>
     let store = SessionStore::new(data_dir);
     if let Ok(mut sf) = store.load(session_id) {
         sf.meta.wf_gate = gate.map(|g| g.to_string());
-        let _ = store.save(&sf);
+        warn_save(session_id, "workflow gate", store.save(&sf));
+    }
+}
+
+/// Persist-or-complain: a swallowed save means a reply the user just watched
+/// stream by may not survive a restart. Log with session context (P2: these
+/// were all bare `let _ =`).
+fn warn_save(session_id: &str, what: &str, r: Result<(), String>) {
+    if let Err(e) = r {
+        eprintln!("[save] {what} 落盘失败 session={session_id}: {e}");
     }
 }
 
@@ -1615,12 +1624,34 @@ fn summarize_input(
 /// and `CompactionRecord` needs no format migration.
 const COMPACT_PROMPT: &str = "你是对话摘要器。把输入的历史压缩为信息密集的 YAML 会话备忘（全部内容合计不超过 1200 字符），字段固定：goal（当前目标，一行）、decisions（已确定的决定，每条一行）、files（涉及文件路径及其最后动作）、errors_fixed（已修复的错误）、open_items（未尽事项）。必须保留具体文件路径与数值。只输出 YAML 本身，不要代码块围栏。";
 
+/// Mixed-script token estimate shared by every compaction accounting site.
+/// The old flat `bytes/4` underestimated CJK 3-4× (a Chinese char is 3
+/// UTF-8 bytes but ≈1 token): ASCII runs at ~4 chars/token, everything
+/// else (CJK, cyrillic, emoji…) at ~1.25 chars/token. KEEP walks use the
+/// same function so budgets, payback and hysteresis stay in sync (P2).
+pub fn est_tokens(content: &str) -> u64 {
+    let mut ascii = 0u64;
+    let mut wide = 0u64;
+    for ch in content.chars() {
+        if (ch as u32) < 0x80 {
+            ascii += 1;
+        } else {
+            wide += 1;
+        }
+    }
+    // ≈ ascii/4 + wide/1.25, no floats
+    ascii / 4 + (wide * 4 + 2) / 5
+}
+
+/// Per-record overhead in the same token unit (role/id/ts JSON frame).
+const RECORD_OVERHEAD_TOKENS: u64 = 24;
+
 /// KEEP-bucket boundary (L6 §5.1): walk user turns newest-first and keep
-/// including whole turns while the accumulated bytes fit the budget;
+/// including whole turns while the accumulated estimate fits the budget;
 /// always keep at least the newest turn. Returns the ts such that every
-/// record with ts ≥ it belongs to KEEP (byte accounting matches the
-/// request estimator: content bytes + 96 overhead).
-fn compute_keep_from_ts(messages: &[MessageRecord], keep_budget_bytes: usize) -> u64 {
+/// record with ts ≥ it belongs to KEEP (accounting matches the request
+/// estimator: est_tokens(content) + fixed overhead).
+fn compute_keep_from_ts(messages: &[MessageRecord], keep_budget_tokens: usize) -> u64 {
     let starts: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -1636,8 +1667,11 @@ fn compute_keep_from_ts(messages: &[MessageRecord], keep_budget_bytes: usize) ->
     for n in (0..starts.len()).rev() {
         let start = starts[n];
         let end = starts.get(n + 1).copied().unwrap_or(messages.len());
-        let span: usize = messages[start..end].iter().map(|m| m.content.len() + 96).sum();
-        if kept > 0 && acc + span > keep_budget_bytes {
+        let span: usize = messages[start..end]
+            .iter()
+            .map(|m| (est_tokens(&m.content) + RECORD_OVERHEAD_TOKENS) as usize)
+            .sum();
+        if kept > 0 && acc + span > keep_budget_tokens {
             break;
         }
         acc += span;
@@ -1679,7 +1713,7 @@ async fn compact_now(
     let window = provider.context_window.unwrap_or(131_072) as f64;
     // KEEP bucket (L6 §5.1): recent user turns within window × 20%, always
     // at least the newest turn — records from keep_from_ts on stay verbatim.
-    let keep_budget = (window * 0.20) as usize * 4; // tokens → bytes (÷4 convention)
+    let keep_budget = (window * 0.20) as usize; // token budget (est_tokens unit)
     let keep_from_ts = compute_keep_from_ts(&sf0.messages, keep_budget);
     // DROP rung before folding (idempotent): stale oversized outputs →
     // stubs, so the summarizer reads a smaller input. The load-modify-save
@@ -1714,7 +1748,7 @@ async fn compact_now(
     };
     // third ledger (L6 §6.1): what fired, what it folded, what it saved
     let folded_tokens =
-        (foldable.iter().map(|m| m.content.len() + 96).sum::<usize>() as u64) / 4;
+        foldable.iter().map(|m| est_tokens(&m.content) + RECORD_OVERHEAD_TOKENS).sum::<u64>();
     let completed_turns = sf.messages.iter().filter(|m| m.role == "user").count() as u64;
     let epoch_before = prefixes_lock()
         .as_ref()
@@ -1725,7 +1759,7 @@ async fn compact_now(
         ts: now_ms(),
         trigger: trigger.to_string(),
         folded_tokens,
-        dropped_tokens: (dropped as u64) / 4,
+        dropped_tokens: dropped as u64, // free rungs already account in tokens
         stubs,
         summary_tokens: 800,
         memo_chars,
@@ -1799,17 +1833,16 @@ pub fn compact_estimate(
     let provider = resolve_provider(&cfg, &binding).cloned().ok_or("Provider 未配置")?;
     let model = binding.model.clone();
 
-    // folded = what compaction replaces: every record that would go over the
-    // wire now (content bytes + per-message overhead, same units as the tail
-    // estimator in chat.rs; ÷4 = mixed-script token approximation)
-    let folded_bytes: usize = sf
+    // folded = what compaction replaces: every record that would go over
+    // the wire now (same mixed-script estimator as the KEEP walk and the
+    // auto gate, so UI numbers and gate decisions never drift apart)
+    let folded_tokens: u64 = sf
         .messages
         .iter()
         .filter(|m| m.role == "user" || m.role == "assistant" || m.role == "tool")
-        .map(|m| m.content.len() + 96)
+        .map(|m| est_tokens(&m.content) + RECORD_OVERHEAD_TOKENS)
         .sum();
-    let folded_tokens = (folded_bytes as u64) / 4;
-    let summary_tokens: u64 = 800; // 600-char summary cap ≈ 600–900 CJK tokens
+    let summary_tokens: u64 = 800; // 1200-char YAML cap ≈ 800–1000 CJK tokens
 
     let pricing = provider.pricing.get(&model);
     let (rewrite_cost_usd, save_per_turn_usd, payback) = match pricing {
@@ -2182,10 +2215,12 @@ fn prune_oversized_tool_records(
             &m.content,
             max_chars,
         );
-        let before = m.content.chars().count();
-        let after = trimmed.chars().count();
+        // accounting in the shared token unit so the projected input drop
+        // matches what the request estimator would see
+        let before = est_tokens(&m.content);
+        let after = est_tokens(&trimmed);
         if after < before {
-            saved += before - after;
+            saved += (before - after) as usize;
             m.content = trimmed;
             changed = true;
         }
@@ -2216,7 +2251,7 @@ fn prune_oversized_tool_records(
 /// persisted record is rewritten once, the live prefix is dropped, and
 /// restart rebuilds read the rewritten bytes. The stub keeps role=tool +
 /// tool_call_id, so call/result pairing survives (design invariant I1).
-/// Returns (saved chars, stubs written); (0, 0) = nothing changed.
+/// Returns (saved tokens, stubs written); (0, 0) = nothing changed.
 fn elide_stale_tool_records(
     data_dir: &std::path::Path,
     session_id: &str,
@@ -2276,10 +2311,11 @@ fn elide_stale_tool_records(
             m.ts,
             m.content.chars().count()
         );
-        let before = m.content.chars().count();
-        let after = stub.chars().count();
+        // token-unit accounting, consistent with the prune rung above
+        let before = est_tokens(&m.content);
+        let after = est_tokens(&stub);
         if after < before {
-            saved += before - after;
+            saved += (before - after) as usize;
             stubs += 1;
             m.content = stub;
             changed = true;
@@ -2420,21 +2456,26 @@ async fn maybe_auto_compact(
     // payback gate (L6 §2): only summarize when the session's expected
     // remaining life amortizes the rewrite cost. No pricing data ⇒ the
     // gate stays open (pressure-only, previous behavior).
-    let folded_tokens = {
-        let bytes: usize = sf
-            .messages
-            .iter()
-            .filter(|m| m.role == "user" || m.role == "assistant" || m.role == "tool")
-            .map(|m| m.content.len() + 96)
-            .sum();
-        (bytes as u64) / 4
-    };
-    if !auto_compact_payback_ok(
-        provider.pricing.get(&binding.model),
-        folded_tokens,
-        800,
-        completed_turns,
-    ) {
+    let folded_tokens: u64 = sf
+        .messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant" || m.role == "tool")
+        .map(|m| est_tokens(&m.content) + RECORD_OVERHEAD_TOKENS)
+        .sum();
+    // pressure hard line (P2): the payback gate can stay shut forever when
+    // cached-token pricing is unknown (cached_per_m <= 0) and the free
+    // rungs have already run dry — such a session grows past the window
+    // until the upstream refuses requests. Survival beats savings: past
+    // 90% of the window, summarize regardless of economics.
+    let pressure = last_input >= window * 0.90;
+    if !pressure
+        && !auto_compact_payback_ok(
+            provider.pricing.get(&binding.model),
+            folded_tokens,
+            800,
+            completed_turns,
+        )
+    {
         return;
     }
     // thrash engage (L6 §6.2): this is the ≥2nd auto compaction within the
@@ -2472,7 +2513,7 @@ async fn maybe_auto_compact(
                 images: Vec::new(),
             });
             s.meta.updated_at = now_ms();
-            let _ = state.store.save(&s);
+            warn_save(session_id, "thrash notice", state.store.save(&s));
         }
     }
     let _ =
@@ -2536,6 +2577,12 @@ pub async fn rollback_session(state: State<'_, AppState>, session_id: String, fr
     let before = sf.messages.len();
     sf.messages.retain(|m| m.ts < from_ts);
     let removed = before - sf.messages.len();
+    // a rollback point at/before the fold boundary invalidates the summary:
+    // it now covers messages that no longer exist — drop it so the next
+    // request rebuilds from the full remaining transcript (P2)
+    if sf.compaction.as_ref().is_some_and(|c| c.upto_ts >= from_ts) {
+        sf.compaction = None;
+    }
     sf.telemetry.retain(|r| r.ts < from_ts);
     sf.meta.updated_at = now_ms();
     state.store.save(&sf)?;
@@ -3796,7 +3843,7 @@ async fn run_send(
                     if let Ok(mut sf) = store.load(&session_id) {
                         sf.messages.push(record);
                         sf.meta.updated_at = now_ms();
-                        let _ = store.save(&sf);
+                        warn_save(&session_id, "assistant record", store.save(&sf));
                     }
                 }
                 let _ = channel.send(StreamEvent::Done {
@@ -3899,7 +3946,7 @@ async fn run_send(
                 if let Ok(mut s) = store.load(&session_id) {
                     s.meta.rolling_memo_injected_rev = s.meta.rolling_memo_rev;
                     s.meta.updated_at = now_ms();
-                    let _ = store.save(&s);
+                    warn_save(&session_id, "memo watermark", store.save(&s));
                 }
             }
 
@@ -4347,7 +4394,7 @@ async fn run_send(
                         }
                         sf.telemetry.push(stat);
                         sf.meta.updated_at = now_ms();
-                        let _ = store.save(&sf);
+                        warn_save(&session_id, "usage record", store.save(&sf));
                     }
                 }
 
@@ -4466,7 +4513,7 @@ async fn run_send(
                             if let Ok(mut sf) = store.load(&session_id) {
                                 sf.messages.push(tool_record);
                                 sf.meta.updated_at = now_ms();
-                                let _ = store.save(&sf);
+                                warn_save(&session_id, "tool record", store.save(&sf));
                             }
                         }
                         sent_this_turn.push(ChatMessage {
@@ -4945,7 +4992,7 @@ async fn run_send(
                                                     sf.writes.drain(..sf.writes.len() - 200);
                                                 }
                                                 sf.meta.updated_at = now_ms();
-                                                let _ = store.save(&sf);
+                                                warn_save(&session_id, "write log", store.save(&sf));
                                             }
                                         }
                                         // post-write verification hook: run the
@@ -5053,7 +5100,7 @@ async fn run_send(
                         if let Ok(mut sf) = store.load(&session_id) {
                             sf.messages.push(tool_record);
                             sf.meta.updated_at = now_ms();
-                            let _ = store.save(&sf);
+                            warn_save(&session_id, "tool record", store.save(&sf));
                         }
                     }
                     // live wire: the record above stores the REAL tool
@@ -5132,7 +5179,7 @@ async fn run_send(
                         s.meta.rolling_memo = Some(memo);
                         s.meta.rolling_memo_rev += 1;
                         s.meta.updated_at = now_ms();
-                        let _ = store.save(&s);
+                        warn_save(&session_id, "rolling memo", store.save(&s));
                     }
                 }
             }
@@ -5220,7 +5267,7 @@ async fn run_send(
                         sfr.meta.goal_rounds.drain(..overflow);
                     }
                     sfr.meta.updated_at = now_ms();
-                    let _ = store.save(&sfr);
+                    warn_save(&session_id, "goal rounds", store.save(&sfr));
                 }
             }
 
@@ -5916,7 +5963,8 @@ mod memo_tests {
         store.save(&s).unwrap();
 
         let (saved, stubs) = elide_stale_tool_records(&dir, &sid, 24_000, 9);
-        assert!(saved > 40_000 - 200);
+        // token-unit accounting: 40k ASCII chars ≈ 10k tokens, stub ≈ 30
+        assert!(saved > 10_000 - 500, "{saved}");
         assert_eq!(stubs, 1);
 
         let s2 = store.load(&sid).unwrap();
@@ -6012,6 +6060,19 @@ mod bucket_tests {
             big_tool(3, 50_000),
         ];
         assert_eq!(compute_keep_from_ts(&msgs, 1_000), 2);
+    }
+
+    #[test]
+    fn est_tokens_handles_cjk_not_as_bytes_over_four() {
+        // 400 ASCII chars ≈ 100 tokens
+        assert_eq!(est_tokens(&"a".repeat(400)), 100);
+        // 400 CJK chars are 1200 UTF-8 bytes: flat bytes/4 said 300,
+        // reality is ≈320 (1.25 chars/token) — the old estimate
+        // systematically inflated KEEP budgets and payback (P2)
+        let t = est_tokens(&"中".repeat(400));
+        assert!((300..=340).contains(&t), "{t}");
+        let mixed = est_tokens(&format!("{}{}", "a".repeat(400), "中".repeat(400)));
+        assert!((400..=440).contains(&mixed), "{mixed}");
     }
 
     #[test]

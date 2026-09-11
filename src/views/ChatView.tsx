@@ -626,19 +626,31 @@ export function ChatView() {
   const compactionSessionId = activeSessionId;
   useEffect(() => {
     setCompaction(null);
-    if (compactionSessionId) {
-      void api.getSessionCompaction(compactionSessionId).then(setCompaction).catch(() => {});
-    }
+    if (!compactionSessionId) return;
+    // stale-response guard: a slow answer for the PREVIOUS session must not
+    // overwrite this session's badge (P2: five effects had no expiry)
+    let alive = true;
+    void api
+      .getSessionCompaction(compactionSessionId)
+      .then((c) => alive && setCompaction(c))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, [compactionSessionId]);
   // refresh the +/- badge when the transcript grows (a turn that wrote
   // files just ended) or the session switches
   useEffect(() => {
     setChangeLines(null);
     if (!activeSessionId) return;
+    let alive = true;
     void api
       .sessionChangeLines(activeSessionId)
-      .then(setChangeLines)
+      .then((r) => alive && setChangeLines(r))
       .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, [activeSessionId, msgs.length]);
 
   // session-cumulative prefix hit rate for the header badge (Σcached/Σinput
@@ -666,10 +678,14 @@ export function ChatView() {
   // successful turn shows up without a manual reload.
   useEffect(() => {
     if (!activeSessionId) return;
+    let alive = true;
     void api
       .getWorkflowMode(activeSessionId)
-      .then(setWfMode)
-      .catch(() => setWfMode("agent"));
+      .then((m) => alive && setWfMode(m))
+      .catch(() => alive && setWfMode("agent"));
+    return () => {
+      alive = false;
+    };
   }, [activeSessionId, msgs.length]);
 
   // declarative state-machine position: wfMode carries "sm:<def>:<state>"
@@ -718,7 +734,14 @@ export function ChatView() {
       setWtInfo(null);
       return;
     }
-    refreshWt(activeSessionId);
+    let alive = true;
+    void api
+      .wtInfo(activeSessionId)
+      .then((r) => alive && setWtInfo(r))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, [activeSessionId, msgs.length]);
 
   // isolation popover + diff overlay state
@@ -868,8 +891,16 @@ export function ChatView() {
       setGoal(null);
       return;
     }
-    refreshGoal(activeSessionId);
-  }, [activeSessionId, msgs.length, refreshGoal]);
+    // stale-response guard: only the CURRENT session's snapshot may land
+    let alive = true;
+    api
+      .goalGet(activeSessionId)
+      .then((g) => alive && setGoal(g))
+      .catch(() => alive && setGoal(null));
+    return () => {
+      alive = false;
+    };
+  }, [activeSessionId, msgs.length]);
   useEffect(() => {
     autoContRef.current = 0;
     goalStoppedRef.current = false;

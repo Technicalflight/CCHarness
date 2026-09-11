@@ -1565,7 +1565,7 @@ mod tests {
         let mut cfilter = crate::confidence::ConfidenceFilter::new();
         let mut tool_accs: Vec<ToolCallAcc> = Vec::new();
         let mut finish: Option<String> = None;
-        let mut apply = |v: Value,
+        let apply = |v: Value,
                          content: &mut String,
                          reasoning: &mut String,
                          usage: &mut UsageStat,
