@@ -6,6 +6,7 @@ mod auxmemo;
 mod bench;
 mod chat;
 mod commands;
+mod compaction;
 mod confidence;
 mod config;
 mod deepfiles;
@@ -17,6 +18,7 @@ mod mcp;
 mod memvector;
 mod prefix;
 mod privacy;
+mod send_engine;
 mod sessions;
 mod skillhub;
 mod skills;
@@ -26,6 +28,7 @@ mod sysprompt;
 mod types_rs;
 mod update;
 mod urlguard;
+mod workflow;
 mod worktree;
 
 use tauri::{
@@ -144,7 +147,7 @@ fn main() {
             commands::rename_session,
             commands::update_bindings,
             commands::set_workspace,
-            commands::set_permission_mode,
+            workflow::set_permission_mode,
             commands::get_session_messages,
             commands::attachment_data,
             commands::get_telemetry,
@@ -155,18 +158,18 @@ fn main() {
             commands::window_minimize,
             commands::window_toggle_maximize,
             commands::window_close,
-            commands::send_message,
-            commands::arena_send,
-            commands::group_send,
+            send_engine::send_message,
+            send_engine::arena_send,
+            send_engine::group_send,
             bench::bench_cases_default,
             bench::bench_history,
             bench::bench_run,
-            commands::stop_generation,
+            send_engine::stop_generation,
             commands::resolve_approval,
             commands::rollback_session,
-            commands::compact_session,
-            commands::get_session_compaction,
-            commands::compact_estimate,
+            compaction::compact_session,
+            compaction::get_session_compaction,
+            compaction::compact_estimate,
             commands::get_todos,
             commands::mcp_status,
             commands::mcp_test,
@@ -179,20 +182,20 @@ fn main() {
             commands::skillhub_plugin_install,
             commands::enhance_prompt,
             commands::get_aux_stats,
-            commands::set_workflow_mode,
-            commands::get_workflow_mode,
-            commands::goal_set,
-            commands::goal_get,
+            workflow::set_workflow_mode,
+            workflow::get_workflow_mode,
+            workflow::goal_set,
+            workflow::goal_get,
             commands::wiki_generate,
             commands::session_digest,
             commands::session_change_lines,
             commands::open_backup_dir,
             commands::privacy_log_tail,
             commands::privacy_log_clear,
-            commands::goal_status,
-            commands::goal_clear,
-            commands::sm_get,
-            commands::sm_set,
+            workflow::goal_status,
+            workflow::goal_clear,
+            workflow::sm_get,
+            workflow::sm_set,
             commands::list_session_writes,
             commands::get_write_diff,
             commands::set_session_pinned,
