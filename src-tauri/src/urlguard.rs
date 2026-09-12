@@ -1,7 +1,11 @@
 // SSRF guard: loopback / private-network endpoints are refused unless the
 // provider carries an explicit user consent flag (allow_local). Local model
-// runners (Ollama, llama.cpp) are the intended use of that flag.
-use std::net::IpAddr;
+// runners (Ollama, llama.cpp) are the intended use of that flag. Hostnames
+// are additionally RESOLVED and every answer classified — a public-looking
+// name that answers with a private IP (nip.io / sslip.io style services,
+// rebinding resolvers) is treated as internal.
+use std::net::{IpAddr, ToSocketAddrs};
+use std::time::Duration;
 
 pub fn is_loopback_or_private(host: &str) -> bool {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
@@ -41,6 +45,28 @@ fn classify_ip(ip: &IpAddr) -> bool {
     }
 }
 
+/// Resolve `host` and report whether ANY resolved address is
+/// loopback/private. Bounded: DNS must answer within 3s on a worker thread
+/// (std `to_socket_addrs` has no timeout, and a hung resolver would stall
+/// the caller) — unresolvable names return None, which callers treat as
+/// refuse (the subsequent HTTP request would hang on the same resolver).
+fn resolves_into_private(host: &str, port: u16) -> Option<bool> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<IpAddr>>();
+    let target = (host.to_string(), port);
+    std::thread::spawn(move || {
+        let ips = target
+            .to_socket_addrs()
+            .map(|it| it.map(|a| a.ip()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let _ = tx.send(ips);
+    });
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(ips) if !ips.is_empty() => Some(ips.iter().any(|ip| classify_ip(ip))),
+        // resolution failed or timed out — the caller refuses (fail-closed)
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub enum UrlCheck {
     // `base` carries the normalized origin for future callers (catalog
@@ -74,6 +100,27 @@ pub fn check_base_url(raw: &str, allow_local: bool) -> UrlCheck {
         return UrlCheck::Refused(format!(
             "端点 {host} 位于本机/内网 —— 出于 SSRF 防护默认拒绝；确属本地模型服务（如 Ollama）时，请在 Provider 设置中开启「允许本地/内网地址」"
         ));
+    }
+    if !allow_local && host.parse::<IpAddr>().is_err() {
+        // the string check passed and the host is a NAME — it can still
+        // answer with private addresses (nip.io/sslip.io subdomain
+        // services, rebinding resolvers): resolve and classify every IP
+        let port = parsed
+            .port()
+            .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+        match resolves_into_private(&host, port) {
+            Some(false) => {}
+            Some(true) => {
+                return UrlCheck::Refused(format!(
+                    "端点 {host} 解析到本机/内网地址 —— 出于 SSRF 防护默认拒绝；确属本地模型服务（如 Ollama）时，请在 Provider 设置中开启「允许本地/内网地址」"
+                ));
+            }
+            None => {
+                return UrlCheck::Refused(format!(
+                    "无法解析端点主机 {host}（3 秒超时或域名不存在）—— 出于 SSRF 防护拒绝；请检查域名拼写，或直接填 IP"
+                ));
+            }
+        }
     }
     let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
     let mut base = format!("{}://{}{}", parsed.scheme(), host, port);
@@ -112,6 +159,22 @@ mod tests {
     #[test]
     fn refuses_bad_scheme() {
         assert!(matches!(check_base_url("file:///etc/passwd", false), UrlCheck::Refused(_)));
+    }
+
+    #[test]
+    fn resolution_classifies_localhost_as_private() {
+        // real getaddrinfo on a name every OS resolves locally (hosts file,
+        // no network dependency): the resolved 127.0.0.1 / ::1 classifies
+        // private — this is the path nip.io-style names would take
+        assert_eq!(resolves_into_private("localhost", 80), Some(true));
+    }
+
+    #[test]
+    fn literal_ip_hosts_skip_resolution() {
+        // a literal IP never re-enters the resolver; classification is
+        // direct (and unresolvable garbage names are not looked up either)
+        assert!(matches!(check_base_url("http://8.8.8.8/v1", false), UrlCheck::Ok { .. }));
+        assert!(matches!(check_base_url("http://10.0.0.3/v1", false), UrlCheck::Refused(_)));
     }
 
     #[test]
