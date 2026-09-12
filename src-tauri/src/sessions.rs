@@ -68,7 +68,23 @@ impl SessionStore {
         let tmp = self.dir.join(format!(".{}.tmp", sf.meta.id));
         let body = serde_json::to_string_pretty(sf).map_err(|e| e.to_string())?;
         fs::write(&tmp, body).map_err(|e| format!("写入失败: {e}"))?;
-        fs::rename(&tmp, &p).map_err(|e| format!("提交失败: {e}"))
+        // Windows rename briefly collides with unlocked concurrent readers
+        // (auto-title etc.) — retry a few times before giving up, so a
+        // transient share violation doesn't silently drop the record
+        let mut err: Option<std::io::Error> = None;
+        for attempt in 0..4u32 {
+            match fs::rename(&tmp, &p) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    err = Some(e);
+                    if attempt < 3 {
+                        std::thread::sleep(std::time::Duration::from_millis(10 * (attempt as u64 + 1)));
+                    }
+                }
+            }
+        }
+        Err(format!("提交失败: {}", err.unwrap_or_else(|| std::io::Error::other("rename")))
+        )
     }
 
     pub fn create(&self, kind: &str, bindings: Vec<SessionBinding>, title: &str) -> Result<SessionFile, String> {

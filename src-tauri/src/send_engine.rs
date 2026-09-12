@@ -2823,7 +2823,19 @@ async fn run_send(
     for h in handles {
         let _ = h.await;
     }
-    state.stops.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
+    // concurrent-send guard: a second send on the same session replaces
+    // this entry in the map — only remove the flag if it is still OURS,
+    // otherwise the first finisher deletes the second send's stop switch
+    // and that send could never be stopped
+    {
+        let mut stops = state.stops.lock().unwrap_or_else(|p| p.into_inner());
+        if stops
+            .get(&session_id)
+            .is_some_and(|cur| Arc::ptr_eq(cur, &stop))
+        {
+            stops.remove(&session_id);
+        }
+    }
 
     // AuxMemo application: auto-title (whitelist kind "title"). Fires once
     // per session when the first exchange finished; served from the exact
