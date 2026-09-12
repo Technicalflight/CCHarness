@@ -59,7 +59,7 @@ function FileRow({
 }
 
 export function GitTab({ workspace, wtActive }: { workspace: string; wtActive: boolean }) {
-  const { toast } = useApp();
+  const toast = useApp((s) => s.toast);
   const fsVersion = useApp((s) => s.fsVersion);
   const [ov, setOv] = useState<GitOverview | null>(null);
   const [error, setError] = useState("");

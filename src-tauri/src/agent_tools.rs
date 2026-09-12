@@ -823,6 +823,37 @@ fn refuse_symlink_target(path: &Path, rel: &str) -> Result<(), String> {
     {
         return Err(format!("拒绝操作符号链接 {rel}（真实落点可能在工作区之外）"));
     }
+    // std's is_symlink() does not recognize NTFS junctions (mount-point
+    // reparse points): a junction inside the workspace sails past the check
+    // above and a write through it lands wherever the junction points —
+    // outside the workspace. FILE_ATTRIBUTE_REPARSE_POINT covers symlinks
+    // and junctions alike. (Known residual: TOCTOU between this check and
+    // the actual open — true hardening needs open-by-handle; recorded as a
+    // long-term depth item.)
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
+        };
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        if attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "拒绝操作链接目标 {rel}（NTFS reparse point，真实落点可能在工作区之外）"
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // non-Windows: is_symlink() above already covers every link kind
+        let _ = path;
+        let _ = rel;
+    }
     Ok(())
 }
 

@@ -27,7 +27,7 @@ export function ToolCard({
   /** Live output streamed from a delegated sub-agent. */
   progress?: string;
 }) {
-  const { setPreview } = useApp();
+  const setPreview = useApp((s) => s.setPreview);
   const isDelegate = name === "delegate_subagent";
   // extract the workspace-relative path for the preview shortcut
   const previewPath = useMemo(() => {

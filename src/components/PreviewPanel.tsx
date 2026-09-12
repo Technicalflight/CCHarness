@@ -237,7 +237,7 @@ const PRESETS = [
 ];
 
 function BrowserTab() {
-  const { toast } = useApp();
+  const toast = useApp((s) => s.toast);
   const [input, setInput] = useState("");
   const [url, setUrl] = useState("");
   const [reloadKey, setReloadKey] = useState(0);
@@ -437,7 +437,15 @@ const TABS: { id: PreviewTab; label: string; icon: "folder" | "branch" | "globe"
 ];
 
 export function PreviewPanel() {
-  const { previewOpen, previewTab, previewFile, setPreview, setPanelW, sessions, activeSessionId } = useApp();
+  // per-field selectors: this panel is always mounted — a whole-store
+  // subscription re-rendered it (and every tab inside) on each stream delta
+  const previewOpen = useApp((s) => s.previewOpen);
+  const previewTab = useApp((s) => s.previewTab);
+  const previewFile = useApp((s) => s.previewFile);
+  const setPreview = useApp((s) => s.setPreview);
+  const setPanelW = useApp((s) => s.setPanelW);
+  const sessions = useApp((s) => s.sessions);
+  const activeSessionId = useApp((s) => s.activeSessionId);
   const panelW = useApp((s) => s.panelW);
   const workspace = useMemo(
     () => sessions.find((s) => s.id === activeSessionId)?.workspace ?? null,

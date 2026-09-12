@@ -13,7 +13,15 @@ interface Action {
 export function CommandPalette() {
   const open = useApp((s) => s.paletteOpen);
   const setPalette = useApp((s) => s.setPalette);
-  const store = useApp();
+  // per-field selectors: this palette is ALWAYS mounted at the app root —
+  // a whole-store subscription re-rendered it on every stream delta
+  const setView = useApp((s) => s.setView);
+  const sessions = useApp((s) => s.sessions);
+  const newSession = useApp((s) => s.newSession);
+  const toast = useApp((s) => s.toast);
+  const config = useApp((s) => s.config);
+  const persistConfig = useApp((s) => s.persistConfig);
+  const selectSession = useApp((s) => s.selectSession);
   const [q, setQ] = useState("");
   const [hl, setHl] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -52,7 +60,7 @@ export function CommandPalette() {
       ["settings", "设置"],
     ];
     for (const [v, label] of views) {
-      list.push({ id: `view-${v}`, label: `打开${label}`, tag: "视图", run: () => store.setView(v) });
+      list.push({ id: `view-${v}`, label: `打开${label}`, tag: "视图", run: () => setView(v) });
     }
     list.push({
       id: "new-chat",
@@ -60,10 +68,10 @@ export function CommandPalette() {
       tag: "操作",
       run: async () => {
         try {
-          const binding = store.sessions.find((s) => s.kind === "chat" && s.bindings[0])?.bindings[0];
-          await store.newSession("chat", binding ? [binding] : [], "新会话");
+          const binding = sessions.find((s) => s.kind === "chat" && s.bindings[0])?.bindings[0];
+          await newSession("chat", binding ? [binding] : [], "新会话");
         } catch (e) {
-          store.toast("error", `新建会话失败: ${String(e)}`);
+          toast("error", `新建会话失败: ${String(e)}`);
         }
       },
     });
@@ -73,10 +81,10 @@ export function CommandPalette() {
       tag: "操作",
       run: async () => {
         try {
-          const lanes = store.sessions.find((s) => s.kind === "arena")?.bindings ?? [];
-          await store.newSession("arena", lanes, "竞技场");
+          const lanes = sessions.find((s) => s.kind === "arena")?.bindings ?? [];
+          await newSession("arena", lanes, "竞技场");
         } catch (e) {
-          store.toast("error", `新建竞技场失败: ${String(e)}`);
+          toast("error", `新建竞技场失败: ${String(e)}`);
         }
       },
     });
@@ -85,24 +93,24 @@ export function CommandPalette() {
       label: "切换 深色 / 浅色主题",
       tag: "操作",
       run: async () => {
-        if (!store.config) return;
-        await store.persistConfig({
-          ...store.config,
-          settings: { ...store.config.settings, theme: store.config.settings.theme === "dark" ? "light" : "dark" },
+        if (!config) return;
+        await persistConfig({
+          ...config,
+          settings: { ...config.settings, theme: config.settings.theme === "dark" ? "light" : "dark" },
         });
       },
     });
-    for (const s of store.sessions) {
+    for (const s of sessions) {
       if (s.kind === "sub") continue; // hidden sub-agent sessions
       list.push({
         id: `session-${s.id}`,
         label: s.title || "未命名会话",
         tag: s.kind === "arena" ? `${s.bindings.length} 模型` : "会话",
-        run: () => store.selectSession(s.id),
+        run: () => selectSession(s.id),
       });
     }
     return list;
-  }, [store]);
+  }, [setView, sessions, newSession, toast, config, persistConfig, selectSession]);
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
