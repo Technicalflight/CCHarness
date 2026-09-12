@@ -571,37 +571,90 @@ fn headers_of(cfg: &McpServerConfig) -> reqwest::header::HeaderMap {
 }
 
 async fn request_http(cfg: &McpServerConfig, msg: Value, timeout_secs: u64) -> Result<Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        // user-configured endpoints are trusted-ish, but redirects must not
-        // quietly walk a request into loopback/private space (P2 SSRF)
-        .redirect(reqwest::redirect::Policy::custom(|att| {
-            if att.previous().len() > 5 {
-                return att.error("重定向过多");
-            }
-            let host = att.url().host_str().unwrap_or("");
-            if crate::urlguard::is_loopback_or_private(host) {
-                return att.error("重定向目标位于本机/内网，已拒绝");
-            }
-            att.follow()
-        }))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .post(&cfg.url)
-        .headers(headers_of(cfg))
-        .json(&msg)
-        .send()
-        .await
-        .map_err(|e| format!("网络错误: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("上游返回 {}", resp.status()));
-    }
-    let v: Value = resp.json().await.map_err(|e| format!("响应不是 JSON: {e}"))?;
-    if let Some(err) = v.get("error") {
-        if !err.is_null() {
-            return Err(format!("MCP 错误: {err}"));
+    // hop-by-hop resolve-then-pin (same discipline as agent_tools::web_fetch):
+    // a string-only redirect check loses to a name that resolves loopback,
+    // and vetting the base URL once at ensure() time leaves a DNS rebinding
+    // window before every later POST — so each hop resolves, vets every
+    // answer against the private-net policy, and pins the connection.
+    use std::net::ToSocketAddrs;
+    const MAX_HOPS: usize = 5;
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    let mut current = reqwest::Url::parse(&cfg.url).map_err(|e| format!("URL 无效: {e}"))?;
+    let origin_host = current.host_str().unwrap_or_default().to_string();
+    for hop in 0..=MAX_HOPS {
+        let host = current
+            .host_str()
+            .ok_or("URL 缺少主机名")?
+            .trim_matches(['[', ']'])
+            .to_string();
+        if crate::urlguard::is_loopback_or_private(&host) {
+            return Err(format!("目标 {host} 位于本机/内网，请求已拒绝"));
         }
+        let port = current.port_or_known_default().unwrap_or(80);
+        let lookup = host.clone();
+        let addrs = tauri::async_runtime::spawn_blocking(move || {
+            (lookup.as_str(), port)
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<_>>())
+                .map_err(|e| format!("DNS 解析失败: {e}"))
+        })
+        .await
+        .map_err(|e| format!("解析任务失败: {e}"))??;
+        let mut pinned: Option<std::net::SocketAddr> = None;
+        for sa in addrs {
+            if crate::urlguard::is_loopback_or_private(&sa.ip().to_string()) {
+                return Err(format!("解析结果 {} 位于本机/内网，请求已拒绝", sa.ip()));
+            }
+            if pinned.is_none() {
+                pinned = Some(sa);
+            }
+        }
+        let pinned = pinned.ok_or_else(|| "DNS 解析未返回地址".to_string())?;
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .resolve(&host, pinned)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| e.to_string())?;
+        // configured auth/tenant headers are for the configured server only —
+        // a cross-host redirect must not carry them to the new target
+        let same_host = host == origin_host;
+        let mut req = client.post(current.clone());
+        if same_host {
+            req = req.headers(headers_of(cfg));
+        }
+        let resp = req
+            .json(&msg)
+            .send()
+            .await
+            .map_err(|e| format!("网络错误: {e}"))?;
+        if resp.status().is_redirection() {
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or("重定向缺少 Location 头")?
+                .to_string();
+            if hop == MAX_HOPS {
+                return Err("重定向过多".into());
+            }
+            let next = current.join(&loc).map_err(|e| format!("非法重定向目标: {e}"))?;
+            if next.scheme() != "http" && next.scheme() != "https" {
+                return Err(format!("重定向协议不被支持: {}", next.scheme()));
+            }
+            current = next;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(format!("上游返回 {}", resp.status()));
+        }
+        let v: Value = resp.json().await.map_err(|e| format!("响应不是 JSON: {e}"))?;
+        if let Some(err) = v.get("error") {
+            if !err.is_null() {
+                return Err(format!("MCP 错误: {err}"));
+            }
+        }
+        return Ok(v.get("result").cloned().unwrap_or(Value::Null));
     }
-    Ok(v.get("result").cloned().unwrap_or(Value::Null))
+    unreachable!("redirect hops are bounded")
 }

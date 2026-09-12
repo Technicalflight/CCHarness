@@ -694,11 +694,33 @@ fn stream_error_message(v: &Value) -> Option<String> {
     Some(msg.to_string())
 }
 
+/// Provider and model-list endpoints carry the conversation transcript (or
+/// provider keys' auth headers) in the request — following a cross-host
+/// redirect would hand them to a third party. Same-host hops stay allowed
+/// (CDN-style); anything else surfaces as an error instead of silently
+/// following. reqwest strips auth headers cross-host on its own, but the
+/// body with the full transcript would still ride along.
+pub fn same_host_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|att| {
+        let same_host = att
+            .previous()
+            .first()
+            .and_then(|u| u.host_str())
+            .zip(att.url().host_str())
+            .map(|(a, b)| a == b)
+            .unwrap_or(false);
+        if same_host {
+            att.follow()
+        } else {
+            att.error("上游跨主机重定向已拒绝")
+        }
+    })
+}
+
 /// Route one parsed SSE frame to the provider handler. Returns the upstream
 /// error message when the frame is a fatal in-stream error event.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_sse_frame(
-    ctx: &SendCtx<'_>,
+fn dispatch_sse_frame(    ctx: &SendCtx<'_>,
     v: &Value,
     content: &mut String,
     reasoning: &mut String,

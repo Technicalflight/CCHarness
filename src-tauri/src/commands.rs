@@ -218,11 +218,13 @@ impl AppState {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .connect_timeout(std::time::Duration::from_secs(20))
+            .redirect(crate::chat::same_host_redirects())
             .build()
             .expect("http client");
         let stream_client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(20))
             .read_timeout(std::time::Duration::from_secs(90))
+            .redirect(crate::chat::same_host_redirects())
             .build()
             .expect("stream http client");
         let store = SessionStore::new(&data_dir);
@@ -721,6 +723,7 @@ pub async fn test_provider(
     provider: Provider,
 ) -> Result<TestResult, String> {
     let provider = unmask_provider_key(&state, provider);
+    let provider = reconcile_allow_local(&state, provider);
     // same SSRF guard as save_config: these commands hit an arbitrary URL,
     // so loopback/private endpoints need the explicit allow_local consent
     if let crate::urlguard::UrlCheck::Refused(msg) =
@@ -744,6 +747,7 @@ pub async fn fetch_models(
     provider: Provider,
 ) -> Result<Vec<String>, String> {
     let provider = unmask_provider_key(&state, provider);
+    let provider = reconcile_allow_local(&state, provider);
     if let crate::urlguard::UrlCheck::Refused(msg) =
         crate::urlguard::check_base_url(&provider.base_url, provider.allow_local)
     {
@@ -776,8 +780,23 @@ fn models_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(crate::chat::same_host_redirects())
         .build()
         .expect("models http client")
+}
+
+/// `allow_local` is an SSRF consent flag — trusting the caller's copy would
+/// let a compromised webview flip it per-invoke against internal endpoints
+/// and read the response back out of the error string. For a provider that
+/// already exists in the stored config, the STORED consent wins; only a
+/// brand-new provider (not yet saved) may pass its own value, and saving it
+/// goes through the visible save_config flow.
+fn reconcile_allow_local(state: &State<'_, AppState>, mut p: Provider) -> Provider {
+    let cfg = crate::config::load(&state.data_dir);
+    if let Some(stored) = cfg.providers.iter().find(|x| x.id == p.id) {
+        p.allow_local = stored.allow_local;
+    }
+    p
 }
 
 /// In-memory and side-file teardown shared by a session and its cascade:
