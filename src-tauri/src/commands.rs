@@ -684,27 +684,50 @@ fn home_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
+/// Renderer snapshots carry the ****last4 mask (get_config never ships real
+/// keys). For commands that USE a stored provider — test / fetch models —
+/// swap the mask back for the stored key, otherwise the literal asterisks
+/// go out as the Bearer token and upstream answers 401 Invalid token.
+/// New/edited providers (plaintext key just typed) pass through untouched.
+fn unmask_provider_key(state: &AppState, mut provider: Provider) -> Provider {
+    if config::is_masked_key(&provider.api_key) {
+        let cfg = config::load(&state.data_dir);
+        if let Some(stored) = cfg.providers.iter().find(|x| x.id == provider.id) {
+            provider.api_key = stored.api_key.clone();
+        }
+    }
+    provider
+}
+
 #[tauri::command]
-pub async fn test_provider(provider: Provider) -> TestResult {
+pub async fn test_provider(
+    state: State<'_, AppState>,
+    provider: Provider,
+) -> Result<TestResult, String> {
+    let provider = unmask_provider_key(&state, provider);
     // same SSRF guard as save_config: these commands hit an arbitrary URL,
     // so loopback/private endpoints need the explicit allow_local consent
     if let crate::urlguard::UrlCheck::Refused(msg) =
         crate::urlguard::check_base_url(&provider.base_url, provider.allow_local)
     {
-        return TestResult { ok: false, message: msg, models: vec![] };
+        return Ok(TestResult { ok: false, message: msg, models: vec![] });
     }
     match chat::fetch_models_async(&models_client(), &provider).await {
-        Ok(models) => TestResult {
+        Ok(models) => Ok(TestResult {
             ok: true,
             message: format!("连接成功，{} 个模型可用", models.len()),
             models: models.clone(),
-        },
-        Err(e) => TestResult { ok: false, message: e, models: vec![] },
+        }),
+        Err(e) => Ok(TestResult { ok: false, message: e, models: vec![] }),
     }
 }
 
 #[tauri::command]
-pub async fn fetch_models(provider: Provider) -> Result<Vec<String>, String> {
+pub async fn fetch_models(
+    state: State<'_, AppState>,
+    provider: Provider,
+) -> Result<Vec<String>, String> {
+    let provider = unmask_provider_key(&state, provider);
     if let crate::urlguard::UrlCheck::Refused(msg) =
         crate::urlguard::check_base_url(&provider.base_url, provider.allow_local)
     {
