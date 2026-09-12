@@ -290,11 +290,18 @@ impl McpManager {
                     .ok_or("进程不存在")?
             };
             let mut stdin = stdin_arc.lock().await;
-            stdin
-                .write_all(line.as_bytes())
+            // bounded like the request path below: a stuck child that never
+            // drains its pipe must not park whoever awaits this notification
+            // (currently startup-only, but the bound keeps future call sites
+            // in the tool loop safe)
+            let write = async {
+                stdin.write_all(line.as_bytes()).await.map_err(|e| format!("写入失败: {e}"))?;
+                stdin.flush().await.map_err(|e| format!("flush 失败: {e}"))?;
+                Ok::<(), String>(())
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), write)
                 .await
-                .map_err(|e| format!("写入失败: {e}"))?;
-            stdin.flush().await.map_err(|e| format!("flush 失败: {e}"))?;
+                .unwrap_or_else(|_| Err("写入超时".to_string()))?;
         }
         Ok(())
     }
