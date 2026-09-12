@@ -689,6 +689,10 @@ pub fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<
     if let Some(map) = prefixes_lock(&state).as_mut() {
         map.retain(|(sid, _), _| sid != &session_id);
     }
+    // 生命周期随行：内存里的隐私替身库与磁盘上的溢出文件都随会话消亡，
+    // 不再无限累积（privacy::forget 此前是死代码，spills 目录从未清理）
+    crate::privacy::forget(&session_id);
+    crate::spill::purge_session(&session_id);
     state.store.delete(&session_id)
 }
 

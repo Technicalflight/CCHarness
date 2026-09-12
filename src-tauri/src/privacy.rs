@@ -155,6 +155,13 @@ fn master_key(data_dir: &Path) -> [u8; 32] {
     let mut k = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut k);
     let _ = std::fs::write(&path, &k);
+    // 主密钥能解出全部替身映射 —— unix 上绝不落成全局可读（与
+    // auxcache.key、config.json 同一纪律）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     k
 }
 

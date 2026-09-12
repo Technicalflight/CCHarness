@@ -67,12 +67,26 @@ pub fn resolve_spill_file(rel: &str) -> Option<PathBuf> {
     (name_ok && under_root).then(|| p.to_path_buf())
 }
 
+/// Remove one session's spill directory (session deleted).此前会话删除后
+/// 溢出文件永久残留 —— 大输出工具用得越多，数据目录涨得越大。缺失的
+/// 目录视为已清理。
+pub fn purge_session_in(root: &Path, session_id: &str) {
+    let _ = std::fs::remove_dir_all(session_dir(root, session_id));
+}
+
 /// Convenience wrapper using the boot-initialized root. Sites that already
 /// hold `data_dir` should prefer [`maybe_spill_in`] to stay testable.
 pub fn maybe_spill(session_id: &str, tool_name: &str, result: &str, max_chars: usize) -> String {
     match spill_root() {
         Some(root) => maybe_spill_in(root, session_id, tool_name, result, max_chars),
         None => result.to_string(),
+    }
+}
+
+/// Boot-root variant of [`purge_session_in`]; no-op before init_root.
+pub fn purge_session(session_id: &str) {
+    if let Some(root) = spill_root() {
+        purge_session_in(root, session_id);
     }
 }
 
@@ -222,6 +236,19 @@ mod tests {
         std::fs::write(&root, "not a dir").unwrap();
         let s = big(30_000);
         assert_eq!(maybe_spill_in(&root, "sid", "run_command", &s, 24_000), s);
+    }
+
+    #[test]
+    fn purge_session_removes_directory() {
+        let root = temp_root("purge");
+        let out = maybe_spill_in(&root, "sess-purge", "web_fetch", &big(100_000), 1000);
+        assert!(out.contains(MARKER_PREFIX), "must spill to trigger file creation");
+        let dir = session_dir(&root, "sess-purge");
+        assert!(dir.exists());
+        purge_session_in(&root, "sess-purge");
+        assert!(!dir.exists(), "spill dir must die with the session");
+        // 再清一次必须是无害 no-op
+        purge_session_in(&root, "sess-purge");
     }
 
     #[test]

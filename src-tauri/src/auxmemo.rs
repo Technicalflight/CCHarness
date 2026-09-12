@@ -332,20 +332,50 @@ pub struct LedgerRow {
     pub saved_usd: Option<f64>,
 }
 
+const LEDGER_MAX_ROWS: usize = 4000;
+
 static LEDGER_LOCK: Mutex<()> = Mutex::new(());
+static LEDGER_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn ledger_path(data_dir: &Path) -> PathBuf {
     data_dir.join("aux-ledger.jsonl")
 }
 
+/// 台账无限追加会随时间撑大数据目录，stats() 又要整读文件 —— 超过
+/// 行数上限时原子重写、保留最新的 rows（每 200 次写入检查一次，误差
+/// 有界）。行下限约 120 字节，64B/行的估算门只做廉价的读前过滤。
+fn trim_ledger(path: &Path) {
+    let Ok(md) = fs::metadata(path) else { return };
+    if md.len() < (LEDGER_MAX_ROWS as u64) * 64 {
+        return;
+    }
+    let Ok(content) = fs::read_to_string(path) else { return };
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() <= LEDGER_MAX_ROWS {
+        return;
+    }
+    let body = lines[lines.len() - LEDGER_MAX_ROWS..].join("
+");
+    let tmp = path.with_extension("jsonl.tmp");
+    if fs::write(&tmp, body + "
+").is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
 fn ledger_append(data_dir: &Path, row: &LedgerRow) {
     let _guard = LEDGER_LOCK.lock().unwrap();
-    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(ledger_path(data_dir)) else {
+    let path = ledger_path(data_dir);
+    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
     if let Ok(line) = serde_json::to_string(row) {
         use std::io::Write;
         let _ = writeln!(f, "{line}");
+    }
+    let n = LEDGER_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n % 200 == 0 {
+        trim_ledger(&path);
     }
 }
 
@@ -586,6 +616,25 @@ mod tests {
         l1_clear();
         assert!(get(&d, &key, "global").is_none());
         assert!(!path.exists(), "corrupt entry must be removed");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ledger_is_trimmed_to_row_cap() {
+        l1_clear();
+        let d = tmpdir("trim");
+        for _ in 0..(LEDGER_MAX_ROWS + 300) {
+            record_miss(&d, "title", "m", Some(1), Some(1), None);
+        }
+        let s = stats(&d);
+        assert_eq!(s.kinds.len(), 1);
+        // 每 200 次写入触发一次裁剪：最终行数落在 [MAX_ROWS, MAX_ROWS+200)
+        let calls = s.kinds[0].calls;
+        assert!(
+            calls >= LEDGER_MAX_ROWS as u64 && calls < (LEDGER_MAX_ROWS + 250) as u64,
+            "ledger must stay bounded, got {calls}"
+        );
+        assert_eq!(s.recent.len(), 50, "recent view stays capped");
         let _ = fs::remove_dir_all(&d);
     }
 }

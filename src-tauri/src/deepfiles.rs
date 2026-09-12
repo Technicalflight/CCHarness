@@ -57,7 +57,38 @@ impl FileIndex {
             .or_default()
             .insert(hash.to_string(), entry);
     }
+
+    /// 过期驱逐 + 单 provider 容量上限（新者保留）。返回是否有变化，
+    /// 调用方据此决定是否回盘。此前索引只增不减，长期使用会无限膨胀。
+    pub fn evict(&mut self, now_ms: u64) -> bool {
+        let mut changed = false;
+        for entries in self.map.values_mut() {
+            let before = entries.len();
+            entries.retain(|_, e| now_ms.saturating_sub(e.created_at) <= ENTRY_MAX_AGE_MS);
+            if entries.len() != before {
+                changed = true;
+            }
+            if entries.len() > MAX_PER_PROVIDER {
+                let mut by_age: Vec<(u64, String)> = entries
+                    .iter()
+                    .map(|(h, e)| (e.created_at, h.clone()))
+                    .collect();
+                by_age.sort_by_key(|(ts, _)| *ts); // oldest first
+                for (_, h) in by_age.into_iter().take(entries.len() - MAX_PER_PROVIDER) {
+                    entries.remove(&h);
+                    changed = true;
+                }
+            }
+        }
+        self.map.retain(|_, e| !e.is_empty());
+        changed
+    }
 }
+
+/// 驱逐策略：条目过期（provider 侧文件随时可能被回收，过期 id 只会让
+/// wire 请求退化失败）或单 provider 条目数超限时，丢弃最旧的。
+const ENTRY_MAX_AGE_MS: u64 = 30 * 24 * 3600 * 1000;
+const MAX_PER_PROVIDER: usize = 512;
 
 /// Content hash of one image payload (16 hex chars — file-name grade).
 pub fn image_hash(b64: &str) -> String {
@@ -76,7 +107,7 @@ pub async fn ensure_file_refs(
     messages: &mut [crate::prefix::ChatMessage],
 ) {
     let mut index = FileIndex::load(data_dir);
-    let mut dirty = false;
+    let mut dirty = index.evict(crate::sessions::now_ms());
     for msg in messages.iter_mut() {
         for img in msg.images.iter_mut() {
             if img.file_ref.is_some() {
@@ -189,6 +220,40 @@ mod tests {
         assert_eq!(image_hash("abc"), image_hash("abc"));
         assert_ne!(image_hash("abc"), image_hash("abd"));
         assert_eq!(image_hash("abc").len(), 16);
+    }
+
+    #[test]
+    fn evict_drops_stale_and_caps_per_provider() {
+        let mut idx = FileIndex::default();
+        let now = 1_000_000_000_000u64;
+        idx.insert(
+            "p1",
+            "old",
+            FileEntry { file_id: "a".into(), created_at: now - ENTRY_MAX_AGE_MS - 1 },
+        );
+        idx.insert("p1", "fresh", FileEntry { file_id: "b".into(), created_at: now });
+        for i in 0..(MAX_PER_PROVIDER + 5) {
+            idx.insert(
+                "p2",
+                &format!("h{i}"),
+                FileEntry { file_id: format!("f{i}"), created_at: now - i as u64 },
+            );
+        }
+        assert!(idx.evict(now));
+        assert!(idx.lookup("p1", "old").is_none(), "过期条目必须被驱逐");
+        assert!(idx.lookup("p1", "fresh").is_some());
+        assert_eq!(idx.map["p2"].len(), MAX_PER_PROVIDER);
+        assert!(idx.lookup("p2", "h0").is_some(), "最新条目保留");
+        assert!(idx.lookup("p2", "h516").is_none(), "最旧条目丢弃");
+        assert!(idx.lookup("p2", "h511").is_some());
+    }
+
+    #[test]
+    fn evict_noop_reports_unchanged() {
+        let mut idx = FileIndex::default();
+        let now = 1_000_000_000_000u64;
+        idx.insert("p", "h", FileEntry { file_id: "f".into(), created_at: now });
+        assert!(!idx.evict(now));
     }
 
     #[test]
