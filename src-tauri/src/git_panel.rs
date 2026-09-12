@@ -224,7 +224,12 @@ pub fn git_file_diff(workspace: String, path: String) -> Result<String, String> 
     let root = Path::new(&workspace);
     let st = crate::worktree::git(root, &["status", "--porcelain", "-uall", "--", &path])?;
     if st.lines().any(|l| l.starts_with("??")) {
-        let content = std::fs::read_to_string(root.join(&path))
+        // path arrives from the webview unvalidated: Path::join replaces the
+        // whole root on an absolute component, and .. walks out — same
+        // validation as every agent tool (lexical + canonical containment)
+        let full = crate::agent_tools::resolve_in_workspace(&workspace, &path)
+            .map_err(|e| format!("非法文件路径: {e}"))?;
+        let content = std::fs::read_to_string(&full)
             .map_err(|e| format!("读取新文件失败: {e}"))?;
         let mut out = format!("--- /dev/null\n+++ b/{path}\n@@ 新文件 @@\n");
         for line in content.lines() {

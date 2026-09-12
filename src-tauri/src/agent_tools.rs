@@ -209,6 +209,41 @@ fn cmd_norm(cmd: &str) -> String {
     stripped.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
+/// Every program a command line may end up executing: the outer program
+/// plus the inner programs of shell wrappers (cmd /c, pwsh -command,
+/// bash -c, wsl ...), recursively. Policy lists (deny/ask/allow) must see
+/// them all — matching only the first token let `cmd /c wsl ...` hide
+/// behind an allow entry for `cmd` and bypass the deny list and the
+/// built-in blocklist entirely.
+fn command_programs(cmd: &str) -> Vec<String> {
+    const WRAPPERS: &[&str] = &["cmd", "powershell", "pwsh", "bash", "sh", "zsh", "wsl"];
+    let mut out = vec![program_name(cmd)];
+    let norm = cmd_norm(cmd);
+    let toks: Vec<&str> = norm.split_whitespace().collect();
+    let is_wrapper = |t: &str| WRAPPERS.contains(&t.strip_suffix(".exe").unwrap_or(t));
+    let mut in_wrapper = if toks.first().is_some_and(|t| is_wrapper(t)) { 1 } else { 0 };
+    for raw in toks.iter().skip(1) {
+        let t = raw.strip_suffix(".exe").unwrap_or(raw);
+        let flag = t.starts_with('/') || t.starts_with('-');
+        let t = if flag { t } else { t.rsplit(['/', '\\']).next().unwrap_or(t) };
+        if in_wrapper > 0 {
+            if flag {
+                continue; // /c, -command, -d ... — the wrapped program comes next
+            }
+            out.push(t.to_string());
+            in_wrapper -= 1;
+            if is_wrapper(t) && in_wrapper < 4 {
+                in_wrapper += 1; // nested wrapper: cmd /c pwsh -c ...
+            }
+        } else if is_wrapper(t) && in_wrapper < 4 {
+            in_wrapper += 1; // wrapper appearing mid-command
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// the first segment — document this in the settings dialog.
 fn program_name(cmd: &str) -> String {
     let s = cmd.trim();
@@ -327,17 +362,20 @@ pub fn sandbox_check(name: &str, args: &Value) -> SandboxVerdict {
     // ---- 命令策略 ----
     if p.commands && name == "run_command" {
         let cmd = str_arg(args, "command");
-        let prog = program_name(&cmd);
-        if p.cmd_deny.iter().any(|d| d.trim().to_lowercase() == prog) {
+        let programs = command_programs(&cmd);
+        let listed = |list: &[String], pr: &str| list.iter().any(|d| d.trim().to_lowercase() == pr);
+        if let Some(pr) = programs.iter().find(|pr| listed(&p.cmd_deny, pr)) {
             return SandboxVerdict::Block(format!(
-                "沙箱模式已拦截：程序「{prog}」在命令禁止名单中（命令策略）。"
+                "沙箱模式已拦截：程序「{pr}」在命令禁止名单中（命令策略）。"
             ));
         }
-        if p.cmd_ask.iter().any(|d| d.trim().to_lowercase() == prog) {
+        if programs.iter().any(|pr| listed(&p.cmd_ask, pr)) {
             return SandboxVerdict::ForceAsk;
         }
-        if p.cmd_allow.iter().any(|d| d.trim().to_lowercase() == prog) {
-            // 显式允许名单：用户自担风险的放行，跳过内置高危黑名单
+        if !programs.is_empty() && programs.iter().all(|pr| listed(&p.cmd_allow, pr)) {
+            // 显式允许名单：用户自担风险的放行，跳过内置高危黑名单。
+            // 只有当全部将执行的程序（含 cmd /c 等包装的内层）都在允许
+            // 名单里才生效 —— 单放行外层不再为内层程序开绿灯。
             return SandboxVerdict::Allow;
         }
         if let Some(hit) = SANDBOX_CMD_BLOCKLIST
@@ -1402,66 +1440,81 @@ fn web_fetch(url: &str) -> Result<String, String> {
     // dedicated thread: blocking client would otherwise run on a tokio worker
     let url_owned = url.to_string();
     let handle = std::thread::spawn(move || -> Result<(String, String), String> {
-        // resolve-then-pin (P2 SSRF hardening): the lexical host check loses
-        // to DNS rebinding — a name can answer public at check time and
-        // loopback at connect time. Resolve here, vet EVERY answer, and pin
-        // the connection to the first vetted address so reqwest cannot
-        // re-resolve around us. Redirect hops keep the host-string check
-        // below (per-hop pinning is not expressible in reqwest's API).
+        // per-hop resolve-then-pin: for the initial URL AND every redirect
+        // hop, resolve the host, vet EVERY answer against the private-net
+        // policy, and pin the connection to the first vetted address — so
+        // neither DNS rebinding nor a redirect bounce can land on an
+        // address we never vetted (string-only hop checks lose to a name
+        // that resolves loopback, incl. ::ffff:-mapped answers).
         use std::net::ToSocketAddrs;
-        let parsed = reqwest::Url::parse(&url_owned).map_err(|e| format!("URL 无效: {e}"))?;
-        let host = parsed
-            .host_str()
-            .ok_or("URL 缺少主机名")?
-            .trim_matches(['[', ']'])
-            .to_string();
-        let port = parsed.port_or_known_default().unwrap_or(80);
-        let mut pinned: Option<std::net::SocketAddr> = None;
-        for sa in (host.as_str(), port)
-            .to_socket_addrs()
-            .map_err(|e| format!("DNS 解析失败: {e}"))?
-        {
-            if crate::urlguard::is_loopback_or_private(&sa.ip().to_string()) {
-                return Err(format!("解析结果 {} 位于本机/内网，请求已拒绝", sa.ip()));
+        const MAX_HOPS: usize = 5;
+        let mut current = reqwest::Url::parse(&url_owned).map_err(|e| format!("URL 无效: {e}"))?;
+        for hop in 0..=MAX_HOPS {
+            let host = current
+                .host_str()
+                .ok_or("URL 缺少主机名")?
+                .trim_matches(['[', ']'])
+                .to_string();
+            if crate::urlguard::is_loopback_or_private(&host) {
+                return Err(format!("目标 {host} 位于本机/内网，请求已拒绝"));
             }
-            if pinned.is_none() {
-                pinned = Some(sa);
+            let port = current.port_or_known_default().unwrap_or(80);
+            let mut pinned: Option<std::net::SocketAddr> = None;
+            for sa in (host.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|e| format!("DNS 解析失败: {e}"))?
+            {
+                if crate::urlguard::is_loopback_or_private(&sa.ip().to_string()) {
+                    return Err(format!("解析结果 {} 位于本机/内网，请求已拒绝", sa.ip()));
+                }
+                if pinned.is_none() {
+                    pinned = Some(sa);
+                }
             }
-        }
-        let pinned = pinned.ok_or_else(|| "DNS 解析未返回地址".to_string())?;
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
-            .resolve(&host, pinned)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() > 5 {
-                    return attempt.error("重定向过多");
+            let pinned = pinned.ok_or_else(|| "DNS 解析未返回地址".to_string())?;
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
+                .resolve(&host, pinned)
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent("CCHarness/0.1 (agent web_fetch)")
+                .build()
+                .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
+            let resp = client
+                .get(current.clone())
+                .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
+                .send()
+                .map_err(|e| format!("请求失败: {e}"))?;
+            if resp.status().is_redirection() {
+                let loc = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or("重定向缺少 Location 头")?
+                    .to_string();
+                if hop == MAX_HOPS {
+                    return Err("重定向过多".to_string());
                 }
-                let host = attempt.url().host_str().unwrap_or("");
-                if crate::urlguard::is_loopback_or_private(host) {
-                    return attempt.error("重定向目标位于本机/内网，已拒绝");
+                let next = current.join(&loc).map_err(|e| format!("非法重定向目标: {e}"))?;
+                if next.scheme() != "http" && next.scheme() != "https" {
+                    return Err(format!("重定向协议不被支持: {}", next.scheme()));
                 }
-                attempt.follow()
-            }))
-            .user_agent("CCHarness/0.1 (agent web_fetch)")
-            .build()
-            .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
-        let resp = client
-            .get(&url_owned)
-            .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
-            .send()
-            .map_err(|e| format!("请求失败: {e}"))?;
-        let status = resp.status();
-        let ctype = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let bytes = resp.bytes().map_err(|e| format!("读取响应失败: {e}"))?;
-        if bytes.len() > MAX_BODY_BYTES {
-            return Err(format!("响应超过 {MAX_BODY_BYTES} 字节上限"));
+                current = next;
+                continue;
+            }
+            let status = resp.status();
+            let ctype = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let bytes = resp.bytes().map_err(|e| format!("读取响应失败: {e}"))?;
+            if bytes.len() > MAX_BODY_BYTES {
+                return Err(format!("响应超过 {MAX_BODY_BYTES} 字节上限"));
+            }
+            return Ok((format!("{status} {ctype}"), String::from_utf8_lossy(&bytes).to_string()));
         }
-        Ok((format!("{status} {ctype}"), String::from_utf8_lossy(&bytes).to_string()))
+        unreachable!("redirect hops are bounded")
     });
     let (meta, body) = handle.join().map_err(|_| "抓取线程崩溃".to_string())??;
 
@@ -1752,10 +1805,41 @@ fn glob_files(workspace: &str, pattern: &str) -> Result<String, String> {
     if pattern.trim().is_empty() {
         return Err("pattern 不能为空".into());
     }
+    // the pattern is model-supplied and concatenated onto the workspace
+    // root: a `..` component or an absolute / drive prefix would walk the
+    // glob outside the workspace and list foreign file names
+    let raw = pattern.trim();
+    if raw.starts_with('/') || raw.starts_with('\\') || raw.contains('\0') {
+        return Err("pattern 必须是相对工作区的路径".into());
+    }
+    let pat = raw.trim_start_matches(['/', '\\']);
+    if pat.split(['/', '\\']).any(|c| c == "..") {
+        return Err("pattern 不允许包含 .. 路径组件".into());
+    }
+    if Path::new(pat).is_absolute() {
+        return Err("pattern 必须是相对工作区的路径".into());
+    }
+    #[cfg(windows)]
+    if pat.as_bytes().len() >= 2
+        && pat.as_bytes()[1] == b':'
+        && pat.as_bytes()[0].is_ascii_alphabetic()
+    {
+        return Err("pattern 必须是相对工作区的路径（不允许盘符前缀）".into());
+    }
     let base = workspace.trim_end_matches(['/', '\\']);
-    let full = format!("{base}/{pattern}");
+    let full = format!("{base}/{pat}");
+    // belt-and-braces: keep only entries that really resolve inside the
+    // workspace (a symlinked directory inside it could still redirect the
+    // glob walk); unresolvable entries are skipped, not surfaced
+    let ws_canon = fs::canonicalize(workspace).ok();
     let mut out: Vec<String> = Vec::new();
     for entry in glob::glob(&full).map_err(|e| format!("非法 glob 模式: {e}"))?.flatten() {
+        if let Some(ws_canon) = &ws_canon {
+            match entry.canonicalize() {
+                Ok(real) if real.starts_with(ws_canon) => {}
+                _ => continue,
+            }
+        }
         let shown = entry
             .strip_prefix(workspace)
             .unwrap_or(&entry)
@@ -2388,6 +2472,43 @@ mod sandbox_tests {
             sandbox_check("web_fetch", &json!({ "url": "https://xn--pple-43d.com/x" })),
             SandboxVerdict::Allow
         );
+    }
+
+    #[test]
+    fn command_programs_sees_wrappers() {
+        assert_eq!(command_programs("git status"), vec!["git"]);
+        assert_eq!(command_programs("cmd /c schtasks /run /tn x"), vec!["cmd", "schtasks"]);
+        assert_eq!(
+            command_programs("cmd /c powershell -c schtasks"),
+            vec!["cmd", "powershell", "schtasks"]
+        );
+        assert_eq!(command_programs("bash -c \"rm -rf /\""), vec!["bash", "rm"]);
+        // 输出经 sort+dedup，断言须用字典序
+        let mut pwsh = vec!["powershell", "get-process"];
+        pwsh.sort();
+        assert_eq!(command_programs("powershell.exe -command get-process"), pwsh);
+        let mut wsl = vec!["rm", "wsl"];
+        wsl.sort();
+        assert_eq!(command_programs("wsl rm -rf /"), wsl);
+        // quoted outer path still resolves via program_name
+        assert_eq!(
+            command_programs(r#""C:\Program Files\Docker\docker.exe" ps"#),
+            vec!["docker"]
+        );
+    }
+
+    #[test]
+    fn glob_pattern_cannot_escape() {
+        let ws = std::env::temp_dir().join(format!("cch_glob_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a.txt"), "x").unwrap();
+        assert!(glob_files(ws.to_str().unwrap(), "../../*").is_err());
+        assert!(glob_files(ws.to_str().unwrap(), "a/../../b*").is_err());
+        assert!(glob_files(ws.to_str().unwrap(), "/etc/*").is_err());
+        let ok = glob_files(ws.to_str().unwrap(), "*.txt").unwrap();
+        assert!(ok.contains("a.txt"), "{ok}");
+        let _ = fs::remove_dir_all(&ws);
     }
 
     #[test]

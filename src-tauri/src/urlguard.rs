@@ -28,6 +28,12 @@ fn classify_ip(ip: &IpAddr) -> bool {
                 || o[0] == 255
         }
         IpAddr::V6(v6) => {
+            // IPv4-mapped IPv6 (::ffff:0:0/96) must be judged by its
+            // embedded IPv4 address — ::ffff:127.0.0.1 is loopback and
+            // ::ffff:10.0.0.1 is private, not public IPv6
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return classify_ip(&IpAddr::V4(v4));
+            }
             let seg = v6.segments();
             // loopback, link-local fe80::/10, unique-local fc00::/7
             v6.is_loopback() || (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xfe00) == 0xfc00
@@ -106,5 +112,17 @@ mod tests {
     #[test]
     fn refuses_bad_scheme() {
         assert!(matches!(check_base_url("file:///etc/passwd", false), UrlCheck::Refused(_)));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_classifies_as_v4() {
+        assert!(is_loopback_or_private("::ffff:127.0.0.1"));
+        assert!(is_loopback_or_private("::ffff:192.168.1.5"));
+        assert!(is_loopback_or_private("::ffff:10.0.0.7"));
+        assert!(is_loopback_or_private("::ffff:169.254.1.9"));
+        assert!(!is_loopback_or_private("::ffff:8.8.8.8"));
+        assert!(!is_loopback_or_private("::1") == false); // v6 loopback itself
+        // a real public v6 stays public
+        assert!(!is_loopback_or_private("2606:4700::1111"));
     }
 }
