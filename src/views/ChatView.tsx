@@ -1469,13 +1469,31 @@ export function ChatView() {
       >
         <div className="chat-scroll">
           {items.map((item, i) => {
+            // firstTs per kind: a notice entry has no group/user payload and
+            // is display-only, so it must never participate in the compaction
+            // boundary scan (reading group[0] on it crashed the whole view).
             const firstTs =
-              item.kind === "user" ? item.user!.ts : (item.group![0]?.ts ?? Number.MAX_SAFE_INTEGER);
-            const showCompact = compaction != null && firstTs >= compaction.upto_ts && (i === 0 || (() => {
-              const prev = items[i - 1];
-              const prevTs = prev.kind === "user" ? prev.user!.ts : (prev.group![0]?.ts ?? 0);
-              return prevTs < compaction.upto_ts;
-            })());
+              item.kind === "user"
+                ? item.user!.ts
+                : item.kind === "assistantGroup"
+                  ? (item.group![0]?.ts ?? Number.MAX_SAFE_INTEGER)
+                  : Number.MAX_SAFE_INTEGER;
+            // the boundary's previous-item scan skips notice entries — they
+            // are invisible to the model context, so the compact divider
+            // lands on the next substantive item after them
+            const prevTs = (() => {
+              for (let j = i - 1; j >= 0; j--) {
+                const prev = items[j];
+                if (prev.kind === "notice") continue;
+                return prev.kind === "user"
+                  ? prev.user!.ts
+                  : (prev.group![0]?.ts ?? Number.MAX_SAFE_INTEGER);
+              }
+              return Number.MAX_SAFE_INTEGER;
+            })();
+            const showCompact =
+              compaction != null && firstTs >= compaction.upto_ts &&
+              (i === 0 || prevTs < compaction.upto_ts);
             if (item.kind === "notice") {
               const n = item.notice!;
               return (
