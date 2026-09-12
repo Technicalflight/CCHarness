@@ -491,9 +491,14 @@ pub fn privacy_log_clear(state: State<'_, AppState>) -> Result<(), String> {
 ///   - app_type "claude": settings_config.env.ANTHROPIC_BASE_URL / _AUTH_TOKEN
 ///     → anthropic provider
 ///   - app_type "codex":  settings_config.auth.OPENAI_API_KEY + TOML config
-///     text (model = "...", base_url = "...") → openai_compatible provider
-/// Skips entries without a key and anything whose (base_url, api_key) pair
-/// already exists in the config. Appends the rest and returns what was added.
+///     text → openai provider; the TOML's `wire_api` picks the protocol
+///     kind ("responses" → openai_responses, "chat"/absent →
+///     openai_compatible) — the two endpoints reject each other's calls,
+///     so a wrong kind makes every imported key LOOK broken
+/// Skips entries without a key. A (base_url, api_key) pair that already
+/// exists keeps its stored entry — unless the parsed protocol kind
+/// differs, in which case the stored kind is healed in place (re-import
+/// repairs entries imported by older builds). Returns what was added.
 #[tauri::command]
 pub fn ccswitch_import(state: State<'_, AppState>) -> Result<Vec<Provider>, String> {
     let db_path = home_dir()
@@ -552,26 +557,8 @@ pub fn ccswitch_import(state: State<'_, AppState>) -> Result<Vec<Provider>, Stri
             (crate::config::ProviderKind::Anthropic, url, key, Vec::new())
         } else {
             // codex-style: {"auth": {"OPENAI_API_KEY": ...}, "config": "<toml>"}
-            let key = cfg
-                .pointer("/auth/OPENAI_API_KEY")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let toml_text = cfg.get("config").and_then(|v| v.as_str()).unwrap_or("");
-            let mut model = String::new();
-            let mut url = String::new();
-            for line in toml_text.lines() {
-                let line = line.trim();
-                if model.is_empty() && line.starts_with("model =") {
-                    model = unquote_toml_value(line.trim_start_matches("model ="));
-                } else if url.is_empty() && line.starts_with("base_url =") {
-                    url = unquote_toml_value(line.trim_start_matches("base_url ="));
-                }
-            }
-            let url = url.trim_end_matches('/').to_string();
-            let models = if model.is_empty() { Vec::new() } else { vec![model] };
-            (crate::config::ProviderKind::OpenaiCompatible, url, key, models)
+            let (kind, base_url, key, models) = parse_codex_entry(&cfg);
+            (kind, base_url, key, models)
         };
 
         if api_key.is_empty() {
@@ -583,13 +570,27 @@ pub fn ccswitch_import(state: State<'_, AppState>) -> Result<Vec<Provider>, Stri
         } else {
             base_url
         };
-        // dedupe against existing providers and this batch
-        let dup = config
-            .providers
+        // dedupe against existing providers and this batch. If the same
+        // (key, endpoint) pair already exists under a different protocol
+        // kind (imported before wire_api support), heal the kind in place
+        // instead of silently skipping — re-import then repairs old data.
+        let mut healed = false;
+        for p in config.providers.iter_mut() {
+            if p.api_key == api_key && p.base_url == base_url {
+                if p.kind != kind {
+                    p.kind = kind.clone();
+                    healed = true;
+                }
+                break;
+            }
+        }
+        if healed {
+            continue;
+        }
+        if imported
             .iter()
-            .chain(imported.iter())
-            .any(|p| p.api_key == api_key && p.base_url == base_url);
-        if dup {
+            .any(|p| p.api_key == api_key && p.base_url == base_url)
+        {
             continue;
         }
 
@@ -637,6 +638,43 @@ fn unquote_toml_value(raw: &str) -> String {
         .trim()
         .trim_matches('"')
         .to_string()
+}
+
+/// Parse a cc-switch codex entry: `{"auth": {"OPENAI_API_KEY": ...},
+/// "config": "<toml text>"}`. The TOML carries the endpoint, the model and
+/// — critically — `wire_api`, which decides the protocol kind: Responses
+/// endpoints reject chat-completions calls and vice versa, so mapping a
+/// "responses" provider to openai_compatible makes every request fail
+/// while the key itself is perfectly fine.
+fn parse_codex_entry(cfg: &Value) -> (crate::config::ProviderKind, String, String, Vec<String>) {
+    let key = cfg
+        .pointer("/auth/OPENAI_API_KEY")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let toml_text = cfg.get("config").and_then(|v| v.as_str()).unwrap_or("");
+    let mut model = String::new();
+    let mut url = String::new();
+    let mut wire = String::new();
+    for line in toml_text.lines() {
+        let line = line.trim();
+        if model.is_empty() && line.starts_with("model =") {
+            model = unquote_toml_value(line.trim_start_matches("model ="));
+        } else if url.is_empty() && line.starts_with("base_url =") {
+            url = unquote_toml_value(line.trim_start_matches("base_url ="));
+        } else if wire.is_empty() && line.starts_with("wire_api =") {
+            wire = unquote_toml_value(line.trim_start_matches("wire_api ="));
+        }
+    }
+    let url = url.trim_end_matches('/').to_string();
+    let models = if model.is_empty() { Vec::new() } else { vec![model] };
+    let kind = if wire.eq_ignore_ascii_case("responses") {
+        crate::config::ProviderKind::OpenaiResponses
+    } else {
+        crate::config::ProviderKind::OpenaiCompatible
+    };
+    (kind, url, key, models)
 }
 
 fn home_dir() -> std::path::PathBuf {
@@ -1790,3 +1828,51 @@ pub fn get_aux_stats(state: State<'_, AppState>) -> crate::auxmemo::AuxStats {
     crate::auxmemo::stats(&state.data_dir)
 }
 
+
+#[cfg(test)]
+mod ccswitch_tests {
+    use super::*;
+
+    #[test]
+    fn codex_responses_wire_maps_to_responses_kind() {
+        let cfg = serde_json::json!({
+            "auth": {"OPENAI_API_KEY": "sk-test"},
+            "config": "model_provider = \"custom\"\nmodel = \"grok-4.6\"\n\n[model_providers.custom]\nname = \"My Codex\"\nbase_url = \"https://ai.xmiaom.com/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\n"
+        });
+        let (kind, url, key, models) = parse_codex_entry(&cfg);
+        assert_eq!(kind, crate::config::ProviderKind::OpenaiResponses);
+        assert_eq!(url, "https://ai.xmiaom.com/v1");
+        assert_eq!(key, "sk-test");
+        assert_eq!(models, vec!["grok-4.6".to_string()]);
+    }
+
+    #[test]
+    fn codex_chat_wire_and_missing_wire_stay_compatible() {
+        let chat = serde_json::json!({
+            "auth": {"OPENAI_API_KEY": "sk-a"},
+            "config": "[model_providers.custom]\nbase_url = \"https://x/v1\"\nwire_api = \"chat\"\n"
+        });
+        let (kind, url, _, _) = parse_codex_entry(&chat);
+        assert_eq!(kind, crate::config::ProviderKind::OpenaiCompatible);
+        assert_eq!(url, "https://x/v1");
+        let none = serde_json::json!({
+            "auth": {"OPENAI_API_KEY": "sk-b"},
+            "config": "model = \"m\"\n"
+        });
+        let (kind, url, _, models) = parse_codex_entry(&none);
+        assert_eq!(kind, crate::config::ProviderKind::OpenaiCompatible);
+        assert_eq!(url, "");
+        assert_eq!(models, vec!["m".to_string()]);
+    }
+
+    #[test]
+    fn model_lines_do_not_shadow_the_model_key() {
+        // model_provider / model_reasoning_effort must not be picked up as `model =`
+        let cfg = serde_json::json!({
+            "auth": {"OPENAI_API_KEY": "sk-c"},
+            "config": "model_provider = \"custom\"\nmodel_reasoning_effort = \"high\"\nmodel = \"glm-5.3\"\n"
+        });
+        let (_, _, _, models) = parse_codex_entry(&cfg);
+        assert_eq!(models, vec!["glm-5.3".to_string()]);
+    }
+}
