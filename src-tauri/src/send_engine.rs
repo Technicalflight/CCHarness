@@ -1295,13 +1295,18 @@ async fn run_send(
             // not the chat pipeline — no prefix state, no tools, no telemetry
             // ledger entry (the image API has no chat usage to record) ----
             if image_mode {
-                let prompt = sf_snapshot
+                let mut prompt = sf_snapshot
                     .messages
                     .iter()
                     .rev()
                     .find(|m| m.role == "user")
                     .map(|m| m.content.clone())
                     .unwrap_or_default();
+                // records keep the RESTORED text (privacy.rs discipline) —
+                // the raw prompt must never ride upstream un-scrubbed
+                if privacy_on {
+                    prompt = crate::privacy::outbound(&session_id, &pseed, &prompt);
+                }
                 let message_id = Uuid::new_v4().to_string();
                 let ctx = SendCtx {
                     client: &client,
@@ -1370,7 +1375,7 @@ async fn run_send(
                 let lp = map
                     .entry(key)
                     .or_insert_with(|| LanePrefix::new(&system_full, &cache_key));
-                lp.bind_model(&model);
+                let model_changed = lp.bind_model(&model);
                 // per-model behavior overrides (temperature / max_tokens /
                 // reasoning) with global-thinking fallback, all epoch-gated
                 let beh = provider.behavior.get(&model);
@@ -1401,7 +1406,13 @@ async fn run_send(
                 let in_history_ok = cfg.settings.system_update_mode == "in-history"
                     && provider.kind == crate::config::ProviderKind::OpenaiCompatible
                     && !privacy_on;
+                // a model switch already invalidates the whole cache (epoch
+                // bump in bind_model); rebuilding Zone H too re-serializes
+                // from the persisted transcript, so wire-shape decisions
+                // baked into old fragments (Files-API file_ids uploaded to
+                // the previous provider) can't leak to the new endpoint
                 let needs_rebuild = privacy_changed
+                    || model_changed
                     || lp_is_empty(lp)
                     || (system_changed && !in_history_ok);
                 // adopt only when NOT rebuilding: a fresh/rebuilt prefix
@@ -1569,6 +1580,15 @@ async fn run_send(
                                     "\n\n[长期记忆参考 — 与本条消息语义相关的既往记忆]\n{}",
                                     mems.iter().map(|m| format!("- {m}")).collect::<Vec<_>>().join("\n")
                                 );
+                                // the memory store keeps raw values while the
+                                // outbound wire runs on surrogates — appending
+                                // the block un-scrubbed would leak them past
+                                // the privacy-mode promise
+                                let block = if privacy_on {
+                                    crate::privacy::outbound(&session_id, &pseed, &block)
+                                } else {
+                                    block
+                                };
                                 if let Some(user_msg) = sent_this_turn.iter_mut().find(|m| m.role == "user") {
                                     user_msg.content.push_str(&block);
                                 }

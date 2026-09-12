@@ -245,14 +245,20 @@ impl LanePrefix {
 
     /// Rebind to a model. A model change rebuilds Zone H (re-serializing the
     /// same transcript) and bumps the epoch — an expected, logged rebuild.
-    pub fn bind_model(&mut self, model: &str) {
+    /// Returns true when the model actually changed: the caller must rebuild
+    /// Zone H, because wire-shape decisions baked into the old fragments
+    /// (e.g. Files-API `file_id` parts uploaded to the previous provider's
+    /// endpoint) are invalid for the new one.
+    pub fn bind_model(&mut self, model: &str) -> bool {
         if self.model.as_deref() == Some(model) {
-            return;
+            return false;
         }
-        if self.model.is_some() {
+        let changed = self.model.is_some();
+        if changed {
             self.epoch += 1;
         }
         self.model = Some(model.to_string());
+        changed
     }
 
     /// Append one message's bytes to Zone H. Called *after* a turn completes
@@ -325,6 +331,13 @@ impl LanePrefix {
     /// epoch discipline in one place.
     pub fn thinking_level(&self) -> Option<&str> {
         self.thinking.as_deref()
+    }
+
+    /// Stable cache-routing key — the warmer rides it as the affinity header
+    /// so replica-routed gateways keep the probe on the same shard the next
+    /// real request will hit.
+    pub fn cache_key(&self) -> &str {
+        &self.cache_key
     }
 
     /// Rebind per-model sampling parameters (temperature / output cap).

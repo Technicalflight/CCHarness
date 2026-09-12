@@ -123,6 +123,9 @@ async fn fire(
     let mut req = client
         .post(crate::chat::endpoint_chat(provider))
         .header("content-type", "application/json")
+        // same affinity header the real requests send — a replica-routed
+        // gateway would otherwise warm a shard the next turn never hits
+        .header("x-session-affinity", slot.prefix.cache_key())
         .body(body)
         .timeout(std::time::Duration::from_secs(120));
     for (k, v) in crate::chat::auth_for(provider).headers().iter() {
