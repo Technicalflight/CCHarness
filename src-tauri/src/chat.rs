@@ -163,7 +163,7 @@ pub async fn stream_lane(
         std::collections::HashMap::new();
 
     use futures_util::StreamExt;
-    loop {
+    'read: loop {
         if ctx.stop.load(Ordering::Relaxed) {
             stopped = true;
             break;
@@ -198,43 +198,59 @@ pub async fn stream_lane(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                match ctx.provider.kind {
-                    ProviderKind::OpenaiCompatible => handle_openai_frame(
-                        ctx,
-                        &v,
-                        &mut content,
-                        &mut reasoning,
-                        &mut usage,
-                        &mut cfilter,
-                        &mut tool_accs,
-                        &mut finish_reason,
-                    ),
-                    ProviderKind::OpenaiResponses | ProviderKind::AzureResponses => {
-                        handle_responses_frame(
-                            ctx,
-                            &v,
-                            &mut content,
-                            &mut reasoning,
-                            &mut usage,
-                            &mut cfilter,
-                            &mut tool_accs,
-                            &mut finish_reason,
-                        )
+                if let Some(err) = dispatch_sse_frame(
+                    ctx,
+                    &v,
+                    &mut content,
+                    &mut reasoning,
+                    &mut usage,
+                    &mut cfilter,
+                    &mut tool_accs,
+                    &mut finish_reason,
+                    &mut anthropic_blocks,
+                ) {
+                    // HTTP was 200, but the stream itself reported a fatal
+                    // error. With nothing delivered yet, fail the turn so
+                    // the user sees the real upstream message instead of an
+                    // empty ok record; partial output already on screen
+                    // closes as a stopped turn (same philosophy as a broken
+                    // transport with partial content).
+                    if content.is_empty() && reasoning.is_empty() && tool_accs.is_empty() {
+                        return Err(format!("上游流内错误: {err}"));
                     }
-                    ProviderKind::Anthropic => {
-                        handle_anthropic_frame(
-                            ctx,
-                            &v,
-                            &mut content,
-                            &mut reasoning,
-                            &mut usage,
-                            &mut cfilter,
-                            &mut tool_accs,
-                            &mut finish_reason,
-                            &mut anthropic_blocks,
-                        )
-                    }
+                    stopped = true;
+                    break 'read;
                 }
+            }
+        }
+    }
+
+    // Some gateways close the connection without the trailing blank line —
+    // the final buffered frame (typically the usage block or finish_reason)
+    // must still be parsed, or telemetry silently loses usage for every
+    // such provider
+    {
+        let frame = String::from_utf8_lossy(&buf);
+        for line in frame.lines() {
+            let data = match line.strip_prefix("data:") {
+                Some(d) => d.trim(),
+                None => continue,
+            };
+            if data == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(data) {
+                let _ = dispatch_sse_frame(
+                    ctx,
+                    &v,
+                    &mut content,
+                    &mut reasoning,
+                    &mut usage,
+                    &mut cfilter,
+                    &mut tool_accs,
+                    &mut finish_reason,
+                    &mut anthropic_blocks,
+                );
             }
         }
     }
@@ -435,7 +451,7 @@ fn handle_openai_frame(
     cfilter: &mut crate::confidence::ConfidenceFilter,
     tool_accs: &mut Vec<ToolCallAcc>,
     finish_reason: &mut Option<String>,
-) {
+) -> Option<String> {
     if let Some(u) = v.get("usage") {
         usage.input = u.get("prompt_tokens").and_then(|x| x.as_u64());
         usage.output = u.get("completion_tokens").and_then(|x| x.as_u64());
@@ -458,7 +474,14 @@ fn handle_openai_frame(
     }
     let delta = v.pointer("/choices/0/delta");
     if let Some(d) = delta {
-        if let Some(t) = d.get("reasoning_content").and_then(|x| x.as_str()) {
+        // reasoning streams under `reasoning_content` on most providers;
+        // OpenRouter-style gateways use the bare `reasoning` key — without
+        // the fallback the whole chain of thought silently disappears
+        let rt = d
+            .get("reasoning_content")
+            .and_then(|x| x.as_str())
+            .or_else(|| d.get("reasoning").and_then(|x| x.as_str()));
+        if let Some(t) = rt {
             if !t.is_empty() {
                 reasoning.push_str(t);
                 ctx.emit_reasoning(t);
@@ -502,6 +525,7 @@ fn handle_openai_frame(
             }
         }
     }
+    stream_error_message(v)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -515,7 +539,13 @@ fn handle_anthropic_frame(
     tool_accs: &mut Vec<ToolCallAcc>,
     finish_reason: &mut Option<String>,
     blocks: &mut std::collections::HashMap<u64, usize>,
-) {
+) -> Option<String> {
+    // Anthropic signals mid-stream failures (overloaded_error etc.) as a
+    // 200-level `type:"error"` event — it used to fall into the catch-all
+    // arm and the turn recorded an empty ok reply
+    if v.get("type").and_then(|x| x.as_str()) == Some("error") {
+        return stream_error_message(v);
+    }
     match v.get("type").and_then(|x| x.as_str()) {
         Some("message_start") => {
             if let Some(inp) = v.pointer("/message/usage/input_tokens").and_then(|x| x.as_u64()) {
@@ -572,6 +602,7 @@ fn handle_anthropic_frame(
         }
         _ => {}
     }
+    None
 }
 
 /// content_block_start(type=tool_use)：注册一个调用accumulator，
@@ -630,7 +661,12 @@ fn handle_responses_frame(
     cfilter: &mut crate::confidence::ConfidenceFilter,
     tool_accs: &mut Vec<ToolCallAcc>,
     finish_reason: &mut Option<String>,
-) {
+) -> Option<String> {
+    // response.failed carries the real failure reason in response.error —
+    // folded into the terminal arm before, the message was dropped
+    if v.get("type").and_then(|x| x.as_str()) == Some("response.failed") {
+        return stream_error_message(v);
+    }
     let (text_delta, reasoning_delta) = apply_responses_event(
         v, content, reasoning, usage, cfilter, tool_accs, finish_reason,
     );
@@ -639,6 +675,49 @@ fn handle_responses_frame(
     }
     if !reasoning_delta.is_empty() {
         ctx.emit_reasoning(&reasoning_delta);
+    }
+    None
+}
+
+/// Extract the message from an in-stream error frame. Covers the three wire
+/// shapes this app can receive: Anthropic `{"type":"error","error":{…}}`,
+/// OpenAI-compatible gateways inlining `{"error":{…}}` into a data frame,
+/// and Responses `response.failed` with `response.error`.
+fn stream_error_message(v: &Value) -> Option<String> {
+    let err = v
+        .get("error")
+        .or_else(|| v.pointer("/response/error"))?;
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("上游返回了未说明的错误");
+    Some(msg.to_string())
+}
+
+/// Route one parsed SSE frame to the provider handler. Returns the upstream
+/// error message when the frame is a fatal in-stream error event.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_sse_frame(
+    ctx: &SendCtx<'_>,
+    v: &Value,
+    content: &mut String,
+    reasoning: &mut String,
+    usage: &mut UsageStat,
+    cfilter: &mut crate::confidence::ConfidenceFilter,
+    tool_accs: &mut Vec<ToolCallAcc>,
+    finish_reason: &mut Option<String>,
+    anthropic_blocks: &mut std::collections::HashMap<u64, usize>,
+) -> Option<String> {
+    match ctx.provider.kind {
+        ProviderKind::OpenaiCompatible => {
+            handle_openai_frame(ctx, v, content, reasoning, usage, cfilter, tool_accs, finish_reason)
+        }
+        ProviderKind::OpenaiResponses | ProviderKind::AzureResponses => {
+            handle_responses_frame(ctx, v, content, reasoning, usage, cfilter, tool_accs, finish_reason)
+        }
+        ProviderKind::Anthropic => handle_anthropic_frame(
+            ctx, v, content, reasoning, usage, cfilter, tool_accs, finish_reason, anthropic_blocks,
+        ),
     }
 }
 
