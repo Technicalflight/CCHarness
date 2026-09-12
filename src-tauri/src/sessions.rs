@@ -215,7 +215,7 @@ pub fn now_ms() -> u64 {
 }
 
 /// Sanitize a session id for filesystem use (ids are our uuids anyway).
-fn sanitize_id(id: &str) -> String {
+pub(crate) fn sanitize_id(id: &str) -> String {
     id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect()
 }
 

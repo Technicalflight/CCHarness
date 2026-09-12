@@ -836,10 +836,23 @@ pub fn load(data_dir: &Path) -> AppConfig {
                 cfg
             }
         },
-        Err(_) => {
+        // a genuinely missing file = first launch: write the default config
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let cfg = AppConfig::default();
             save(data_dir, &cfg);
             cfg
+        }
+        // ANY other read error (antivirus / sync tool briefly locking the
+        // file, permission hiccup) must NOT be treated as "no config":
+        // persisting defaults here would destroy every provider + sealed
+        // key the moment the lock clears. Use defaults for this run but
+        // leave the file — and keep a rescue copy alongside it.
+        Err(e) => {
+            eprintln!(
+                "[config] unreadable ({e}); using in-memory defaults WITHOUT touching the file"
+            );
+            let _ = fs::copy(&path, data_dir.join("config.json.broken"));
+            AppConfig::default()
         }
     };
     // keys are stored sealed on disk; memory always holds plaintext.

@@ -174,7 +174,10 @@ impl AppState {
 }
 
 fn todos_path(data_dir: &std::path::Path, session_id: &str) -> PathBuf {
-    data_dir.join("todos").join(format!("{session_id}.json"))
+    // session_id joins a filesystem path — sanitize like sessions::path_for
+    // does, so a hostile id ("../../x") cannot escape the todos directory
+    let safe = crate::sessions::sanitize_id(session_id);
+    data_dir.join("todos").join(format!("{safe}.json"))
 }
 
 fn load_todos(data_dir: &std::path::Path, session_id: &str) -> Vec<TodoItem> {
@@ -628,7 +631,14 @@ pub fn ccswitch_import(state: State<'_, AppState>) -> Result<Vec<Provider>, Stri
         }
     }
     config::save(&state.data_dir, &config);
-    Ok(imported)
+    // the renderer must never receive plaintext keys (get_config masks for
+    // the same reason) — mask the RETURN copy only; the persisted config
+    // keeps the real values, sealed
+    let mut masked = imported;
+    for p in &mut masked {
+        p.api_key = config::mask_key(&p.api_key);
+    }
+    Ok(masked)
 }
 
 /// `"...value..."` → `value` (tolerates trailing commas / whitespace).
@@ -777,7 +787,15 @@ pub fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<
 }
 
 #[tauri::command]
-pub fn rename_session(state: State<'_, AppState>, session_id: String, title: String) -> Result<SessionMeta, String> {
+pub async fn rename_session(
+    state: State<'_, AppState>,
+    session_id: String,
+    title: String,
+) -> Result<SessionMeta, String> {
+    // metadata writes are load-modify-save: hold save_lock so a concurrent
+    // stream save that lands mid-write is not silently rolled back by a
+    // stale snapshot (P1 — same discipline as update_bindings)
+    let _guard = state.save_lock.lock().await;
     state.store.rename(&session_id, &title)
 }
 
@@ -843,7 +861,7 @@ pub async fn update_bindings(
 }
 
 #[tauri::command]
-pub fn set_workspace(
+pub async fn set_workspace(
     state: State<'_, AppState>,
     session_id: String,
     workspace: Option<String>,
@@ -854,16 +872,27 @@ pub fn set_workspace(
             return Err(format!("目录不存在: {ws}"));
         }
     }
+    let _guard = state.save_lock.lock().await;
     state.store.set_workspace(&session_id, workspace)
 }
 
 #[tauri::command]
-pub fn set_session_pinned(state: State<'_, AppState>, session_id: String, pinned: bool) -> Result<SessionMeta, String> {
+pub async fn set_session_pinned(
+    state: State<'_, AppState>,
+    session_id: String,
+    pinned: bool,
+) -> Result<SessionMeta, String> {
+    let _guard = state.save_lock.lock().await;
     state.store.set_pinned(&session_id, pinned)
 }
 
 #[tauri::command]
-pub fn set_session_archived(state: State<'_, AppState>, session_id: String, archived: bool) -> Result<SessionMeta, String> {
+pub async fn set_session_archived(
+    state: State<'_, AppState>,
+    session_id: String,
+    archived: bool,
+) -> Result<SessionMeta, String> {
+    let _guard = state.save_lock.lock().await;
     state.store.set_archived(&session_id, archived)
 }
 
@@ -968,6 +997,16 @@ pub fn import_session(
 ) -> Result<SessionMeta, String> {
     if !std::path::Path::new(&path).is_file() {
         return Err(format!("文件不存在: {path}"));
+    }
+    // same size cap as import_scan: a huge file would be read wholesale
+    // into memory (OOM) — and under an XSS this command is an arbitrary
+    // file-read primitive, so the cap blunts that too
+    let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件信息失败: {e}"))?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err(format!(
+            "文件过大（{} MB，上限 64 MB）",
+            meta.len() / 1024 / 1024
+        ));
     }
     let msgs = crate::importer::parse_file(&source, &path)?;
     if msgs.is_empty() {

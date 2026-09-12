@@ -43,7 +43,13 @@ impl FileIndex {
 
     pub fn save(&self, data_dir: &Path) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(Self::path_for(data_dir), json);
+            // atomic-ish write (tmp + rename): a crash mid-write must not
+            // leave a truncated index that silently evicts every file ref
+            let path = Self::path_for(data_dir);
+            let tmp = data_dir.join("files_index.json.tmp");
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
         }
     }
 
