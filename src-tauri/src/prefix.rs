@@ -613,6 +613,76 @@ impl LanePrefix {
         parts
     }
 
+    /// Restore Zone H into typed messages (Anthropic replay path, P0 fix).
+    /// Zone H segments were written by `append`/`rebuild` from this very
+    /// struct, so typed parsing succeeds for everything the app itself
+    /// wrote. The Value fallback covers legacy/foreign segments — most
+    /// importantly multi-modal user turns whose `content` serialized as an
+    /// OpenAI parts array (which `ChatMessage.content: String` cannot
+    /// deserialize): text blocks flatten back into the content and image
+    /// parts are restored as attachments, so images replay too.
+    pub fn history_messages(&self) -> Vec<ChatMessage> {
+        self.history
+            .iter()
+            .filter_map(|j| match serde_json::from_str::<ChatMessage>(j) {
+                Ok(m) => Some(m),
+                Err(_) => {
+                    let v: serde_json::Value = serde_json::from_str(j).ok()?;
+                    let role = v.get("role")?.as_str()?.to_string();
+                    let mut texts: Vec<String> = Vec::new();
+                    let mut images: Vec<ChatImage> = Vec::new();
+                    match v.get("content") {
+                        Some(serde_json::Value::String(t)) => texts.push(t.clone()),
+                        Some(serde_json::Value::Array(parts)) => {
+                            for p in parts {
+                                match p.get("type").and_then(|t| t.as_str()) {
+                                    Some("text") => {
+                                        if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                                            texts.push(t.to_string());
+                                        }
+                                    }
+                                    Some("image_url") => {
+                                        if let Some(uri) = p
+                                            .pointer("/image_url/url")
+                                            .and_then(|u| u.as_str())
+                                        {
+                                            // data:{mime};base64,{b64}
+                                            if let Some(rest) = uri.strip_prefix("data:") {
+                                                if let Some((mime, b64)) =
+                                                    rest.split_once(";base64,")
+                                                {
+                                                    images.push(ChatImage {
+                                                        mime: mime.to_string(),
+                                                        b64: b64.to_string(),
+                                                        file_ref: None,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Some("file") => {
+                                        if let Some(fid) =
+                                            p.get("file_id").and_then(|f| f.as_str())
+                                        {
+                                            images.push(ChatImage {
+                                                mime: "application/octet-stream".into(),
+                                                b64: String::new(),
+                                                file_ref: Some(fid.to_string()),
+                                            });
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    Some(ChatMessage::with_images(&role, texts.join("\n"), images))
+                }
+            })
+            .collect()
+    }
+
     /// Byte length of Zone S+H exactly as it will appear in the next request
     /// (including separators) — recorded into telemetry before the send.
     #[allow(dead_code)]
@@ -746,7 +816,11 @@ fn anthropic_tools(tools: &Value) -> Value {
 /// Anthropic bodies are structurally different (top-level system, required
 /// max_tokens), so Zone stability is maintained per-role fragments but the
 /// exact byte-layout guarantee belongs to the OpenAI-compat path.
-/// `messages` must already be role-merged (user/assistant alternating).
+/// `messages` may contain system / tool / assistant-with-tool_calls records:
+/// system demotes to a user turn, tool results map to native tool_result
+/// blocks (user role), assistant tool calls map to tool_use blocks, and
+/// adjacent same-role messages merge into one — Anthropic requires strict
+/// user/assistant alternation. All message content ships as block arrays.
 /// `max_output` overrides the built-in 8192 cap; `temperature` is omitted
 /// when None (provider default).
 ///
@@ -784,34 +858,108 @@ pub fn build_anthropic_body(
         role: String,
         content: serde_json::Value,
     }
-    let mut msgs: Vec<Msg> = messages
-        .iter()
-        .filter(|m| m.role == "assistant" || m.role == "user")
-        .map(|m| {
-            // user messages with attached images become content blocks
-            // (text + base64 image sources); plain messages stay strings
-            let content = if !m.images.is_empty() {
-                let mut blocks = Vec::new();
+
+    fn text_block(s: &str) -> Value {
+        json!({ "type": "text", "text": s })
+    }
+    fn image_block(img: &ChatImage) -> Value {
+        json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": img.mime, "data": img.b64 }
+        })
+    }
+    // arguments are stored as a JSON-encoded string; a parse failure
+    // degrades to an empty object rather than dropping the call
+    fn tool_use_block(tc: &Value) -> Option<Value> {
+        let f = tc.get("function")?;
+        let input: Value = f
+            .get("arguments")
+            .and_then(|a| a.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+        Some(json!({
+            "type": "tool_use",
+            "id": tc.get("id").cloned().unwrap_or(Value::Null),
+            "name": f.get("name").cloned().unwrap_or(Value::Null),
+            "input": input,
+        }))
+    }
+
+    let mut msgs: Vec<Msg> = Vec::new();
+    for m in messages {
+        let role: String;
+        let mut blocks: Vec<Value> = Vec::new();
+        match m.role.as_str() {
+            "system" => {
+                // in-history system updates (RollingMemo / workflow
+                // re-injection) have no Anthropic role — demote to a
+                // marked user turn so they stay visible
+                if m.content.is_empty() {
+                    continue;
+                }
+                role = "user".into();
+                blocks.push(text_block(&format!("[系统更新]\n\n{}", m.content)));
+            }
+            "user" => {
+                role = "user".into();
                 if !m.content.is_empty() {
-                    blocks.push(json!({ "type": "text", "text": m.content }));
+                    blocks.push(text_block(&m.content));
                 }
                 for img in &m.images {
-                    blocks.push(json!({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": img.mime,
-                            "data": img.b64
-                        }
-                    }));
+                    blocks.push(image_block(img));
                 }
-                serde_json::Value::Array(blocks)
-            } else {
-                serde_json::Value::String(m.content.clone())
-            };
-            Msg { role: m.role.clone(), content }
-        })
-        .collect();
+            }
+            "assistant" => {
+                role = "assistant".into();
+                if !m.content.is_empty() {
+                    blocks.push(text_block(&m.content));
+                }
+                if let Some(calls) = &m.tool_calls {
+                    if let Some(arr) = calls.as_array() {
+                        for tc in arr {
+                            if let Some(b) = tool_use_block(tc) {
+                                blocks.push(b);
+                            }
+                        }
+                    }
+                }
+            }
+            "tool" => {
+                // a tool result rides in a USER message (Anthropic rule);
+                // dangling results without an id are dropped
+                let Some(id) = &m.tool_call_id else { continue };
+                role = "user".into();
+                let mut inner = Vec::new();
+                if !m.content.is_empty() {
+                    inner.push(text_block(&m.content));
+                }
+                for img in &m.images {
+                    inner.push(image_block(img));
+                }
+                blocks.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "content": inner,
+                }));
+            }
+            _ => continue,
+        }
+        if blocks.is_empty() {
+            continue;
+        }
+        // merge adjacent same-role messages (strict user/assistant
+        // alternation): consecutive tool results collapse into one user
+        // message carrying several tool_result blocks
+        if let Some(last) = msgs.last_mut() {
+            if last.role == role {
+                if let Value::Array(a) = &mut last.content {
+                    a.extend(blocks);
+                    continue;
+                }
+            }
+        }
+        msgs.push(Msg { role, content: Value::Array(blocks) });
+    }
     // incremental cache breakpoint: everything up to (and including) the
     // newest message becomes the cached prefix for the NEXT request
     if let (Some(mark), Some(last)) = (cache_mark(), msgs.last_mut()) {
@@ -965,6 +1113,111 @@ mod tests {
         assert!(lp.adopt_system_in_history("第三个提示"));
         assert!(lp.system_is("第三个提示"));
         assert!(!lp.system_is("新系统提示"));
+    }
+
+    #[test]
+    fn zone_h_replays_into_anthropic_body_with_tool_blocks() {
+        let mut lp = LanePrefix::new("sys", "ck");
+        lp.append(&ChatMessage::plain("user", "第一轮：项目结构是什么"));
+        lp.append(&ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(json!([
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "list_dir", "arguments": "{\"path\":\".\"}"}}
+            ])),
+            tool_call_id: None,
+            images: Vec::new(),
+        });
+        lp.append(&ChatMessage {
+            role: "tool".into(),
+            content: "src/, docs/".into(),
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            images: Vec::new(),
+        });
+        lp.append(&ChatMessage::plain("assistant", "项目包含 src 和 docs。"));
+
+        let mut msgs = lp.history_messages();
+        msgs.push(ChatMessage::plain("user", "第二轮：继续"));
+        let body =
+            build_anthropic_body("claude-test", "sys", &msgs, None, None, CacheTier::None, None);
+        // round 1 replays — the P0 regression this test pins
+        assert!(body.contains("第一轮：项目结构是什么"), "{body}");
+        assert!(body.contains("项目包含 src 和 docs。"), "{body}");
+        assert!(body.contains("第二轮：继续"), "{body}");
+        // native tool blocks
+        assert!(body.contains("\"tool_use\""), "{body}");
+        assert!(body.contains("\"tool_result\""), "{body}");
+        assert!(body.contains("list_dir"), "{body}");
+        assert!(body.contains("call_1"), "{body}");
+        assert!(body.contains("src/, docs/"), "{body}");
+        // strict alternation after the merge
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let roles: Vec<&str> = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant", "user"]);
+    }
+
+    #[test]
+    fn history_messages_roundtrips_tool_records() {
+        let mut lp = LanePrefix::new("s", "c");
+        lp.append(&ChatMessage::plain("user", "q"));
+        lp.append(&ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(json!([{"id": "t1", "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}}])),
+            tool_call_id: None,
+            images: Vec::new(),
+        });
+        lp.append(&ChatMessage {
+            role: "tool".into(),
+            content: "data".into(),
+            tool_calls: None,
+            tool_call_id: Some("t1".into()),
+            images: Vec::new(),
+        });
+        let back = lp.history_messages();
+        assert_eq!(back.len(), 3);
+        assert_eq!(back[0].role, "user");
+        assert_eq!(back[1].role, "assistant");
+        assert!(back[1].tool_calls.is_some());
+        assert_eq!(back[2].role, "tool");
+        assert_eq!(back[2].tool_call_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn history_messages_survives_multimodal_segments() {
+        let mut lp = LanePrefix::new("s", "c");
+        // a multi-modal user segment serializes content as an OpenAI parts
+        // array — the String content cannot deserialize it; the Value
+        // fallback must flatten the text and restore the image
+        lp.history
+            .push(json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "看这张图"},
+                    {"type": "image_url",
+                     "image_url": {"url": "data:image/png;base64,QUJD"}}
+                ]
+            })
+            .to_string());
+        let back = lp.history_messages();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].role, "user");
+        assert_eq!(back[0].content, "看这张图");
+        assert_eq!(back[0].images.len(), 1);
+        assert_eq!(back[0].images[0].mime, "image/png");
+        assert_eq!(back[0].images[0].b64, "QUJD");
+        let body =
+            build_anthropic_body("claude-test", "s", &back, None, None, CacheTier::None, None);
+        assert!(body.contains("\"type\":\"image\""), "{body}");
+        assert!(body.contains("看这张图"), "{body}");
     }
 
     #[test]
@@ -1130,7 +1383,13 @@ mod tests {
         assert!(!b.contains("cache_control"), "{b}");
         let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
         assert_eq!(v["system"], serde_json::json!("sys"));
-        assert_eq!(v["messages"][0]["content"], serde_json::json!("hi"));
+        // message content always ships as a block array now (tool replay
+        // made blocks the universal shape; a plain turn is a single text
+        // block)
+        assert_eq!(
+            v["messages"][0]["content"],
+            serde_json::json!([{ "type": "text", "text": "hi" }])
+        );
     }
 
     #[test]

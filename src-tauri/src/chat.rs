@@ -985,25 +985,6 @@ pub async fn image_generate(ctx: &SendCtx<'_>, prompt: &str) -> Result<LaneOutco
     })
 }
 
-/// Merge consecutive same-role messages (Anthropic requires alternation).
-fn merge_alternating(msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let mut out: Vec<ChatMessage> = Vec::new();
-    for m in msgs {
-        if let Some(last) = out.last_mut() {
-            // 相邻同角色（user 或 assistant）都必须合并：tool 记录被
-            // Anthropic 路径丢弃后，连续 assistant 会触发 400
-            // roles-must-alternate
-            if last.role == m.role && (m.role == "user" || m.role == "assistant") {
-                last.content.push_str("\n\n");
-                last.content.push_str(&m.content);
-                continue;
-            }
-        }
-        out.push(m);
-    }
-    out
-}
-
 pub fn build_body(
     p: &Provider,
     model: &str,
@@ -1020,28 +1001,19 @@ pub fn build_body(
             lp.build_responses_body(model, new_msgs, tools)
         }
         ProviderKind::Anthropic => {
-            // Anthropic path: legacy shape (top-level system + merged roles).
-            // In-history system messages (RollingMemo / workflow re-injection)
-            // have no Anthropic role — they used to be silently DROPPED here,
-            // making the memo invisible on Anthropic providers; now they are
-            // demoted to user turns with a marker prefix.
-            let mut msgs: Vec<ChatMessage> = Vec::new();
-            for m in new_msgs {
-                match m.role.as_str() {
-                    "user" | "assistant" => msgs.push(m.clone()),
-                    "system" if !m.content.is_empty() => msgs.push(ChatMessage::plain(
-                        "user",
-                        format!("[系统更新]\n\n{}", m.content),
-                    )),
-                    _ => {}
-                }
-            }
-            let merged = merge_alternating(msgs);
+            // Anthropic path: Zone H is REPLAYED (P0 — this arm used to send
+            // ONLY this turn's messages, wiping every earlier round from
+            // Claude's context without any error). In-history system
+            // messages (RollingMemo / workflow re-injection) demote to user
+            // turns inside the body builder; tool-call history maps to
+            // native tool_use / tool_result blocks there too.
+            let mut msgs = lp.history_messages();
+            msgs.extend(new_msgs.iter().cloned());
             let beh = p.behavior.get(model);
             prefix::build_anthropic_body(
                 model,
                 system,
-                &merged,
+                &msgs,
                 beh.and_then(|b| b.max_output),
                 beh.and_then(|b| b.temperature),
                 p.cache_tier(),
@@ -1607,19 +1579,6 @@ mod tests {
         assert!(body.contains("\"tools\""), "{body}");
         assert!(body.contains("\"input_schema\""), "{body}");
         assert!(!body.contains("\"role\":\"system\""), "no system role in messages: {body}");
-    }
-
-    #[test]
-    fn merge_alternating_collapses_consecutive_assistants() {
-        let msgs = vec![
-            ChatMessage::plain("user", "a"),
-            ChatMessage::plain("assistant", "b"),
-            ChatMessage::plain("assistant", "c"),
-            ChatMessage::plain("user", "d"),
-        ];
-        let merged = merge_alternating(msgs);
-        assert_eq!(merged.len(), 3);
-        assert_eq!(merged[1].content, "b\n\nc");
     }
 
     // --- item: one-shot bodies carry no cache marks (pi compaction discipline)
