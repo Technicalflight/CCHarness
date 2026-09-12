@@ -342,9 +342,11 @@ pub fn git_remote_remove(workspace: String, name: String) -> Result<(), String> 
 
 /// Push the current branch to a remote. `set_upstream` (-u) links the local
 /// branch to its remote counterpart on the first push so later pull/fetch
-/// and the ahead/behind counters work. Network op → long deadline.
+/// and the ahead/behind counters work. Network op → long deadline, executed
+/// on the blocking pool so a slow remote or credential prompt never freezes
+/// the UI thread (async command).
 #[tauri::command]
-pub fn git_push(
+pub async fn git_push(
     workspace: String,
     remote: String,
     branch: String,
@@ -352,22 +354,32 @@ pub fn git_push(
 ) -> Result<String, String> {
     sane_token("远程名", remote.trim(), true)?;
     sane_token("分支名", branch.trim(), false)?;
-    let remote = remote.trim();
-    let branch = branch.trim();
-    let mut args: Vec<&str> = vec!["push"];
-    if set_upstream {
-        args.push("-u");
-    }
-    args.push(remote);
-    args.push(branch);
-    crate::worktree::git_net(Path::new(&workspace), &args)
+    let remote = remote.trim().to_string();
+    let branch = branch.trim().to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut args: Vec<&str> = vec!["push"];
+        if set_upstream {
+            args.push("-u");
+        }
+        args.push(&remote);
+        args.push(&branch);
+        crate::worktree::git_net(Path::new(&workspace), &args)
+    })
+    .await
+    .map_err(|e| format!("git 任务执行失败: {e}"))?
 }
 
 /// Pull (fetch + merge) the current branch's upstream. Network op → long
-/// deadline. A missing upstream gets a hint pointing at the push button.
+/// deadline on the blocking pool (async command, never freezes the UI). A
+/// missing upstream gets a hint pointing at the push button.
 #[tauri::command]
-pub fn git_pull(workspace: String) -> Result<String, String> {
-    match crate::worktree::git_net(Path::new(&workspace), &["pull"]) {
+pub async fn git_pull(workspace: String) -> Result<String, String> {
+    let out = tokio::task::spawn_blocking(move || {
+        crate::worktree::git_net(Path::new(&workspace), &["pull"])
+    })
+    .await
+    .map_err(|e| format!("git 任务执行失败: {e}"))?;
+    match out {
         Ok(out) => Ok(out),
         Err(e) if e.contains("no tracking information") => Err(format!(
             "{e}\n提示：当前分支尚未关联远程分支 —— 先「推送」一次（首次推送自动关联），再回来拉取"
@@ -377,10 +389,14 @@ pub fn git_pull(workspace: String) -> Result<String, String> {
 }
 
 /// Fetch all remotes (with prune) so the ahead/behind counters refresh.
-/// Network op → long deadline.
+/// Network op → long deadline on the blocking pool (async command).
 #[tauri::command]
-pub fn git_fetch(workspace: String) -> Result<String, String> {
-    crate::worktree::git_net(Path::new(&workspace), &["fetch", "--all", "--prune"])
+pub async fn git_fetch(workspace: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::worktree::git_net(Path::new(&workspace), &["fetch", "--all", "--prune"])
+    })
+    .await
+    .map_err(|e| format!("git 任务执行失败: {e}"))?
 }
 
 #[cfg(test)]
@@ -498,8 +514,8 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn remote_add_list_push_pull_roundtrip() {
+    #[tokio::test]
+    async fn remote_add_list_push_pull_roundtrip() {
         let bare = seed_bare("remote");
         let bare_url = bare.to_str().unwrap().to_string();
 
@@ -527,13 +543,15 @@ mod tests {
             .find(|b| b.current)
             .unwrap()
             .name;
-        git_push(ws.clone(), "origin".into(), branch.clone(), true).unwrap();
+        git_push(ws.clone(), "origin".into(), branch.clone(), true)
+            .await
+            .unwrap();
         let bare_head = crate::worktree::git(&bare, &["rev-parse", &branch]).unwrap();
         let ws_head = crate::worktree::git(Path::new(&ws), &["rev-parse", &branch]).unwrap();
         assert_eq!(bare_head, ws_head);
 
         // fetch refreshes remote refs without touching the working tree
-        git_fetch(ws.clone()).unwrap();
+        git_fetch(ws.clone()).await.unwrap();
         assert!(dir.join("peer.txt").exists() == false);
 
         // a second clone moves the remote forward; pulling brings it in
@@ -550,7 +568,7 @@ mod tests {
         crate::worktree::git(&clone_dir, &["add", "-A"]).unwrap();
         crate::worktree::git(&clone_dir, &["commit", "-qm", "peer commit"]).unwrap();
         crate::worktree::git(&clone_dir, &["push", "-q", "origin", &branch]).unwrap();
-        git_pull(ws.clone()).unwrap();
+        git_pull(ws.clone()).await.unwrap();
         // autocrlf may check the file out with CRLF — compare content only
         let pulled = std::fs::read_to_string(dir.join("peer.txt"))
             .unwrap()

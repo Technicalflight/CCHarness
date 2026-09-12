@@ -91,7 +91,7 @@ struct L1State {
 static L1: Mutex<Option<L1State>> = Mutex::new(None);
 
 fn l1_get(key: &str) -> Option<EntryMeta> {
-    let mut guard = L1.lock().unwrap();
+    let mut guard = L1.lock().unwrap_or_else(|p| p.into_inner());
     let st = guard.as_mut()?;
     if let Some(e) = st.map.get(key).cloned() {
         // touch: move to the back of the eviction order
@@ -105,7 +105,7 @@ fn l1_get(key: &str) -> Option<EntryMeta> {
 }
 
 fn l1_put(key: &str, e: EntryMeta) {
-    let mut guard = L1.lock().unwrap();
+    let mut guard = L1.lock().unwrap_or_else(|p| p.into_inner());
     let st = guard.get_or_insert_with(|| L1State { order: VecDeque::new(), map: HashMap::new(), text_bytes: 0 });
     if let Some(prev) = st.map.insert(key.to_string(), e.clone()) {
         st.text_bytes = st.text_bytes.saturating_sub(prev.text.len());
@@ -131,7 +131,7 @@ fn l1_put(key: &str, e: EntryMeta) {
 /// Test-only: drop all L1 entries (simulates a process restart).
 #[cfg(test)]
 fn l1_clear() {
-    *L1.lock().unwrap() = None;
+    *L1.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 // ---------- L2: per-workspace encrypted disk cache ----------
@@ -364,7 +364,7 @@ fn trim_ledger(path: &Path) {
 }
 
 fn ledger_append(data_dir: &Path, row: &LedgerRow) {
-    let _guard = LEDGER_LOCK.lock().unwrap();
+    let _guard = LEDGER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = ledger_path(data_dir);
     let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
         return;

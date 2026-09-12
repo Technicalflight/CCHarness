@@ -80,7 +80,7 @@ impl McpManager {
     /// dead-entry sweep (try_wait reap / error-entry respawn) lives here so
     /// the handshake retry path reuses the exact same logic.
     fn spawn_if_absent(&self, cfg: &McpServerConfig) -> Result<(), String> {
-        let mut guard = self.procs.lock().unwrap();
+        let mut guard = self.procs.lock().unwrap_or_else(|p| p.into_inner());
         let procs = guard.get_or_insert_with(HashMap::new);
         let dead = match procs.get_mut(&cfg.id) {
             Some(e) => match e.child.as_mut() {
@@ -143,7 +143,7 @@ impl McpManager {
             Ok(t) => t,
             Err(first) => {
                 {
-                    let mut guard = self.procs.lock().unwrap();
+                    let mut guard = self.procs.lock().unwrap_or_else(|p| p.into_inner());
                     if let Some(procs) = guard.as_mut() {
                         procs.remove(&cfg.id);
                     }
@@ -154,7 +154,7 @@ impl McpManager {
                     .map_err(|second| format!("{first}；重试仍失败: {second}"))?
             }
         };
-        let mut guard = self.procs.lock().unwrap();
+        let mut guard = self.procs.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(procs) = guard.as_mut() {
             if let Some(entry) = procs.get_mut(&cfg.id) {
                 entry.tools = tools.clone();
@@ -209,7 +209,7 @@ impl McpManager {
 
     /// Cached OpenAI-format tool definitions of all connected servers.
     pub fn cached_tools(&self, enabled: &[McpServerConfig]) -> Vec<Value> {
-        let guard = self.procs.lock().unwrap();
+        let guard = self.procs.lock().unwrap_or_else(|p| p.into_inner());
         let Some(procs) = guard.as_ref() else { return Vec::new() };
         enabled
             .iter()
@@ -220,7 +220,7 @@ impl McpManager {
     }
 
     pub fn status(&self, servers: &[McpServerConfig]) -> Vec<Value> {
-        let guard = self.procs.lock().unwrap();
+        let guard = self.procs.lock().unwrap_or_else(|p| p.into_inner());
         let procs = guard.as_ref();
         servers
             .iter()
@@ -240,7 +240,7 @@ impl McpManager {
     }
 
     pub fn mark_state(&self, id: &str, state: &str) {
-        if let Some(procs) = self.procs.lock().unwrap().as_mut() {
+        if let Some(procs) = self.procs.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
             if let Some(e) = procs.get_mut(id) {
                 e.state = state.to_string();
             }
@@ -249,7 +249,7 @@ impl McpManager {
 
     /// Drop a server's process (config removed / disabled).
     pub fn drop_server(&self, id: &str) {
-        let mut guard = self.procs.lock().unwrap();
+        let mut guard = self.procs.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(procs) = guard.as_mut() {
             if let Some(mut e) = procs.remove(id) {
                 // 显式 start_kill 立即生效；kill_on_drop 只是兜底
@@ -282,7 +282,7 @@ impl McpManager {
         } else {
             let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
             let stdin_arc = {
-                let guard = self.procs.lock().unwrap();
+                let guard = self.procs.lock().unwrap_or_else(|p| p.into_inner());
                 guard
                     .as_ref()
                     .and_then(|p| p.get(&cfg.id))
@@ -310,10 +310,10 @@ impl McpManager {
         // register the waiter under the short std lock…
         let (tx, rx) = oneshot::channel();
         let (stdin_arc, pending_arc) = {
-            let mut guard = self.procs.lock().unwrap();
+            let mut guard = self.procs.lock().unwrap_or_else(|p| p.into_inner());
             let procs = guard.get_or_insert_with(HashMap::new);
             let entry = procs.get_mut(&cfg.id).ok_or("进程不存在")?;
-            entry.pending.lock().unwrap().insert(id, tx);
+            entry.pending.lock().unwrap_or_else(|p| p.into_inner()).insert(id, tx);
             (entry.stdin.clone(), entry.pending.clone())
         };
         // …then write through the async stdin lock (Send-safe across await)
@@ -321,16 +321,16 @@ impl McpManager {
             Some(s) => {
                 let mut stdin = s.lock().await;
                 if let Err(e) = stdin.write_all(line.as_bytes()).await {
-                    pending_arc.lock().unwrap().remove(&id);
+                    pending_arc.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
                     return Err(format!("写入失败: {e}"));
                 }
                 if let Err(e) = stdin.flush().await {
-                    pending_arc.lock().unwrap().remove(&id);
+                    pending_arc.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
                     return Err(format!("flush 失败: {e}"));
                 }
             }
             None => {
-                pending_arc.lock().unwrap().remove(&id);
+                pending_arc.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
                 return Err("进程已退出".into());
             }
         }
@@ -340,7 +340,7 @@ impl McpManager {
             Err(_) => {
                 // 超时必须摘除等待者：否则 pending 表随失败请求无限增长，
                 // 迟到的响应也只会撞上一个早已失效的 sender（S5）
-                pending_arc.lock().unwrap().remove(&id);
+                pending_arc.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
                 return Err("响应超时".to_string());
             }
         };
@@ -473,7 +473,7 @@ fn spawn_server(
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
             let Some(id) = v.get("id").and_then(|i| i.as_u64()) else { continue };
-            if let Some(tx) = pending_reader.lock().unwrap().remove(&id) {
+            if let Some(tx) = pending_reader.lock().unwrap_or_else(|p| p.into_inner()).remove(&id) {
                 let _ = tx.send(v);
             }
         }

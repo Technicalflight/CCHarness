@@ -109,7 +109,7 @@ pub async fn set_workflow_mode(
 ) -> Result<(), String> {
     if matches!(mode.as_str(), "agent" | "plan" | "goal" | "deep" | "review" | "image") {
         // leaving (or never entering) a state machine — clear the SM position
-        if let Some(m) = state.sm_state.lock().unwrap().as_mut() {
+        if let Some(m) = state.sm_state.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
             m.remove(&session_id);
         }
         state
@@ -235,7 +235,7 @@ async fn set_goal_inner(
     drop(_guard);
     // flip the workflow gate to goal (same map + persist as
     // set_workflow_mode) so the next turn runs under GOAL_DIRECTIVE
-    if let Some(m) = state.sm_state.lock().unwrap().as_mut() {
+    if let Some(m) = state.sm_state.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
         m.remove(session_id);
     }
     state

@@ -135,7 +135,7 @@ pub fn insert(data_dir: &Path, workspace: &str, text: &str, vec: Vec<f32>) -> Re
     if text.is_empty() {
         return Err("记忆内容不能为空".into());
     }
-    let _g = STORE_LOCK.lock().unwrap();
+    let _g = STORE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut store = load_store(data_dir);
     let items = store.entry(workspace.to_string()).or_default();
     items.push(MemoryItem { text, vec, ts: now_ms() });

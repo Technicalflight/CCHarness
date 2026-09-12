@@ -79,7 +79,7 @@ pub(crate) fn open_approval(state: &AppState, id: &str) -> tokio::sync::oneshot:
 }
 
 fn take_approval(state: &AppState, id: &str) -> Option<tokio::sync::oneshot::Sender<bool>> {
-    state.approvals.lock().unwrap().as_mut()?.remove(id)
+    state.approvals.lock().unwrap_or_else(|p| p.into_inner()).as_mut()?.remove(id)
 }
 
 /// Monotonic per-record timestamp: equal-ms records keep their order.
@@ -101,7 +101,7 @@ pub(crate) fn next_record_ts(state: &AppState) -> u64 {
 pub(crate) fn prefixes_lock(
     state: &AppState,
 ) -> std::sync::MutexGuard<'_, Option<HashMap<(String, u32), LanePrefix>>> {
-    state.prefixes.lock().unwrap()
+    state.prefixes.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// Zone H empty (only the frozen system prompt, if any) — used to detect a
@@ -1230,7 +1230,7 @@ pub async fn clear_session(state: State<'_, AppState>, session_id: String) -> Re
     if let Some(map) = prefixes_lock(&state).as_mut() {
         map.retain(|(sid, _), _| sid != &session_id);
     }
-    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
         map.retain(|(sid, _), _| sid != &session_id);
     }
     Ok(removed)
@@ -1377,7 +1377,7 @@ pub async fn rollback_session(state: State<'_, AppState>, session_id: String, fr
     if let Some(map) = prefixes_lock(&state).as_mut() {
         map.retain(|(sid, _), _| sid != &session_id);
     }
-    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
         map.retain(|(sid, _), _| sid != &session_id);
     }
     Ok(removed)
@@ -1397,7 +1397,7 @@ pub fn resolve_approval(
     let tx = take_approval(&state, &approval_id).ok_or("审批已不存在（可能已超时）")?;
     let _ = tx.send(approved);
     if approved && remember {
-        if let Some(set) = state.grants.lock().unwrap().as_mut() {
+        if let Some(set) = state.grants.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
             set.insert(grant_key(&session_id, &tool));
         }
     }

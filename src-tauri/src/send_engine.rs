@@ -53,7 +53,7 @@ async fn ensure_mcp_servers(data_dir: &std::path::Path, stop: &AtomicBool) {
 
 #[tauri::command]
 pub fn stop_generation(state: State<'_, AppState>, session_id: String) {
-    if let Some(flag) = state.stops.lock().unwrap().get(&session_id) {
+    if let Some(flag) = state.stops.lock().unwrap_or_else(|p| p.into_inner()).get(&session_id) {
         flag.store(true, Ordering::Relaxed);
     }
 }
@@ -86,7 +86,7 @@ async fn abort_lane_pre_stream(
     lane: u32,
     message_id: &str,
 ) {
-    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
         map.remove(&(session_id.to_string(), lane));
     }
     let _ = channel.send(StreamEvent::Done {
@@ -942,7 +942,7 @@ async fn run_send(
 
     // cancellation flag for this session
     let stop = Arc::new(AtomicBool::new(false));
-    state.stops.lock().unwrap().insert(session_id.clone(), stop.clone());
+    state.stops.lock().unwrap_or_else(|p| p.into_inner()).insert(session_id.clone(), stop.clone());
 
     // persist the user message once (lane 0); skill names are validated
     // against what is actually installed so stale chips cannot persist
@@ -1583,7 +1583,7 @@ async fn run_send(
                 // monotonically (append-only) within an epoch; a new epoch is
                 // an expected rebuild, not a break
                 let chain_ok = {
-                    let mut guard = state.last_span.lock().unwrap();
+                    let mut guard = state.last_span.lock().unwrap_or_else(|p| p.into_inner());
                     let map = guard.get_or_insert_with(HashMap::new);
                     let prev = map.insert((session_id.clone(), lane), (owned_prefix.epoch, total_bytes));
                     match prev {
@@ -2633,7 +2633,7 @@ async fn run_send(
                 // an errored turn's tail never enters Zone H — drop the
                 // span marker so the next request isn't judged against bytes
                 // we deliberately discarded
-                if let Some(map) = state.last_span.lock().unwrap().as_mut() {
+                if let Some(map) = state.last_span.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
                     map.remove(&(session_id.clone(), lane));
                 }
             }
@@ -2793,7 +2793,7 @@ async fn run_send(
     for h in handles {
         let _ = h.await;
     }
-    state.stops.lock().unwrap().remove(&session_id);
+    state.stops.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
 
     // AuxMemo application: auto-title (whitelist kind "title"). Fires once
     // per session when the first exchange finished; served from the exact

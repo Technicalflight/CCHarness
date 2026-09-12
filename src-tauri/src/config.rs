@@ -128,8 +128,25 @@ fn default_close_action() -> String {
     "ask".into()
 }
 
+fn default_version() -> u32 {
+    1
+}
+
+fn default_theme() -> String {
+    "dark".into()
+}
+
+fn default_thinking_level() -> String {
+    "default".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppSettings {
+    // Field-level serde defaults must name functions: `#[serde(default)]`
+    // would use the TYPE's default ("" for String), not the struct
+    // Default impl ("dark" / "default") — an old config missing these
+    // fields would silently load wrong values.
+    #[serde(default = "default_theme")]
     pub theme: String, // "dark" | "light"
     #[serde(default = "default_true")]
     pub send_on_enter: bool,
@@ -139,7 +156,7 @@ pub struct AppSettings {
     #[serde(default = "default_true")]
     pub agent_tools: bool,
     /// Reasoning effort sent as `reasoning_effort` ("default" = omit field).
-    #[serde(default)]
+    #[serde(default = "default_thinking_level")]
     pub thinking_level: String, // "default" | "low" | "medium" | "high"
     /// System notifications when a turn finishes / approval is needed while
     /// the window is hidden.
@@ -493,7 +510,12 @@ pub struct WorkflowDef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    // Top-level serde defaults: an old or partially-written config.json
+    // must always load (AGENTS.md rule) instead of failing into the
+    // .broken path and silently resetting the user's providers.
+    #[serde(default = "default_version")]
     pub version: u32,
+    #[serde(default)]
     pub providers: Vec<Provider>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
@@ -505,6 +527,7 @@ pub struct AppConfig {
     /// and tool surface, auto-advancing on success.
     #[serde(default)]
     pub workflows: Vec<WorkflowDef>,
+    #[serde(default)]
     pub settings: AppSettings,
     /// Computed at load(): at least one API key is stored UNSEALED on disk
     /// (OS keyring / DPAPI unavailable → fail-open plaintext). Surfaced so
@@ -949,6 +972,25 @@ mod tests {
         let raw = r#"{"version":1,"providers":[{"id":"p","name":"n","kind":"openai_compatible","base_url":"https://x","api_key":"","pricing":{}}],"settings":{"theme":"dark"}}"#;
         let cfg: AppConfig = serde_json::from_str(raw).unwrap();
         assert!(cfg.providers[0].behavior.is_empty());
+    }
+
+    #[test]
+    fn top_level_fields_tolerate_old_configs() {
+        // Missing top-level fields (or an empty settings object) must load
+        // with defaults — never fail into config.json.broken and wipe the
+        // user's providers on a schema drift.
+        let cfg: AppConfig = serde_json::from_str(r#"{"providers":[],"settings":{}}"#).unwrap();
+        assert_eq!(cfg.version, 1);
+        assert!(cfg.providers.is_empty());
+        assert_eq!(cfg.settings.theme, "dark");
+        assert!(cfg.settings.send_on_enter);
+        assert_eq!(cfg.settings.thinking_level, "default");
+        assert_eq!(cfg.settings.system_update_mode, "rebuild");
+        // a fully empty object also loads with everything defaulted
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.version, 1);
+        assert!(cfg.mcp_servers.is_empty());
+        assert!(cfg.settings.agent_tools);
     }
 
     #[test]

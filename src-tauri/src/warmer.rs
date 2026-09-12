@@ -83,7 +83,7 @@ pub fn schedule(
             eprintln!("[warmer] 保温请求失败（忽略，缓存保持原状）: {e}");
         }
         // self-cleanup only if we still own the registry entry
-        if let Some(map) = WARMERS.lock().unwrap().as_mut() {
+        if let Some(map) = WARMERS.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
             if map.get(&task_key).map(|(g, _)| *g) == Some(gen) {
                 map.remove(&task_key);
             }

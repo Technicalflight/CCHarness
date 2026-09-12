@@ -242,7 +242,7 @@ async fn compact_now(
     if let Some(map) = prefixes_lock(&state).as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
-    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
     Ok(())
@@ -521,7 +521,7 @@ fn prune_oversized_tool_records(
     if let Some(map) = prefixes_lock(&state).as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
-    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
     saved
@@ -616,7 +616,7 @@ fn elide_stale_tool_records(
     if let Some(map) = prefixes_lock(&state).as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
-    if let Some(map) = state.last_span.lock().unwrap().as_mut() {
+    if let Some(map) = state.last_span.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
         map.remove(&(session_id.to_string(), 0));
     }
     (saved, stubs)
