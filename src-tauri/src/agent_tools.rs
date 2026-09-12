@@ -1117,6 +1117,34 @@ fn capture_to(path: &Path) -> Result<(), String> {
 /// Execute one shell command with cwd = workspace root. Blocking by design
 /// (same as the fs tools); pipes are drained on threads so chatty children
 /// can't deadlock, and the child is killed at the timeout.
+/// 终止整个进程树而非仅 shell：`cmd /C long_task` 的孙进程在只杀
+/// cmd.exe 时会存活并继续运行（S3）。Windows 用 taskkill /T /F；Unix
+/// 因 shell 以进程组首身份启动（见 process_group(0)），killpg 整组
+/// SIGKILL。
+#[cfg(windows)]
+fn kill_tree(child: &mut std::process::Child) {
+    use std::os::windows::process::CommandExt;
+    let pid = child.id();
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn kill_tree(child: &mut std::process::Child) {
+    // SAFETY: 只向 spawn 时新建的进程组发送信号
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn run_command(workspace: &str, command: &str, timeout_secs: u64) -> Result<String, String> {
     const CMD_CAP: u64 = 120;
     let cmd = command.trim();
@@ -1147,19 +1175,28 @@ fn run_command(workspace: &str, command: &str, timeout_secs: u64) -> Result<Stri
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — no console flash
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        c.process_group(0); // 自成进程组：kill_tree 可整组 SIGKILL
+    }
     let mut child = c.spawn().map_err(|e| format!("启动失败: {e}"))?;
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
-    let t_out = std::thread::spawn(move || {
+    // join() 可能永久挂住：树被终止后，分离的孙进程仍持有管道句柄时
+    // read_to_end 不会返回 —— 改用 channel + 宽限超时，宁可丢尾部输出
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut buf);
-        buf
+        let _ = tx_out.send(buf);
     });
-    let t_err = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = std::io::Read::read_to_end(&mut std::io::BufReader::new(stderr), &mut buf);
-        buf
+        let _ = tx_err.send(buf);
     });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
@@ -1168,13 +1205,12 @@ fn run_command(workspace: &str, command: &str, timeout_secs: u64) -> Result<Stri
             Ok(Some(st)) => break Some(st),
             Ok(None) => {}
             Err(e) => {
-                let _ = child.kill();
+                kill_tree(&mut child);
                 return Err(format!("等待进程失败: {e}"));
             }
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             break None;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1184,8 +1220,15 @@ fn run_command(workspace: &str, command: &str, timeout_secs: u64) -> Result<Stri
         let s = String::from_utf8_lossy(&bytes);
         s.chars().take(MAX_TOOL_RESULT_CHARS * 2).collect()
     };
-    let out = decode(t_out.join().unwrap_or_default());
-    let err = decode(t_err.join().unwrap_or_default());
+    const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+    let out = match rx_out.recv_timeout(DRAIN_GRACE) {
+        Ok(b) => decode(b),
+        Err(_) => String::new(),
+    };
+    let err = match rx_err.recv_timeout(DRAIN_GRACE) {
+        Ok(b) => decode(b),
+        Err(_) => String::new(),
+    };
 
     let head = match status {
         Some(st) if st.success() => format!("OK: 退出码 0（{timeout} 秒内完成）"),

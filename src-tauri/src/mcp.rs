@@ -31,6 +31,9 @@ struct ProcEntry {
     /// std procs guard across .await (which would make futures non-Send).
     stdin: Option<std::sync::Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
     pending: std::sync::Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    /// Owned server process (stdio only). kill_on_drop is armed at spawn,
+    /// so dropping the entry terminates the server even without start_kill.
+    child: Option<tokio::process::Child>,
     /// OpenAI-format tool definitions contributed by this server.
     tools: Vec<Value>,
     /// Cached state for the status page: "ok" or "error: …".
@@ -86,14 +89,27 @@ impl McpManager {
         {
             let mut guard = self.procs.lock().unwrap();
             let procs = guard.get_or_insert_with(HashMap::new);
+            // 自愈 + 回收：进程已退出的条目先移除（try_wait 兼作收割），
+            // 否则永远复用死条目、handshake 次次超时
+            let dead = match procs.get_mut(&cfg.id) {
+                Some(e) => match e.child.as_mut() {
+                    Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+                    None => e.stdin.is_none() && e.state.starts_with("error:"),
+                },
+                None => false,
+            };
+            if dead {
+                procs.remove(&cfg.id);
+            }
             if !procs.contains_key(&cfg.id) {
                 match spawn_server(cfg) {
-                    Ok((stdin, pending)) => {
+                    Ok((stdin, pending, child)) => {
                         procs.insert(
                             cfg.id.clone(),
                             ProcEntry {
                                 stdin,
                                 pending,
+                                child,
                                 tools: Vec::new(),
                                 state: "connecting…".into(),
                             },
@@ -105,6 +121,7 @@ impl McpManager {
                             ProcEntry {
                                 stdin: None,
                                 pending: std::sync::Arc::new(Mutex::new(HashMap::new())),
+                                child: None,
                                 tools: Vec::new(),
                                 state: format!("error: {e}"),
                             },
@@ -211,8 +228,14 @@ impl McpManager {
 
     /// Drop a server's process (config removed / disabled).
     pub fn drop_server(&self, id: &str) {
-        if let Some(procs) = self.procs.lock().unwrap().as_mut() {
-            procs.remove(id); // Child drops → process killed
+        let mut guard = self.procs.lock().unwrap();
+        if let Some(procs) = guard.as_mut() {
+            if let Some(mut e) = procs.remove(id) {
+                // 显式 start_kill 立即生效；kill_on_drop 只是兜底
+                if let Some(c) = e.child.as_mut() {
+                    let _ = c.start_kill();
+                }
+            }
         }
     }
 
@@ -265,29 +288,41 @@ impl McpManager {
         let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
         // register the waiter under the short std lock…
         let (tx, rx) = oneshot::channel();
-        let stdin_arc = {
+        let (stdin_arc, pending_arc) = {
             let mut guard = self.procs.lock().unwrap();
             let procs = guard.get_or_insert_with(HashMap::new);
             let entry = procs.get_mut(&cfg.id).ok_or("进程不存在")?;
             entry.pending.lock().unwrap().insert(id, tx);
-            entry.stdin.clone()
+            (entry.stdin.clone(), entry.pending.clone())
         };
         // …then write through the async stdin lock (Send-safe across await)
         match stdin_arc {
             Some(s) => {
                 let mut stdin = s.lock().await;
-                stdin
-                    .write_all(line.as_bytes())
-                    .await
-                    .map_err(|e| format!("写入失败: {e}"))?;
-                stdin.flush().await.map_err(|e| format!("flush 失败: {e}"))?;
+                if let Err(e) = stdin.write_all(line.as_bytes()).await {
+                    pending_arc.lock().unwrap().remove(&id);
+                    return Err(format!("写入失败: {e}"));
+                }
+                if let Err(e) = stdin.flush().await {
+                    pending_arc.lock().unwrap().remove(&id);
+                    return Err(format!("flush 失败: {e}"));
+                }
             }
-            None => return Err("进程已退出".into()),
+            None => {
+                pending_arc.lock().unwrap().remove(&id);
+                return Err("进程已退出".into());
+            }
         }
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
-            .await
-            .map_err(|_| "响应超时".to_string())?
-            .map_err(|_| "连接关闭".to_string())?;
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await
+        {
+            Ok(r) => r.map_err(|_| "连接关闭".to_string())?,
+            Err(_) => {
+                // 超时必须摘除等待者：否则 pending 表随失败请求无限增长，
+                // 迟到的响应也只会撞上一个早已失效的 sender（S5）
+                pending_arc.lock().unwrap().remove(&id);
+                return Err("响应超时".to_string());
+            }
+        };
         if let Some(err) = resp.get("error") {
             return Err(format!("MCP 错误: {err}"));
         }
@@ -345,12 +380,13 @@ fn spawn_server(
     (
         Option<std::sync::Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
         std::sync::Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+        Option<tokio::process::Child>,
     ),
     String,
 > {
     if cfg.transport != "stdio" {
         // HTTP servers keep no process; pending map exists for symmetry.
-        return Ok((None, std::sync::Arc::new(Mutex::new(HashMap::new()))));
+        return Ok((None, std::sync::Arc::new(Mutex::new(HashMap::new())), None));
     }
     if cfg.command.trim().is_empty() {
         return Err("stdio 传输需要填写 command".into());
@@ -359,7 +395,10 @@ fn spawn_server(
     cmd.args(&cfg.args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        // 进程归 ProcEntry 所有：entry 被 remove/drop 时必须连带终止，
+        // 而不是留下孤儿服务器（tokio Child 默认 drop 并不杀进程）
+        .kill_on_drop(true);
     // optional working directory — relative paths in args resolve against it
     if !cfg.cwd.trim().is_empty() {
         cmd.current_dir(cfg.cwd.trim());
@@ -418,10 +457,10 @@ fn spawn_server(
             }
         }
     });
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
-    Ok((stdin, pending))
+    // child 移交 ProcEntry 持有（此前这里 spawn 的 wait 任务把 Child
+    // 永久占走，drop_server 根本杀不到它 —— S4）；自然退出的收割由
+    // ensure() 的 try_wait 自愈分支完成
+    Ok((stdin, pending, Some(child)))
 }
 
 /// Extra request headers for http servers (Authorization, tenant ids, …).

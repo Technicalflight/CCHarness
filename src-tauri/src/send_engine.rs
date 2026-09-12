@@ -655,7 +655,17 @@ pub(crate) async fn run_subagent(
         for tc in &outcome.tool_calls {
             let result = match serde_json::from_str::<Value>(&tc.arguments) {
                 Err(e) => format!("ERROR: 参数不是合法 JSON: {e}"),
-                Ok(args) => crate::agent_tools::execute(parent_ws.as_deref().unwrap_or(""), &tc.name, &args),
+                Ok(args) => {
+                    // 同步工具（run_command 轮询最长 120 秒等）必须离开
+                    // async 执行器线程，否则整条 runtime 被卡住
+                    let ws = parent_ws.as_deref().unwrap_or("").to_string();
+                    let name = tc.name.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::agent_tools::execute(&ws, &name, &args)
+                    })
+                    .await
+                    .unwrap_or_else(|e| format!("ERROR: 工具任务失败: {e}"))
+                }
             };
             // context-volume: same trim as the main lane, so a delegation
             // whose result is later promoted into the parent replay keeps
@@ -2261,8 +2271,14 @@ async fn run_send(
                                         }
                                     };
                                     if approved {
-                                        match crate::agent_tools::take_screenshot(&data_dir, &session_id) {
-                                            Ok((text, shots)) => {
+                                        let dd = data_dir.to_path_buf();
+                                        let sid = session_id.to_string();
+                                        match tokio::task::spawn_blocking(move || {
+                                            crate::agent_tools::take_screenshot(&dd, &sid)
+                                        })
+                                        .await
+                                        {
+                                            Ok(Ok((text, shots))) => {
                                                 for s in &shots {
                                                     rec_images.push(s.filename.clone());
                                                 }
@@ -2280,7 +2296,8 @@ async fn run_send(
                                                 ));
                                                 text
                                             }
-                                            Err(e) => format!("ERROR: {e}"),
+                                            Ok(Err(e)) => format!("ERROR: {e}"),
+                                            Err(e) => format!("ERROR: 工具任务失败: {e}"),
                                         }
                                     } else {
                                         "DENIED: 用户拒绝或审批超时（120 秒）——未截取屏幕".to_string()
@@ -2301,11 +2318,14 @@ async fn run_send(
                                     {
                                         reason
                                     } else {
-                                        crate::agent_tools::execute(
-                                            workspace.as_deref().unwrap_or(""),
-                                            &tc.name,
-                                            &args,
-                                        )
+                                        let ws = workspace.as_deref().unwrap_or("").to_string();
+                                        let name = tc.name.clone();
+                                        let args2 = args.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            crate::agent_tools::execute(&ws, &name, &args2)
+                                        })
+                                        .await
+                                        .unwrap_or_else(|e| format!("ERROR: 工具任务失败: {e}"))
                                     }
                                 } else if perm_mode == "readonly" || plan_mode {
                                     "DENIED: 当前为只读或规划模式，写入工具不可用".to_string()
@@ -2412,11 +2432,14 @@ async fn run_send(
                                             })
                                         };
                                         let before = abs.as_ref().and_then(|p| snap(p));
-                                        let mut exec = crate::agent_tools::execute_write(
-                                            workspace.as_deref().unwrap_or(""),
-                                            &tc.name,
-                                            &exec_args,
-                                        );
+                                        let ws_s = workspace.as_deref().unwrap_or("").to_string();
+                                        let name_s = tc.name.clone();
+                                        let exec_args_s = exec_args.clone();
+                                        let mut exec = tokio::task::spawn_blocking(move || {
+                                            crate::agent_tools::execute_write(&ws_s, &name_s, &exec_args_s)
+                                        })
+                                        .await
+                                        .unwrap_or_else(|e| format!("ERROR: 工具任务失败: {e}"));
                                         if exec.starts_with("OK") && !rel.is_empty() {
                                             let after = abs.as_ref().and_then(|p| snap(p));
                                             let log = crate::types_rs::WriteLog {
@@ -2454,8 +2477,14 @@ async fn run_send(
                                                 workspace.as_deref(),
                                                 cfg.settings.post_write_command.as_deref(),
                                             ) {
-                                                if let Some(report) =
-                                                    crate::agent_tools::post_write_verify(ws, cmd)
+                                                let ws_v = ws.to_string();
+                                                let cmd_v = cmd.to_string();
+                                                if let Some(report) = tokio::task::spawn_blocking(move || {
+                                                    crate::agent_tools::post_write_verify(&ws_v, &cmd_v)
+                                                })
+                                                .await
+                                                .ok()
+                                                .flatten()
                                                 {
                                                     exec.push_str(&report);
                                                 }
