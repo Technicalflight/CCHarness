@@ -1192,6 +1192,18 @@ pub fn transcript_for_lane(
         .filter(|m| m.role == "tool")
         .filter_map(|m| m.tool_call_id.as_deref())
         .collect();
+    // call ids owned by assistant records that survive the filters — a tool
+    // result referencing anything else is a dangler (its assistant was
+    // excluded as an errored round, while the synthetic "not executed"
+    // results persisted next to it carry status ok) that would make strict
+    // endpoints 400 the whole rebuilt context
+    let assistant_calls: std::collections::HashSet<&str> = msgs
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flatten()
+        .map(|tc| tc.id.as_str())
+        .collect();
 
     // resolve skill bodies once if any user message invokes skills — the
     // visible record stores names only; bodies are injected here so the
@@ -1228,6 +1240,9 @@ pub fn transcript_for_lane(
         }
         if m.role == "tool" {
             if let Some(id) = &m.tool_call_id {
+                if !assistant_calls.contains(id.as_str()) {
+                    continue; // dangling result — its assistant never made it into the context
+                }
                 out.push(ChatMessage {
                     role: "tool".into(),
                     content: m.content.clone(),

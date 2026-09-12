@@ -1611,6 +1611,9 @@ async fn run_send(
             }
 
             let max_rounds = if goal_mode { GOAL_MAX_TOOL_ROUNDS } else { MAX_TOOL_ROUNDS };
+            // stays true iff the loop runs out of rounds naturally (every
+            // round ended with tool_calls) — see the post-loop finalizer
+            let mut rounds_exhausted = true;
             for _round in 1..=max_rounds {
                 let body = chat::build_body(
                     &provider,
@@ -1665,6 +1668,7 @@ async fn run_send(
                     Err(e) => {
                         let _ = channel.send(StreamEvent::Error { lane, message: e });
                         turn_status = "error".into();
+                        rounds_exhausted = false;
                         break;
                     }
                 };
@@ -1913,12 +1917,14 @@ async fn run_send(
                         }
                     }
                     turn_status = outcome.status;
+                    rounds_exhausted = false;
                     break;
                 }
                 if !has_tools {
                     sent_this_turn.push(asst_msg);
                     if fan_calls.is_empty() {
                         turn_status = "ok".into();
+                        rounds_exhausted = false;
                         break;
                     }
                     // ---- SM parallel fan-out: surface the synthesized
@@ -2660,8 +2666,50 @@ async fn run_send(
                 // continue to the next round: the model sees tool results
             }
 
-            // Zone T falls into Zone H for the next user turn
-            if turn_status != "error" {
+            // Rounds exhausted: every round ended with tool_calls and the
+            // budget ran out mid-flow. All rounds SUCCEEDED — closing as the
+            // initial "error" used to discard the whole turn (user message +
+            // executed tool work) from live Zone H while a restart rebuild
+            // kept the persisted records, forking the context. Close as ok
+            // and tell the user why the model never produced a final answer
+            // (the notice is display-only: transcript_for_lane excludes it
+            // from Zone H, so byte parity is untouched).
+            if rounds_exhausted {
+                turn_status = "ok".into();
+                let _guard = save_lock.lock().await;
+                if let Ok(mut sf) = store.load(&session_id) {
+                    sf.messages.push(MessageRecord {
+                        id: Uuid::new_v4().to_string(),
+                        lane,
+                        role: "notice".into(),
+                        content: format!(
+                            "已连续执行 {max_rounds} 轮工具调用，达到单回合上限，模型尚未输出最终答复。发送「继续」可让其接着当前进度收尾。"
+                        ),
+                        reasoning: None,
+                        ts: next_record_ts(&state),
+                        model: None,
+                        status: "ok".into(),
+                        usage: None,
+                        cost_usd: None,
+                        confidence: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        skill_calls: None,
+                        workflow: None,
+                        images: Vec::new(),
+                    });
+                    sf.meta.updated_at = now_ms();
+                    warn_save(&session_id, "rounds-exhausted notice", store.save(&sf));
+                }
+            }
+
+            // Zone T falls into Zone H for the next user turn. Error turns
+            // append too: sent_this_turn only ever carries rounds that fully
+            // completed (a failed round contributed nothing), and the
+            // persisted transcript keeps exactly those records — appending
+            // keeps live Zone H byte-identical with a restart rebuild instead
+            // of forking the context after every mid-turn failure.
+            {
                 // did a RollingMemo block ship this turn? The watermark only
                 // advances AFTER the Zone H append below (see the block at
                 // the end) — advancing it before the request let a
@@ -2717,13 +2765,6 @@ async fn run_send(
                 }
                 if let Some(slot) = warm_slot {
                     crate::warmer::schedule(client.clone(), provider.clone(), session_id.clone(), lane, slot);
-                }
-            } else {
-                // an errored turn's tail never enters Zone H — drop the
-                // span marker so the next request isn't judged against bytes
-                // we deliberately discarded
-                if let Some(map) = state.last_span.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
-                    map.remove(&(session_id.clone(), lane));
                 }
             }
 
