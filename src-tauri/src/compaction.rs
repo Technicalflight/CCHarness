@@ -289,10 +289,14 @@ pub fn compact_estimate(
 
     // folded = what compaction replaces: every record that would go over
     // the wire now (same mixed-script estimator as the KEEP walk and the
-    // auto gate, so UI numbers and gate decisions never drift apart)
+    // auto gate, so UI numbers and gate decisions never drift apart).
+    // Records already behind an existing compaction boundary are excluded
+    // — double-counting them inflated the savings estimate.
+    let folded_floor = sf.compaction.as_ref().map(|c| c.upto_ts).unwrap_or(0);
     let folded_tokens: u64 = sf
         .messages
         .iter()
+        .filter(|m| m.ts >= folded_floor)
         .filter(|m| m.role == "user" || m.role == "assistant" || m.role == "tool")
         .map(|m| est_tokens(&m.content) + RECORD_OVERHEAD_TOKENS)
         .sum();
@@ -730,7 +734,11 @@ pub(crate) async fn maybe_auto_compact(
     };
     let saved = saved + elided;
     if saved > 0 {
-        let projected = last_input - (saved as f64 / 4.0);
+        // `saved` is already in est_tokens units (the pruning/elide rungs
+        // book token deltas) — a chars-era `/4` re-division here
+        // under-counted the free rungs 4×, so the hysteresis early-out
+        // never fired and sessions paid for a summary they didn't need
+        let projected = last_input - saved as f64;
         // hysteresis: free rungs count as "rescued" only below the TARGET
         // line, not merely back under the trigger — otherwise the session
         // sits a hair under 0.70 and re-triggers every turn
@@ -740,10 +748,14 @@ pub(crate) async fn maybe_auto_compact(
     }
     // payback gate (L6 §2): only summarize when the session's expected
     // remaining life amortizes the rewrite cost. No pricing data ⇒ the
-    // gate stays open (pressure-only, previous behavior).
+    // gate stays open (pressure-only, previous behavior). Already-folded
+    // records (ts < compaction.upto_ts) never go over the wire again, so
+    // they must not count as foldable savings.
+    let folded_floor = sf.compaction.as_ref().map(|c| c.upto_ts).unwrap_or(0);
     let folded_tokens: u64 = sf
         .messages
         .iter()
+        .filter(|m| m.ts >= folded_floor)
         .filter(|m| m.role == "user" || m.role == "assistant" || m.role == "tool")
         .map(|m| est_tokens(&m.content) + RECORD_OVERHEAD_TOKENS)
         .sum();

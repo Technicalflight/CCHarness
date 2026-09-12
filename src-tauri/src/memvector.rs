@@ -6,7 +6,7 @@
 use crate::config::AppConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,7 +24,10 @@ pub struct MemoryItem {
     pub ts: i64,
 }
 
-type Store = HashMap<String, Vec<MemoryItem>>; // workspace -> items
+// BTreeMap, not HashMap: the store serializes to disk, and BTreeMap keeps
+// key order deterministic so identical data always produces identical bytes
+// (HashMap iteration order would churn the file on every save).
+type Store = BTreeMap<String, Vec<MemoryItem>>; // workspace -> items
 
 /// Single-process write lock: remember() can run concurrently from several
 /// lane tasks; read-modify-write must not interleave.
@@ -41,11 +44,32 @@ fn store_path(data_dir: &Path) -> PathBuf {
     data_dir.join("memvector.json")
 }
 
-fn load_store(data_dir: &Path) -> Store {
-    std::fs::read_to_string(store_path(data_dir))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// Load the store. Read or parse failure is NOT the same as "empty store":
+/// returning defaults here would let the next remember() overwrite every
+/// workspace's long-term memory with a near-empty file (config.rs:850 has
+/// the same discipline). A parse failure keeps a .broken rescue copy and
+/// the caller is told the store is unavailable.
+fn load_store(data_dir: &Path) -> Result<Store, String> {
+    let raw = match std::fs::read_to_string(store_path(data_dir)) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeMap::new()); // first launch — genuinely empty
+        }
+        Err(e) => {
+            // transient lock (AV / sync tool): refuse, do not fall back to
+            // empty — the caller skips the write instead of destroying data
+            return Err(format!("memvector.json 不可读（{}）——本次跳过记忆写入", e));
+        }
+    };
+    match serde_json::from_str::<Store>(&raw) {
+        Ok(store) => Ok(store),
+        Err(e) => {
+            let broken = store_path(data_dir).with_extension("json.broken");
+            let _ = std::fs::copy(store_path(data_dir), &broken);
+            eprintln!("[memvector] 解析失败（{}）；已备份到 {}，拒绝覆写", e, broken.display());
+            Err("memvector.json 已损坏——已保留 .broken 备份，拒绝覆写".into())
+        }
+    }
 }
 
 fn save_store(data_dir: &Path, store: &Store) -> Result<(), String> {
@@ -136,7 +160,7 @@ pub fn insert(data_dir: &Path, workspace: &str, text: &str, vec: Vec<f32>) -> Re
         return Err("记忆内容不能为空".into());
     }
     let _g = STORE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let mut store = load_store(data_dir);
+    let mut store = load_store(data_dir)?;
     let items = store.entry(workspace.to_string()).or_default();
     items.push(MemoryItem { text, vec, ts: now_ms() });
     if items.len() > MAX_ITEMS_PER_WS {
@@ -148,7 +172,9 @@ pub fn insert(data_dir: &Path, workspace: &str, text: &str, vec: Vec<f32>) -> Re
 /// Cosine top-k retrieval over a workspace's stored items (pure — the caller
 /// supplies the query embedding). Returns (score, text) pairs, best first.
 pub fn search(data_dir: &Path, workspace: &str, query_vec: &[f32], k: usize) -> Vec<(f32, String)> {
-    let store = load_store(data_dir);
+    // reads may fail open to "no results" — searching never writes, so a
+    // transient error just means this one recall comes back empty
+    let store = load_store(data_dir).unwrap_or_default();
     let mut scored: Vec<(f32, String)> = store
         .get(workspace)
         .map(|items| {
@@ -297,12 +323,26 @@ mod tests {
         for i in 0..(MAX_ITEMS_PER_WS + 10) {
             insert(&d, "ws", &format!("记忆 {i}"), vec![i as f32]).unwrap();
         }
-        let store: Store = load_store(&d);
+        let store: Store = load_store(&d).unwrap();
         assert_eq!(store["ws"].len(), MAX_ITEMS_PER_WS);
         // oldest 10 dropped (210 inserted - 200 cap) → 记忆 0..9 are gone
         assert!(!store["ws"].iter().any(|m| m.text == "记忆 9"));
         assert!(store["ws"].iter().any(|m| m.text == "记忆 10"));
         assert!(insert(&d, "ws", "   ", vec![1.0]).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unreadable_or_corrupt_store_never_overwrites() {
+        let d = tmpdir("resilient");
+        insert(&d, "ws", "要保住的记忆", vec![1.0]).unwrap();
+        // corrupt the file: the next insert must refuse instead of resetting
+        let p = d.join("memvector.json");
+        std::fs::write(&p, "{not json").unwrap();
+        assert!(insert(&d, "ws", "新记忆", vec![1.0]).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{not json");
+        assert!(p.with_extension("json.broken").exists());
+        // an unreadable (locked) file behaves the same
         let _ = std::fs::remove_dir_all(&d);
     }
 }

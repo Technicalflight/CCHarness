@@ -371,7 +371,8 @@ pub fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<(), 
             }
         }
     }
-    config::save(&state.data_dir, &cfg);
+    config::save(&state.data_dir, &cfg)
+        .map_err(|e| format!("保存配置失败: {e}"))?;
     sync_sandbox_policy(&cfg.settings);
     crate::privacy::set_custom_patterns(cfg.settings.privacy_custom_patterns.clone());
     Ok(())
@@ -681,7 +682,7 @@ pub fn ccswitch_import(state: State<'_, AppState>) -> Result<Vec<Provider>, Stri
             return Err(format!("{}: {msg}", p.name));
         }
     }
-    config::save(&state.data_dir, &config);
+    config::save(&state.data_dir, &config).map_err(|e| format!("保存配置失败: {e}"))?;
     // the renderer must never receive plaintext keys (get_config masks for
     // the same reason) — mask the RETURN copy only; the persisted config
     // keeps the real values, sealed

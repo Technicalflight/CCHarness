@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     OpenaiCompatible,
@@ -18,17 +18,67 @@ pub enum ProviderKind {
     Anthropic,
 }
 
+impl ProviderKind {
+    /// Tolerant decode for config files written by NEWER builds: an
+    /// unknown variant degrades to the OpenAI-compatible default instead
+    /// of failing the whole AppConfig (which would blank the entire
+    /// provider list after a downgrade).
+    pub fn from_config_str(s: &str) -> Option<Self> {
+        Self::iter_names()
+            .into_iter()
+            .find(|(_, name)| *name == s)
+            .map(|(kind, _)| kind)
+    }
+
+    fn iter_names() -> [(ProviderKind, &'static str); 4] {
+        [
+            (ProviderKind::OpenaiCompatible, "openai_compatible"),
+            (ProviderKind::OpenaiResponses, "openai_responses"),
+            (ProviderKind::AzureResponses, "azure_responses"),
+            (ProviderKind::Anthropic, "anthropic"),
+        ]
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match Self::from_config_str(&s) {
+            Some(kind) => Ok(kind),
+            None => {
+                eprintln!("[config] 未知 provider kind \"{s}\"，按 openai_compatible 处理（可能来自更新版本）");
+                Ok(ProviderKind::OpenaiCompatible)
+            }
+        }
+    }
+}
+
 /// Cache TTL tier (pi retention alignment): Long keeps cached prefixes
 /// alive for the extended window (Anthropic 1h via `ttl:"1h"`, OpenAI 24h
 /// via `prompt_cache_retention`), Short is the protocol default window
 /// (Anthropic 5m ephemeral, OpenAI ~5-10min), None sends no cache marks at
 /// all (no prompt_cache_key / cache_control — safest for strict gateways).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheTier {
     Short,
     Long,
     None,
+}
+
+impl<'de> Deserialize<'de> for CacheTier {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "short" => Ok(CacheTier::Short),
+            "long" => Ok(CacheTier::Long),
+            "none" => Ok(CacheTier::None),
+            other => {
+                eprintln!("[config] 未知 cache tier \"{other}\"，按 short 处理（可能来自更新版本）");
+                Ok(CacheTier::Short)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -856,14 +906,14 @@ pub fn load(data_dir: &Path) -> AppConfig {
                 eprintln!("[config] parse failed ({e}); writing .broken backup and using defaults");
                 let _ = fs::copy(&path, data_dir.join("config.json.broken"));
                 let cfg = AppConfig::default();
-                save(data_dir, &cfg);
+                let _ = save(data_dir, &cfg);
                 cfg
             }
         },
         // a genuinely missing file = first launch: write the default config
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let cfg = AppConfig::default();
-            save(data_dir, &cfg);
+            let _ = save(data_dir, &cfg);
             cfg
         }
         // ANY other read error (antivirus / sync tool briefly locking the
@@ -902,7 +952,7 @@ pub fn load(data_dir: &Path) -> AppConfig {
     cfg
 }
 
-pub fn save(data_dir: &Path, cfg: &AppConfig) {
+pub fn save(data_dir: &Path, cfg: &AppConfig) -> Result<(), String> {
     let _ = fs::create_dir_all(data_dir);
     // seal API keys before they touch the disk
     let mut out = cfg.clone();
@@ -913,21 +963,41 @@ pub fn save(data_dir: &Path, cfg: &AppConfig) {
     for m in &mut out.mcp_servers {
         m.seal_credentials();
     }
-    // atomic-ish: write temp then rename
+    // atomic-ish: write temp then rename. The rename retries: on Windows a
+    // brief AV/sync-tool lock on config.json used to make it fail silently,
+    // leaving the user's save quietly rolled back after the next restart.
     let path = config_path(data_dir);
     let tmp = data_dir.join("config.json.tmp");
-    if let Ok(body) = serde_json::to_string_pretty(&out) {
-        if fs::write(&tmp, body).is_ok() {
-            let _ = fs::rename(&tmp, &path);
-            // the file holds sealed (and worst-case plaintext) API keys —
-            // never world-readable on unix
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    let body = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
+    fs::write(&tmp, body).map_err(|e| format!("config 写入失败: {e}"))?;
+    let mut err: Option<std::io::Error> = None;
+    for attempt in 0..4u32 {
+        match fs::rename(&tmp, &path) {
+            Ok(()) => {
+                // the file holds sealed (and worst-case plaintext) API keys —
+                // never world-readable on unix
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                err = Some(e);
+                if attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        10 * (attempt as u64 + 1),
+                    ));
+                }
             }
         }
     }
+    let _ = fs::remove_file(&tmp);
+    Err(format!(
+        "config 提交失败: {}",
+        err.unwrap_or_else(|| std::io::Error::other("rename"))
+    ))
 }
 
 #[cfg(test)]
@@ -967,7 +1037,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let mut cfg = AppConfig::default();
         cfg.settings.embeddings_key = "ek-plain-98765".into();
-        save(&dir, &cfg);
+        save(&dir, &cfg).unwrap();
         let raw = fs::read_to_string(dir.join("config.json")).unwrap();
         assert!(!raw.contains("ek-plain-98765"), "embeddings key stored in plaintext");
         let loaded = load(&dir);
