@@ -27,6 +27,8 @@
   --bad: #ef5f6b;
   --bad-soft: rgba(239, 95, 107, 0.12);
   --violet: #a78bfa;
+  --violet-soft: rgba(167, 139, 250, 0.12);
+  --on-accent: #ffffff;
   --shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
   --shadow-sm: 0 2px 12px rgba(0, 0, 0, 0.32);
   --r-sm: 8px;
@@ -57,6 +59,8 @@
   --bad: #d64a4a;
   --bad-soft: rgba(214, 74, 74, 0.1);
   --violet: #7c5cf0;
+  --violet-soft: rgba(124, 92, 240, 0.1);
+  --on-accent: #ffffff;
   --shadow: 0 16px 48px rgba(20, 20, 18, 0.16);
   --shadow-sm: 0 2px 12px rgba(20, 20, 18, 0.06);
 }
@@ -264,11 +268,8 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
   color: var(--text);
 }
 .tb-btn.close:hover {
-  background: #e81123;
-  color: #fff;
-}
-[data-theme="light"] .tb-btn.close:hover {
-  background: #d64a4a;
+  background: var(--bad);
+  color: var(--on-accent);
 }
 
 /* ---------- sidebar ---------- */
@@ -896,7 +897,7 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
   transition: opacity 0.12s, background 0.12s;
 }
 .send-btn:hover { opacity: 0.86; }
-.send-btn.stop { background: var(--bad); color: #fff; }
+.send-btn.stop { background: var(--bad); color: var(--on-accent); }
 .send-btn svg { width: 16px; height: 16px; }
 
 /* model picker */
@@ -1550,7 +1551,7 @@ table.data.wrap th:last-child {
 .enh-btn.primary {
   background: var(--violet);
   border: 1px solid var(--violet);
-  color: #fff;
+  color: var(--on-accent);
 }
 .enh-btn.primary:hover { filter: brightness(1.1); }
 
@@ -1626,7 +1627,7 @@ table.data.wrap th:last-child {
 .goal-summary .gs-label { font-weight: 650; color: var(--text); white-space: nowrap; }
 .goal-summary.done .gs-label { color: var(--good); }
 .goal-summary .gs-budget { font-family: var(--mono, monospace); white-space: nowrap; }
-.goal-summary .gs-budget.over { color: var(--warn, #d97706); }
+.goal-summary .gs-budget.over { color: var(--warn); }
 .goal-summary .gs-flag {
   padding: 1px 8px;
   border-radius: 999px;
@@ -1636,9 +1637,9 @@ table.data.wrap th:last-child {
   white-space: nowrap;
 }
 /* goal state-machine states (persisted; user-only pause/resume/clear) */
-.goal-summary.paused .gs-label { color: var(--warn, #d97706); }
-.goal-summary.failed .gs-label { color: var(--bad, #dc2626); }
-.goal-summary.budget .gs-label { color: var(--warn, #d97706); }
+.goal-summary.paused .gs-label { color: var(--warn); }
+.goal-summary.failed .gs-label { color: var(--bad); }
+.goal-summary.budget .gs-label { color: var(--warn); }
 .goal-summary .gs-actions { display: inline-flex; gap: 6px; align-items: center; }
 /* goal iteration timeline (ZCode parity): popover under the summary bar */
 .goal-summary { position: relative; flex-wrap: wrap; }
@@ -1848,11 +1849,11 @@ table.data.wrap th:last-child {
   font-variant-numeric: tabular-nums;
 }
 .changes-chip .ch-add {
-  color: var(--good, #3fb27f);
+  color: var(--good);
   font-weight: 600;
 }
 .changes-chip .ch-del {
-  color: var(--bad, #e05666);
+  color: var(--bad);
   font-weight: 600;
 }
 
@@ -3303,9 +3304,9 @@ kbd {
 }
 /* sandbox capsule: danger accent while active — it changes tool policy */
 .sandbox-pill.on {
-  color: var(--bad, #e05666);
-  border-color: var(--bad, #e05666);
-  background: color-mix(in srgb, var(--bad, #e05666) 12%, transparent);
+  color: var(--bad);
+  border-color: var(--bad);
+  background: var(--bad-soft);
 }
 .wf-btn {
   display: inline-flex;
@@ -3489,15 +3490,15 @@ kbd {
   user-select: text;
 }
 .wt-diff-body .dl-add {
-  color: #2f9e44;
-  background: rgba(47, 158, 68, 0.1);
+  color: var(--good);
+  background: var(--good-soft);
 }
 .wt-diff-body .dl-del {
-  color: #e03131;
-  background: rgba(224, 49, 49, 0.1);
+  color: var(--bad);
+  background: var(--bad-soft);
 }
 .wt-diff-body .dl-hunk {
-  color: #7f77dd;
+  color: var(--violet);
 }
 
 /* ---------- git tab (right panel) ---------- */
@@ -3616,12 +3617,12 @@ kbd {
   font-weight: 700;
   font-family: ui-monospace, Consolas, monospace;
 }
-.git-lt.lt-m { color: #b8860b; background: rgba(184, 134, 11, 0.14); }
-.git-lt.lt-a { color: #2f9e44; background: rgba(47, 158, 68, 0.14); }
-.git-lt.lt-d { color: #e03131; background: rgba(224, 49, 49, 0.14); }
+.git-lt.lt-m { color: var(--warn); background: var(--warn-soft); }
+.git-lt.lt-a { color: var(--good); background: var(--good-soft); }
+.git-lt.lt-d { color: var(--bad); background: var(--bad-soft); }
 .git-lt.lt-q { color: var(--text-faint); background: var(--bg-hover); }
-.git-lt.lt-r { color: #7f77dd; background: rgba(127, 119, 221, 0.16); }
-.git-lt.lt-u { color: #e8590c; background: rgba(232, 89, 12, 0.14); }
+.git-lt.lt-r { color: var(--violet); background: var(--violet-soft); }
+.git-lt.lt-u { color: var(--bad); background: var(--bad-soft); }
 .git-row-actions { display: none; align-items: center; gap: 2px; }
 .git-row:hover .git-row-actions { display: inline-flex; }
 .git-mini { width: 22px; height: 22px; }
@@ -3664,7 +3665,7 @@ kbd {
   border-radius: 8px;
   border: none;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
@@ -3714,9 +3715,9 @@ kbd {
   white-space: pre;
   user-select: text;
 }
-.git-diff-body .dl-add { color: #2f9e44; background: rgba(47, 158, 68, 0.1); }
-.git-diff-body .dl-del { color: #e03131; background: rgba(224, 49, 49, 0.1); }
-.git-diff-body .dl-hunk { color: #7f77dd; }
+.git-diff-body .dl-add { color: var(--good); background: var(--good-soft); }
+.git-diff-body .dl-del { color: var(--bad); background: var(--bad-soft); }
+.git-diff-body .dl-hunk { color: var(--violet); }
 
 /* git tab: remote repositories */
 .git-remotes { border-bottom: 1px solid var(--border); }
@@ -3945,8 +3946,8 @@ kbd {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--accent, #4a9eff);
-  box-shadow: 0 0 6px var(--accent, #4a9eff);
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
   animation: upd-pulse 2s ease-in-out infinite;
 }
 @keyframes upd-pulse {
