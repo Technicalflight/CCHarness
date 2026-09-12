@@ -672,6 +672,9 @@ export function Composer({
               value={hashMenu.q}
               onChange={(e) => setHashMenu((s) => (s ? { ...s, q: e.target.value } : s))}
               onKeyDown={(e) => {
+                // IME 组合中（拼音候选窗）：按键属于输入法，Enter 确认
+                // 候选词不应被当成搜索确认
+                if (e.nativeEvent.isComposing) return;
                 if (e.key === "Escape") {
                   e.preventDefault();
                   setHashMenu(null);
@@ -742,6 +745,9 @@ export function Composer({
             }
           }}
           onKeyDown={(e) => {
+            // IME 组合中：Enter 确认候选词、方向键选词都不应触发发送或
+            // 移动菜单高亮 —— 下面的三个 Enter 分支被一次性挡住
+            if (e.nativeEvent.isComposing) return;
             if (hashMenu && e.key === "Escape") {
               setHashMenu(null);
               return;

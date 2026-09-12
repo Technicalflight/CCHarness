@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, Fragment } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, Fragment, memo, useMemo } from "react";
 import { useApp } from "../store";
 import { Markdown } from "../components/Markdown";
 import { Composer, ModelPicker } from "../components/Composer";
@@ -62,7 +62,14 @@ function RecordImages({ sessionId, images }: { sessionId: string; images?: strin
   );
 }
 
-function UserItem({
+/** 空数组常量：msgs 在无会话/未加载时保持稳定引用，让下面的 useMemo
+ *  与 memo 组件的比较真正生效。 */
+const EMPTY_MSGS: MessageRecord[] = [];
+
+/** memo：流式 delta 期间 msgs 引用不变 → 记录对象引用不变 → 整条用户
+ *  消息跳过重渲染；闭包 props（onResend 等）每轮新建，比较时跳过 ——
+ *  记录相同则闭包捕获的数据相同，行为不变 */
+const UserItem = memo(function UserItem({
   m,
   sessionId,
   busy,
@@ -177,7 +184,11 @@ function UserItem({
       </div>
     </div>
   );
-}
+}, (a, b) =>
+  a.m === b.m &&
+  a.sessionId === b.sessionId &&
+  a.busy === b.busy &&
+  a.editing === b.editing);
 
 function HitChip({ cached, input }: { cached: number | null; input: number | null }) {
   if (cached == null || input == null || input === 0) return null;
@@ -400,7 +411,10 @@ function GoalSummaryBar({
   );
 }
 
-function AssistantGroup({
+/** memo：流式期间 items/toolIndex 是 memoized 稳定引用 → 历史回复组
+ *  （含 Markdown 重解析，最重的开销）完全不重渲染；planActions/onBranch
+ *  闭包每轮新建，只比较「有没有」 —— 记录相同则行为相同 */
+const AssistantGroup = memo(function AssistantGroup({
   records,
   toolIndex,
   planActions,
@@ -499,7 +513,12 @@ function AssistantGroup({
       </div>
     </div>
   );
-}
+}, (a, b) =>
+  a.records === b.records &&
+  a.toolIndex === b.toolIndex &&
+  a.showGoal === b.showGoal &&
+  (a.planActions == null) === (b.planActions == null) &&
+  (a.onBranch == null) === (b.onBranch == null));
 
 /** tool_call_id → result text lookup built once per transcript render. */
 function buildToolResultIndex(msgs: MessageRecord[]): Map<string, string> {
@@ -545,27 +564,27 @@ const WF_ICON: Record<string, IconName> = {
 };
 
 export function ChatView() {
-  const {
-    activeSessionId,
-    sessions,
-    messages,
-    streaming,
-    busy,
-    queue,
-    send,
-    stop,
-    updateBindings,
-    setWorkspace,
-    ensureFreshMessages,
-    newSession,
-    setView,
-    toast,
-    lastRequest,
-    refreshSessions,
-    selectSession,
-    config,
-    persistConfig,
-  } = useApp();
+  // 逐字段订阅（F2）：useApp() 整店解构会让任何 store 变化 —— 包括每秒
+  // 多次的流式 delta —— 都重渲染整个视图树
+  const activeSessionId = useApp((s) => s.activeSessionId);
+  const sessions = useApp((s) => s.sessions);
+  const messages = useApp((s) => s.messages);
+  const streaming = useApp((s) => s.streaming);
+  const busy = useApp((s) => s.busy);
+  const queue = useApp((s) => s.queue);
+  const send = useApp((s) => s.send);
+  const stop = useApp((s) => s.stop);
+  const updateBindings = useApp((s) => s.updateBindings);
+  const setWorkspace = useApp((s) => s.setWorkspace);
+  const ensureFreshMessages = useApp((s) => s.ensureFreshMessages);
+  const newSession = useApp((s) => s.newSession);
+  const setView = useApp((s) => s.setView);
+  const toast = useApp((s) => s.toast);
+  const lastRequest = useApp((s) => s.lastRequest);
+  const refreshSessions = useApp((s) => s.refreshSessions);
+  const selectSession = useApp((s) => s.selectSession);
+  const config = useApp((s) => s.config);
+  const persistConfig = useApp((s) => s.persistConfig);
 
   const [editingMsg, setEditingMsg] = useState<string | null>(null);
   const [compaction, setCompaction] = useState<CompactionInfo | null>(null);
@@ -609,7 +628,7 @@ export function ChatView() {
   // backend and is loaded by the effect below) — drives the image-mode
   // composer treatment in the chat view
   const isImageSession = wfMode === "image";
-  const msgs = activeSessionId ? messages[activeSessionId] ?? [] : [];
+  const msgs = (activeSessionId ? messages[activeSessionId] : undefined) ?? EMPTY_MSGS;
   const lane0 = streaming[activeSessionId ?? ""]?.find((l) => l.lane === 0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -1166,8 +1185,10 @@ export function ChatView() {
 
   const binding = meta.bindings[0];
   const hit = lastRequest[meta.id];
-  const toolIndex = buildToolResultIndex(msgs);
-  const items = groupTranscript(msgs);
+  // msgs 引用在流式期间不变 → 分组与工具索引不重建 → 配合 memo 化的
+  // AssistantGroup / UserItem，历史消息在 delta 期间零重渲染
+  const toolIndex = useMemo(() => buildToolResultIndex(msgs), [msgs]);
+  const items = useMemo(() => groupTranscript(msgs), [msgs]);
   // goal summary inputs: session cost + persisted goal snapshot
   const goalCost = aggregateCost(msgs.filter((m) => m.role === "assistant"));
   const refreshGoalNow = () => refreshGoal(meta.id);

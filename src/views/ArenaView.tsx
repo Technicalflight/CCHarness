@@ -29,17 +29,29 @@ function loadModerated(): boolean {
   }
 }
 
-function laneLastUsage(msgs: MessageRecord[], lane: number) {
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const m = msgs[i];
-    if (m.lane === lane && m.role === "assistant" && m.usage) return m.usage;
-  }
-  return null;
+/** 泳道的历史记录。lane 号是「发送时绑定的下标」，删除/重排泳道后
+ *  数字移位，按当前下标匹配会把历史答复挂到别的模型头上 —— 记录自带
+ *  模型名，优先按模型身份匹配；模型已不在任何泳道（被换掉）时退回
+ *  下标匹配，让旧记录仍显示在该泳道里。 */
+function laneHistory(msgs: MessageRecord[], model: string, lane: number) {
+  const byModel = msgs.filter((m) => m.role !== "user" && m.model === model);
+  if (byModel.length > 0) return byModel;
+  return msgs.filter((m) => m.lane === lane && m.role !== "user");
 }
 
 export function ArenaView() {
-  const { activeSessionId, sessions, messages, streaming, busy, sendArena, sendGroup, stop, updateBindings, newSession, setView } =
-    useApp();
+  // 逐字段订阅：整店解构会让任何状态变化（含流式 delta）重渲染全视图
+  const activeSessionId = useApp((s) => s.activeSessionId);
+  const sessions = useApp((s) => s.sessions);
+  const messages = useApp((s) => s.messages);
+  const streaming = useApp((s) => s.streaming);
+  const busy = useApp((s) => s.busy);
+  const sendArena = useApp((s) => s.sendArena);
+  const sendGroup = useApp((s) => s.sendGroup);
+  const stop = useApp((s) => s.stop);
+  const updateBindings = useApp((s) => s.updateBindings);
+  const newSession = useApp((s) => s.newSession);
+  const setView = useApp((s) => s.setView);
   const [mode, setMode] = useState<ArenaMode>(loadMode);
   const [moderated, setModerated] = useState<boolean>(loadModerated);
 
@@ -155,10 +167,13 @@ export function ArenaView() {
           </div>
         )}
         {lanes.map((b, i) => {
-          const laneMsgs = msgs.filter((m) => m.lane === i && m.role !== "user");
+          // 流事件按当前下标匹配是对的（本次发送用的就是当前顺序）；
+          // 历史记录必须走 laneHistory 的模型身份匹配（F3）
+          const laneMsgs = laneHistory(msgs, b.model, i);
           const liveLane = live.find((l) => l.lane === i);
-          const usage = laneLastUsage(msgs, i);
-          const confidence = [...msgs].reverse().find((m) => m.lane === i && m.role === "assistant")?.confidence ?? null;
+          const usage = [...laneMsgs].reverse().find((m) => m.usage)?.usage ?? null;
+          const confidence =
+            [...laneMsgs].reverse().find((m) => m.confidence != null)?.confidence ?? null;
           return (
             <div className="lane" key={`${b.provider_id}:${b.model}`}>
               <div className="lane-head">

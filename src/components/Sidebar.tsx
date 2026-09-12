@@ -118,24 +118,23 @@ function SessionRow({
 }
 
 export function Sidebar() {
-  const {
-    view,
-    setView,
-    openChatHome,
-    sessions,
-    activeSessionId,
-    selectSession,
-    deleteSession,
-    newSession,
-    refreshSessions,
-    lastRequest,
-    config,
-    updateInfo,
-    updateChecking,
-    updateDialogOpen,
-    runUpdateCheck,
-    setUpdateDialogOpen,
-  } = useApp();
+  // 逐字段订阅：整店解构会让任何状态变化（含流式 delta）重渲染会话列表
+  const view = useApp((s) => s.view);
+  const setView = useApp((s) => s.setView);
+  const openChatHome = useApp((s) => s.openChatHome);
+  const sessions = useApp((s) => s.sessions);
+  const activeSessionId = useApp((s) => s.activeSessionId);
+  const selectSession = useApp((s) => s.selectSession);
+  const deleteSession = useApp((s) => s.deleteSession);
+  const newSession = useApp((s) => s.newSession);
+  const refreshSessions = useApp((s) => s.refreshSessions);
+  const lastRequest = useApp((s) => s.lastRequest);
+  const config = useApp((s) => s.config);
+  const updateInfo = useApp((s) => s.updateInfo);
+  const updateChecking = useApp((s) => s.updateChecking);
+  const updateDialogOpen = useApp((s) => s.updateDialogOpen);
+  const runUpdateCheck = useApp((s) => s.runUpdateCheck);
+  const setUpdateDialogOpen = useApp((s) => s.setUpdateDialogOpen);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   // auto-dismiss timer for the armed delete confirm; cleared on unmount so
   // a pending timeout can never fire after the sidebar goes away

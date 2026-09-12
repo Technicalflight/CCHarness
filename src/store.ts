@@ -164,6 +164,11 @@ const WRITE_TOOLS = new Set([
   "run_command",
 ]);
 
+/** Approval cards live client-side until answered; the backend silently
+ *  denies after 120s without broadcasting a removal — expire them here a
+ *  bit later (6s grace for timer skew between backend and card render). */
+const APPROVAL_TTL_MS = 126_000;
+
 // Shared streaming-event reducer for both chat and arena sends.
 function makeEventHandler(
   get: () => AppState,
@@ -279,6 +284,17 @@ function makeEventHandler(
           },
         },
       }));
+      // 幽灵卡片治理：后端超时拒绝是静默的，卡片若只靠用户点击清理
+      // 会永久滞留 —— 本地到点兜底摘除（已应答的 id 不存在，直接跳过）
+      const aid = ev.approval_id;
+      setTimeout(() => {
+        set((s) => {
+          if (!(aid in s.approvals)) return {};
+          const approvals = { ...s.approvals };
+          delete approvals[aid];
+          return { approvals };
+        });
+      }, APPROVAL_TTL_MS);
     } else if (ev.type === "error") {
       get().toast("error", ev.message);
     }
@@ -493,8 +509,13 @@ export const useApp = create<AppState>((set, get) => ({
       delete messages[id];
       const todos = { ...s.todos };
       delete todos[id];
+      // 会话没了，挂着写入审批卡没有任何意义 —— 一并清掉
+      const approvals: Record<string, PendingApproval> = {};
+      for (const [k, v] of Object.entries(s.approvals)) {
+        if (v.sessionId !== id) approvals[k] = v;
+      }
       const activeSessionId = s.activeSessionId === id ? null : s.activeSessionId;
-      return { messages, todos, activeSessionId };
+      return { messages, todos, approvals, activeSessionId };
     });
     await get().refreshSessions();
   },
@@ -621,7 +642,19 @@ export const useApp = create<AppState>((set, get) => ({
       await api.stopGeneration(sessionId);
     } catch (e) {
       get().toast("error", `停止失败: ${String(e)}`);
+      return;
     }
+    // 中止后该会话的审批等待者已随 lane 任务一起取消 —— 卡片立即摘除，
+    // 不必等 TTL 到点；停止失败则不动卡片（turn 还在跑，审批仍有效）
+    set((s) => {
+      const approvals: Record<string, PendingApproval> = {};
+      let hit = false;
+      for (const [k, v] of Object.entries(s.approvals)) {
+        if (v.sessionId === sessionId) hit = true;
+        else approvals[k] = v;
+      }
+      return hit ? { approvals } : {};
+    });
   },
 
   persistConfig: async (config) => {
