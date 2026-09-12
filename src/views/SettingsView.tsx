@@ -1,11 +1,46 @@
 // App settings: theme, keybindings, system prompt.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useApp } from "../store";
 import { Dropdown } from "../components/Dropdown";
 import { PolicyDialog, PrivacyLogDialog } from "../components/PolicyDialog";
 import type { ImportCandidate, SkillInfo } from "../types";
 import * as api from "../lib/api";
 import { Icon } from "../lib/icons";
+
+/** Debounced text field for long settings (URLs, keys, prompts, pattern
+ * lists). update() persists the WHOLE config on every change — per-keystroke
+ * persistence meant an IPC + disk write + full-store re-render per character,
+ * and a failed persist snapped the controlled value back mid-typing. The
+ * draft edits locally and commits after 600ms idle or on blur. */
+function useDebouncedText(value: string, onCommit: (v: string) => void) {
+  const [draft, setDraft] = useState(value);
+  const dirtyRef = useRef(false);
+  const timerRef = useRef<number | null>(null);
+  const commitRef = useRef(onCommit);
+  commitRef.current = onCommit;
+  // follow external changes while the user is not editing
+  useEffect(() => {
+    if (!dirtyRef.current) setDraft(value);
+  }, [value]);
+  const onChange = (v: string) => {
+    setDraft(v);
+    dirtyRef.current = true;
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(() => {
+      dirtyRef.current = false;
+      timerRef.current = null;
+      commitRef.current(v);
+    }, 600);
+  };
+  const onBlur = () => {
+    if (!dirtyRef.current) return;
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    timerRef.current = null;
+    dirtyRef.current = false;
+    commitRef.current(draft);
+  };
+  return { value: draft, onChange, onBlur };
+}
 
 const IMPORT_SOURCES = [
   { value: "claude-code", label: "Claude Code" },
@@ -42,6 +77,25 @@ export function SettingsView() {
   const update = (patch: Partial<typeof config.settings>) => {
     void persistConfig({ ...config, settings: { ...config.settings, ...patch } });
   };
+
+  // long-text settings persist on a debounce instead of per keystroke
+  const sysPrompt = useDebouncedText(config.settings.system_prompt, (v) => update({ system_prompt: v }));
+  const embUrl = useDebouncedText(config.settings.embeddings_url ?? "", (v) => update({ embeddings_url: v }));
+  const embModel = useDebouncedText(config.settings.embeddings_model ?? "", (v) => update({ embeddings_model: v }));
+  const embKey = useDebouncedText(config.settings.embeddings_key ?? "", (v) => update({ embeddings_key: v }));
+  const postWrite = useDebouncedText(config.settings.post_write_command ?? "", (v) =>
+    update({ post_write_command: v.trim() === "" ? null : v })
+  );
+  const guardExtra = useDebouncedText((config.settings.guardrails_extra ?? []).join("\n"), (v) =>
+    update({
+      guardrails_extra: v.split("\n").map((l) => l.trim()).filter((l) => l.length > 0),
+    })
+  );
+  const privPatterns = useDebouncedText((config.settings.privacy_custom_patterns ?? []).join("\n"), (v) =>
+    update({
+      privacy_custom_patterns: v.split("\n").map((l) => l.trim()).filter((l) => l.length > 0),
+    })
+  );
 
   const scanImport = async () => {
     setImpScanning(true);
@@ -241,9 +295,10 @@ export function SettingsView() {
               <input
                 className="input mono"
                 style={{ display: "block", marginTop: 4, width: "100%" }}
-                value={config.settings.embeddings_url ?? ""}
+                value={embUrl.value}
                 placeholder="https://api.openai.com/v1/embeddings"
-                onChange={(e) => update({ embeddings_url: e.target.value })}
+                onChange={(e) => embUrl.onChange(e.target.value)}
+                onBlur={embUrl.onBlur}
               />
             </label>
             <label style={{ fontSize: 12, color: "var(--text-dim)", minWidth: 200 }}>
@@ -251,9 +306,10 @@ export function SettingsView() {
               <input
                 className="input mono"
                 style={{ display: "block", marginTop: 4, width: "100%" }}
-                value={config.settings.embeddings_model ?? ""}
+                value={embModel.value}
                 placeholder="text-embedding-3-small"
-                onChange={(e) => update({ embeddings_model: e.target.value })}
+                onChange={(e) => embModel.onChange(e.target.value)}
+                onBlur={embModel.onBlur}
               />
             </label>
           </div>
@@ -263,9 +319,10 @@ export function SettingsView() {
               className="input mono"
               type="password"
               style={{ display: "block", marginTop: 4, width: 320 }}
-              value={config.settings.embeddings_key ?? ""}
+              value={embKey.value}
               placeholder="sk-…（留空则不带 Authorization 头）"
-              onChange={(e) => update({ embeddings_key: e.target.value })}
+              onChange={(e) => embKey.onChange(e.target.value)}
+              onBlur={embKey.onBlur}
             />
           </label>
           <div className="row" style={{ marginTop: 10, marginBottom: 6 }}>
@@ -301,16 +358,10 @@ export function SettingsView() {
             <textarea
               className="input mono"
               style={{ display: "block", marginTop: 4, width: "100%", minHeight: 56, resize: "vertical" }}
-              value={(config.settings.guardrails_extra ?? []).join("\n")}
+              value={guardExtra.value}
               placeholder={"每行一条，例如：公司内部代号\n泄露即终止"}
-              onChange={(e) =>
-                update({
-                  guardrails_extra: e.target.value
-                    .split("\n")
-                    .map((l) => l.trim())
-                    .filter((l) => l.length > 0),
-                })
-              }
+              onChange={(e) => guardExtra.onChange(e.target.value)}
+              onBlur={guardExtra.onBlur}
             />
           </label>
           <div className="hint" style={{ marginTop: 8 }}>
@@ -482,15 +533,9 @@ export function SettingsView() {
               className="input"
               rows={3}
               placeholder={"张三|李四\n内部项目-[A-Z0-9]+"}
-              value={(config.settings.privacy_custom_patterns ?? []).join("\n")}
-              onChange={(e) =>
-                update({
-                  privacy_custom_patterns: e.target.value
-                    .split("\n")
-                    .map((l) => l.trim())
-                    .filter((l) => l.length > 0),
-                })
-              }
+              value={privPatterns.value}
+              onChange={(e) => privPatterns.onChange(e.target.value)}
+              onBlur={privPatterns.onBlur}
             />
           </label>
           <div className="row" style={{ marginTop: 10, marginBottom: 0 }}>
@@ -541,9 +586,10 @@ export function SettingsView() {
             <input
               className="input mono"
               style={{ display: "block", marginTop: 4, width: "100%" }}
-              value={config.settings.post_write_command ?? ""}
+              value={postWrite.value}
               placeholder="例如：npm run build 或 cargo check（在工作区根目录执行）"
-              onChange={(e) => update({ post_write_command: e.target.value.trim() === "" ? null : e.target.value })}
+              onChange={(e) => postWrite.onChange(e.target.value)}
+              onBlur={postWrite.onBlur}
             />
           </label>
           <div className="hint" style={{ marginTop: 8 }}>
@@ -667,9 +713,10 @@ export function SettingsView() {
           </div>
           <textarea
             style={{ width: "100%", minHeight: 110, resize: "vertical" }}
-            value={config.settings.system_prompt}
-            placeholder="例如：你是一位严谨的编程助手，回答使用中文，代码使用英文……"
-            onChange={(e) => update({ system_prompt: e.target.value })}
+              value={sysPrompt.value}
+              placeholder="例如：你是一位严谨的编程助手，回答使用中文，代码使用英文……"
+              onChange={(e) => sysPrompt.onChange(e.target.value)}
+              onBlur={sysPrompt.onBlur}
           />
         </div>
 

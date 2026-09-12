@@ -181,7 +181,11 @@ const UserItem = memo(function UserItem({
         >
           <Icon name="edit" size={13} /> 编辑重发
         </button>
-        <button title="从此消息分支一个新会话（原会话不动）" onClick={onBranch}>
+        <button
+          title="从此消息分支一个新会话（原会话不动）"
+          disabled={busy}
+          onClick={onBranch}
+        >
           <Icon name="branch" size={13} /> 分支
         </button>
       </div>
@@ -1266,6 +1270,12 @@ export function ChatView() {
   };
 
   const branchFrom = async (fromTs: number) => {
+    // a mid-turn fork reads the session file while the lane writes it —
+    // and the backend branch command does not take the save lock
+    if (busy[meta.id]) {
+      toast("info", "回合进行中无法分支 —— 请先停止或等待完成");
+      return;
+    }
     try {
       const branched = await api.branchSession(meta.id, fromTs);
       await refreshSessions();
@@ -1326,8 +1336,12 @@ export function ChatView() {
         }
         break;
       case "skills": {
-        const skills = await api.getSkills(meta.workspace);
-        toast("info", skills.length ? `可用技能: ${skills.map((s) => "/" + s.name).join("、")}` : "当前没有发现技能");
+        try {
+          const skills = await api.getSkills(meta.workspace);
+          toast("info", skills.length ? `可用技能: ${skills.map((s) => "/" + s.name).join("、")}` : "当前没有发现技能");
+        } catch (e) {
+          toast("error", `读取技能失败: ${String(e)}`);
+        }
         break;
       }
       case "wiki": {
@@ -1421,10 +1435,14 @@ export function ChatView() {
           className="btn small ghost"
           title={`工作区: ${meta.workspace ?? "未绑定"}`}
           onClick={async () => {
-            const dir = await api.pickDirectory("选择工作区目录");
-            if (!dir) return;
-            await setWorkspace(meta.id, dir);
-            toast("success", `已绑定工作区: ${dir}`);
+            try {
+              const dir = await api.pickDirectory("选择工作区目录");
+              if (!dir) return;
+              await setWorkspace(meta.id, dir);
+              toast("success", `已绑定工作区: ${dir}`);
+            } catch (e) {
+              toast("error", `绑定工作区失败: ${String(e)}`);
+            }
           }}
         >
           <Icon name="folder" size={13} /> {meta.workspace ? meta.workspace.split(/[\\/]/).pop() : "绑定工作区"}
@@ -1877,8 +1895,12 @@ export function ChatView() {
         onStop={() => {
           goalStoppedRef.current = true;
           setGoalPaused(true);
-          // persist the pause so it survives restarts (state machine)
-          void api.goalStatus(meta.id, "paused").then(refreshGoalNow).catch(() => {});
+          // persist the pause so it survives restarts (state machine) —
+          // only goal sessions have a goal to pause; other modes would
+          // burn a doomed invoke + save_lock round-trip on every stop
+          if (wfMode === "goal") {
+            void api.goalStatus(meta.id, "paused").then(refreshGoalNow).catch(() => {});
+          }
           void stop(meta.id);
         }}
         sessionId={meta.id}

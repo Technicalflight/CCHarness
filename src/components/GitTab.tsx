@@ -285,16 +285,23 @@ export function GitTab({ workspace, wtActive }: { workspace: string; wtActive: b
     }
   };
 
+  // stale-response guard: fast clicks on A then B must not let A's slow
+  // diff overwrite B's (same pattern as PreviewPanel's navSeq)
+  const diffSeq = useRef(0);
   const openDiff = async (path: string) => {
+    const seq = ++diffSeq.current;
     setDiffPath(path);
     setDiffText("");
     setDiffLoading(true);
     try {
-      setDiffText(await api.gitFileDiff(workspace, path));
+      const text = await api.gitFileDiff(workspace, path);
+      if (seq !== diffSeq.current) return;
+      setDiffText(text);
     } catch (e) {
+      if (seq !== diffSeq.current) return;
       setDiffText(`加载失败: ${String(e)}`);
     } finally {
-      setDiffLoading(false);
+      if (seq === diffSeq.current) setDiffLoading(false);
     }
   };
 

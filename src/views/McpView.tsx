@@ -12,6 +12,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useApp } from "../store";
 import * as api from "../lib/api";
 import { Icon, type IconName } from "../lib/icons";
+import { ConfirmDialog } from "../components/Dialog";
 import type { McpServer, McpStatusEntry } from "../types";
 
 /* ------------------------------------------------------------------ */
@@ -489,6 +490,7 @@ const KIND_ICON: Record<string, IconName> = { stdio: "terminal", http: "globe" }
 
 function ServerCard({
   server,
+  config,
   status,
   testing,
   onTest,
@@ -496,6 +498,8 @@ function ServerCard({
   onDelete,
 }: {
   server: McpServer;
+  /** non-null by the time McpView renders any card (it early-returns otherwise) */
+  config: NonNullable<ReturnType<typeof useApp.getState>["config"]>;
   status: McpStatusEntry | undefined;
   testing: boolean;
   onTest: () => void;
@@ -538,7 +542,12 @@ function ServerCard({
           role="switch"
           aria-checked={server.enabled}
           title={server.enabled ? "点击停用" : "点击启用"}
-          onClick={() => void persistConfig({ ...useApp.getState().config!, mcp_servers: useApp.getState().config!.mcp_servers.map((x) => (x.id === server.id ? { ...x, enabled: !x.enabled } : x)) })}
+          onClick={() =>
+            void persistConfig({
+              ...config,
+              mcp_servers: config.mcp_servers.map((x) => (x.id === server.id ? { ...x, enabled: !x.enabled } : x)),
+            })
+          }
         />
       </div>
       {(server.description || metas.length > 0) && (
@@ -575,6 +584,9 @@ export function McpView() {
   const [testingId, setTestingId] = useState<string | null>(null);
   /** Draft being added/edited in the dialog; null = closed. */
   const [dlg, setDlg] = useState<{ draft: McpServer; isNew: boolean } | null>(null);
+  // delete confirmation: a server's env/headers carry credentials and the
+  // action is instant — it must not be one accidental click away
+  const [confirmDelId, setConfirmDelId] = useState<string | null>(null);
 
   const refresh = () => {
     void api
@@ -663,15 +675,31 @@ export function McpView() {
             <ServerCard
               key={s.id}
               server={s}
+              config={config}
               status={status.find((x) => x.id === s.id)}
               testing={testingId === s.id}
               onTest={() => void test(s)}
               onEdit={() => setDlg({ draft: s, isNew: false })}
-              onDelete={() => void saveAll(config.mcp_servers.filter((x) => x.id !== s.id))}
+              onDelete={() => setConfirmDelId(s.id)}
             />
           ))}
         </div>
       </div>
+      {confirmDelId && (
+        <ConfirmDialog
+          title="删除 MCP 服务"
+          description={`确定删除「${
+            config.mcp_servers.find((x) => x.id === confirmDelId)?.name || confirmDelId
+          }」？其环境变量与请求头配置会一并移除。`}
+          confirmText="删除"
+          danger
+          onConfirm={() => {
+            void saveAll(config.mcp_servers.filter((x) => x.id !== confirmDelId));
+            setConfirmDelId(null);
+          }}
+          onCancel={() => setConfirmDelId(null)}
+        />
+      )}
     </>
   );
 }

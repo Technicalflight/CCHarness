@@ -280,13 +280,21 @@ export function Composer({
     if (skillsCache.current.has(key)) {
       build(skillsCache.current.get(key)!);
     } else {
+      // cancelled guard: without it a slow fetch landing after a
+      // session/workspace switch builds THIS session's menu from the OLD
+      // workspace's skills
+      let cancelled = false;
       void api
         .getSkills(workspace ?? null)
         .then((skills) => {
+          if (cancelled) return;
           skillsCache.current.set(key, skills);
           if (text.startsWith("/")) build(skills);
         })
         .catch(() => skillsCache.current.set(key, []));
+      return () => {
+        cancelled = true;
+      };
     }
   }, [text, workspace, onCommand]);
 
@@ -393,14 +401,29 @@ export function Composer({
     });
   };
 
-  // expand @path references into quoted blocks (max 5, failures stay as-is)
+  // expand @path references into quoted blocks (max 5, failures stay as-is).
+  // Caps matter here: the expanded text goes into the message body AND the
+  // cached prefix — a few 256KB reads would blow the context silently.
   const expandAtRefs = async (t: string): Promise<string> => {
     if (!workspace) return t;
+    const AT_FILE_CAP = 64 * 1024;
+    const AT_TOTAL_CAP = 200 * 1024;
     const tokens = [...new Set([...t.matchAll(/@([^\s@\\][^\s@]*)/g)].map((m) => m[1]))].slice(0, 5);
     let out = t;
+    let total = 0;
     for (const p of tokens) {
       try {
-        const content = await api.readWorkspaceFile(workspace, p);
+        let content = await api.readWorkspaceFile(workspace, p);
+        if (content.length > AT_FILE_CAP) {
+          content =
+            content.slice(0, AT_FILE_CAP) +
+            "\n…[引用文件过大已截断 —— 请改用附件或分次读取]";
+        }
+        if (total + content.length > AT_TOTAL_CAP) {
+          out += `\n\n---\n📎 引用文件 @${p} 已跳过 —— 引用总量超过 200KB，请改用附件`;
+          break;
+        }
+        total += content.length;
         out += `\n\n---\n📎 引用文件 @${p}\n\`\`\`\n${content}\n\`\`\``;
       } catch {
         /* not a readable workspace file — leave the token untouched */
@@ -451,8 +474,19 @@ export function Composer({
   };
 
   const setPerm = (mode: string) => {
+    const prev = permMode;
     setPermMode(mode);
-    if (sessionId) void api.setPermissionMode(sessionId, mode);
+    if (sessionId) {
+      // the local flag flips optimistically — a rejected invoke (session
+      // deleted, backend validation) must roll it back instead of leaving
+      // the UI on a mode the backend never accepted
+      api
+        .setPermissionMode(sessionId, mode)
+        .catch((e) => {
+          setPermMode(prev);
+          toast("error", `权限档位同步失败: ${String(e)}`);
+        });
+    }
     onPermChange?.(mode);
     const labels: Record<string, string> = {
       readonly: "只读——写工具已从工具面移除",
@@ -499,7 +533,9 @@ export function Composer({
         .filter((s) => s.kind === "chat" && !s.archived)
         .sort((a, b) => b.updated_at - a.updated_at)
         .slice(0, 40);
-      setHashMenu({ sessions, q: "", loading: false });
+      // land only while the menu is still in its loading state — an Esc
+      // during the fetch must not resurrect the closed menu
+      setHashMenu((cur) => (cur?.loading ? { sessions, q: "", loading: false } : cur));
     } catch (e) {
       setHashMenu(null);
       toast("error", `读取会话列表失败: ${String(e)}`);
@@ -560,6 +596,22 @@ export function Composer({
     }
   };
 
+  // splice the chosen @ref using LIVE offsets: the menu's start/end were
+  // snapshotted when the search fired, but the user may have kept typing —
+  // splicing the stale offsets truncates or duplicates text. Recomputing
+  // from the current text matches the trailing "@token" the user sees.
+  const spliceAtRef = (path: string) => {
+    const m = /(^|\s)@([^\s@]*)$/.exec(text);
+    if (!m) {
+      setAtMenu(null);
+      return;
+    }
+    const start = m.index + m[1].length;
+    const end = start + 1 + m[2].length;
+    setText((cur) => cur.slice(0, start) + "@" + path + " " + cur.slice(end));
+    setAtMenu(null);
+  };
+
   return (
     <div className="composer-wrap">
       <div className={`composer${imageMode ? " image-mode" : ""}`}>
@@ -573,10 +625,7 @@ export function Composer({
                 className={`slash-item ${i === atMenu.hl ? "hl" : ""}`}
                 onMouseEnter={() => setAtMenu((s) => (s ? { ...s, hl: i } : s))}
                 onMouseDown={(e) => e.preventDefault()}
-                onClick={() => {
-                  setText((cur) => cur.slice(0, atMenu.start) + "@" + p + " " + cur.slice(atMenu.end));
-                  setAtMenu(null);
-                }}
+                onClick={() => spliceAtRef(p)}
               >
                 <span className="mono slash-name"><Icon name="folder" size={13} /> {p}</span>
               </button>
@@ -797,9 +846,7 @@ export function Composer({
               }
               if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
                 e.preventDefault();
-                const path = atMenu.items[Math.min(atMenu.hl, atMenu.items.length - 1)];
-                setText((cur) => cur.slice(0, atMenu.start) + "@" + path + " " + cur.slice(atMenu.end));
-                setAtMenu(null);
+                spliceAtRef(atMenu.items[Math.min(atMenu.hl, atMenu.items.length - 1)]);
                 return;
               }
               if (e.key === "Escape") {

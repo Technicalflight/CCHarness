@@ -513,7 +513,14 @@ export const useApp = create<AppState>((set, get) => ({
         /* already stopped */
       }
     }
-    await api.deleteSession(id);
+    try {
+      await api.deleteSession(id);
+    } catch (e) {
+      // callers fire-and-forget this action (Sidebar onConfirmDel) — an
+      // unhandled rejection would leave the row in place with no feedback
+      get().toast("error", `删除会话失败: ${String(e)}`);
+      return;
+    }
     set((s) => {
       const messages = { ...s.messages };
       delete messages[id];
@@ -586,8 +593,12 @@ export const useApp = create<AppState>((set, get) => ({
         delete streaming[sessionId];
         return { busy: { ...s.busy, [sessionId]: false }, streaming };
       });
-      await get().ensureFreshMessages(sessionId);
-      await get().refreshSessions();
+      // the session may have been deleted while the turn ran — refreshing
+      // a dead session only produces a confusing "消息加载失败" toast
+      if (get().sessions.some((m) => m.id === sessionId)) {
+        await get().ensureFreshMessages(sessionId);
+        await get().refreshSessions();
+      }
       // long turns that finished out of sight get a system notification
       if (Date.now() - startedAt > 5000 && get().config?.settings.notify_done !== false) {
         const title = get().sessions.find((m) => m.id === sessionId)?.title || "会话";

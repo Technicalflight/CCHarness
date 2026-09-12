@@ -1,7 +1,7 @@
 // SkillHub marketplace + installed-skills manager. Market tab browses
 // skillhub.cn; Installed tab lists every loaded skill (global + project)
 // with mode/source/body preview and delete (global only).
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useApp } from "../store";
 import { Dropdown } from "../components/Dropdown";
 import { ConfirmDialog } from "../components/Dialog";
@@ -66,17 +66,23 @@ export function MarketView() {
   const workspace =
     sessions.find((s) => s.id === activeSessionId && s.kind === "chat")?.workspace ?? null;
 
+  // stale-response guard: rapid search/page flips must not let a slow
+  // earlier response overwrite the newer list (seq pattern)
+  const loadSeq = useRef(0);
   const load = async (p = page, sort = sortBy, keyword = kw) => {
+    const seq = ++loadSeq.current;
     setLoading(true);
     setError(null);
     try {
       const r = await api.skillhubList(p, PAGE_SIZE, sort, keyword);
+      if (seq !== loadSeq.current) return;
       setSkills(r.skills);
       setTotal(r.total);
     } catch (e) {
+      if (seq !== loadSeq.current) return;
       setError(String(e));
     } finally {
-      setLoading(false);
+      if (seq === loadSeq.current) setLoading(false);
     }
   };
 
