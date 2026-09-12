@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>更新日志 | CCHarness 指南</title>
+  <meta name="description" content="CCHarness 的版本更新日志：v0.2.0 深度审计三轮全项闭环与协议 / 网络专项，以及 v0.1.x 各版本的功能与修复明细。" />
+  <link rel="icon" type="image/png" href="../logo.png" />
+  <script>(function(){var t;try{t=localStorage.getItem("cch-theme")}catch(e){}if(!t){t=window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"}document.documentElement.setAttribute("data-theme",t)})()</script>
+  <link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+
+  <header class="navbar">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">
+        <img src="../logo.png" alt="CCHarness logo" width="24" height="24" />
+        <b>CCHarness</b>
+      </a>
+      <nav class="nav-links">
+        <a href="../index.html">首页</a>
+        <a href="../index.html#features">特性</a>
+        <a href="../index.html#workflow">工作方式</a>
+        <a href="index.html">指南</a>
+        <a href="install.html">下载安装</a>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="nav-actions">
+        <button class="theme-toggle" id="themeToggle" aria-label="切换明暗主题">
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        </button>
+        <a class="btn btn-primary btn-sm nav-cta" href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">免费下载</a>
+        <button class="nav-burger" id="navBurger" aria-label="打开菜单"><span></span><span></span><span></span></button>
+      </div>
+    </div>
+  </header>
+
+  <div class="docs">
+    <!-- ============ 左侧边栏 ============ -->
+    <aside class="sidebar">
+      <div class="side-group">
+        <div class="side-label">介绍</div>
+        <a class="side-link" href="index.html">什么是 CCHarness</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">起步</div>
+        <a class="side-link" href="install.html">下载与安装</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">核心概念</div>
+        <a class="side-link" href="workflows.html">工作流模式</a>
+        <a class="side-link" href="agents.html">智能体与工具</a>
+        <a class="side-link" href="cache.html">请求侧缓存工程</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">安全</div>
+        <a class="side-link" href="security.html">安全与隐私</a>
+      </div>
+      <div class="side-group">
+        <div class="side-label">发布</div>
+        <a class="side-link active" href="changelog.html">更新日志</a>
+      </div>
+    </aside>
+
+    <!-- ============ 正文 ============ -->
+    <main class="doc">
+      <div class="crumb">指南 / 更新日志</div>
+      <h1>更新日志</h1>
+      <p class="lead">
+        每个版本的完整变更明细。当前版本 <strong>v0.2.0</strong>，处于快速迭代期；
+        安装包与逐条发布说明也可在 <a href="https://github.com/Technicalflight/CCHarness/releases" target="_blank" rel="noopener">GitHub Releases</a> 查看。
+      </p>
+
+      <h2 id="v0-2-0">v0.2.0 · 深度审计三轮全项闭环 + 协议与网络专项</h2>
+      <ul>
+        <li><b>第一轮</b>——工具写路径符号链接逃逸防护、网页抓取重定向逐跳「解析后锁定」、glob 与沙箱命令匹配加固、后台命令移入线程池并支持进程树整体击杀、MCP 服务进程生命周期治理（死进程自愈 / 有界重试）、停轮遗留工具调用自愈（中断会话重启后不再报协议错误）、流式工具调用参数分片组装修复（此前参数可能静默丢失）、工具定义注入请求体、流式响应改空闲读超时（长生成不再被总时长掐断）、辅助记忆台账自动裁剪 / 隐私库与溢出目录随会话清理 / 文件索引过期驱逐、旧版配置文件无损加载（并修复旧配置可能发出空推理档位）、git 推送 / 拉取 / 抓取转异步不再冻结界面、流式期间历史消息零重渲染（长会话更顺滑）、输入法组合键防误触、慢响应跨会话守卫。</li>
+        <li><b>第二轮</b>——Anthropic 请求侧多轮历史重放（Zone H 与工具调用链以原生 tool_use / tool_result 块进 Claude 上下文，此前只发当轮消息静默失忆）、圆桌群聊回读修复（第 2 位起成员发言此前读不到）、SSE 工具调用增量索引上界、会话元数据写入与删除全部纳入保存锁（与流式落盘互斥）、配置读损坏先备份再兜底、workspace 遍历 canonical 边界与 NTFS reparse point 写守卫、git 远程传输白名单（ext:: 拒绝）、Base URL 解析后逐 IP 分类（nip.io 型内网域名拒绝）、MCP stdio 写超时与行上限、子代理纳入 guardrails 围栏、memo / 系统提示更新改落地后记账（失败回合重注入）、stopped 回合 live 与重建字节一致、子任务会话随父会话级联清理并启动清扫孤儿、目标清单计数容忍 Markdown 列表前缀、流式中删会话先停流、# 菜单过滤回车、粘贴附件上限、浏览器 confirm 迁自绘对话框、mermaid 随主题重渲染、文件预览过期响应丢弃、标题栏监听器卸载竞态修复、CSP img-src 去除明文 http。</li>
+        <li><b>第三轮 · 引擎正确性</b>——前缀缓存纪元重建不再丢失采样参数（重启 / 系统提示变更 / 隐私切换后的首个请求保留 temperature / max_tokens / 推理档位）、Responses 协议通道上的滚动备忘正常注入（此前被静默丢弃而水位照推，记忆永久丢失）、工具轮数耗尽的回合正常收尾并提示「发送继续」（此前整回合被静默丢弃、重启后上下文分叉）、出错回合保留已完成部分（与重启重建字节一致）、流内 error 事件透出真实上游错误（不再记为空回复）、网关不发终止空行时的最后一个 SSE 帧照常解析（用量遥测不再丢失）、模型切换强制重建历史区（Files API 文件引用不再发往新端点）、状态机工作流指令文本随消息记录冻结（此后编辑工作流定义不再引发缓存全量未命中与上下文分叉）。</li>
+        <li><b>第三轮 · 安全与隐私</b>——MCP http 传输逐跳「解析后分类 + 地址锁定」（重定向与 DNS 重绑定内网穿透端到端修复）、连接测试 / 模型拉取的「允许本地」以已保存配置为准（单次调用不可越权）、供应商与模型列表请求拒绝跨主机重定向（对话内容不随 30x 转发）、MCP 环境变量与请求头随密钥一并加密落盘且界面只回显掩码、会话导入路径限制（源目录 / 用户主目录内）、写路径最终分量以不跟随链接方式打开（Unix O_NOFOLLOW / Windows reparse point）、工作区遍历环检测与深度上限（junction 环不再无限递归）、grep 单文件 8MB 上限、沙箱网络策略主机提取改协议解析（IPv6 字面量 / 十进制 IP 不再绕过 deny 名单）、组播 / 保留段与 NAT64 / 6to4 内嵌地址分类补全、备份目录会话 ID 消毒、隐私映射日志权限收紧、技能市场解包按实际解压大小复核。</li>
+        <li><b>第三轮 · 稳定性与体验</b>——子代理随停止按钮中止（此前委派不受停止控制）、同会话并发发送互斥、子会话落盘纳入保存锁、损坏会话文件不再被静默跳过且不再误判其子任务为孤儿、自动压缩免费梯级记账单位修复（此前效果被低估 4 倍导致不必要的付费摘要）、配置保存 rename 重试并上抛错误、更新版本枚举值宽容解码（降级运行不再「Provider 全部消失」）、长期记忆存储键序确定化、基准历史串行化、git 面板中文文件名修复（core.quotePath）、git 管道读取有界（凭据助手残留进程不再挂死）、全部互斥锁防毒化、审批超时条目自动清理、markdown 外链走系统浏览器（不再整个窗口被导航）、设置页长文本输入防抖（不再逐键写盘）、@ 引用单文件 64KB / 总量 200KB 上限、@ / # / 技能菜单竞态守卫补齐、删除 MCP 服务需确认、全部视图完成订阅粒度拆分。</li>
+      </ul>
+
+      <h2 id="v0-1-9">v0.1.9 · 安全与稳定性专项</h2>
+      <ul>
+        <li>外部深度审计全项闭环——工作区路径穿越防护、CSP 收紧、API 密钥界面掩码 + 落盘加密密封、会话写入原子化并纳入保存锁、中文感知 token 估算（修复中英混排下自动压缩触发滞后）、SSE 分帧兼容、工具集哈希跨版本稳定、沙箱匹配加固、MCP 环境变量白名单与私网重定向拒绝、网页抓取防 DNS 重绑定、删除确认与双发修复、mermaid 漏洞依赖链替换、技能内容安全扫描。</li>
+        <li>架构重构——全局状态收编进应用状态、6190 行核心文件拆分为工作流 / 压缩 / 发送引擎三模块。</li>
+        <li>新增 CI 质量门（构建 + 全量测试）；README 源码地图补全。</li>
+      </ul>
+
+      <h2 id="v0-1-8">v0.1.8 · 缓存工程专项</h2>
+      <ul>
+        <li>上下文瘦身两档免费清理：超长工具结果自动落盘（留一行存根，需要时可读回原文）；过时工具输出一次性降级为存根——能救回的都不调摘要。</li>
+        <li>三桶对账压缩：最近轮次逐字节保留（KEEP）、中段历史折叠为结构化 YAML 摘要（FOLD）、过时大块输出降级（DROP）；自动压缩新增回本门槛与 0.70 / 0.55 迟滞——预期剩余轮数摊不薄摘要重算成本就不压缩；10 轮内反复压缩自动上调触发线并插入会话提示（抖动保护）。</li>
+        <li>RollingMemo 滚动备忘：每轮末零调用规则提炼会话状态（目标 / 决定 / 文件 / 已修错误 / 待办），确定性渲染 ≤1200 字符随系统提示注入，压缩与重启后状态不丢。</li>
+        <li>in-history 系统提示更新：系统提示演进复用历史内注入，稳定前缀字节不再整链回退重建；修复首轮系统提示重复注入。</li>
+        <li>缓存保温（可选，设置页开启）：推理绑定模型空闲约 4 分钟自动保温，长思考会话搁置回来依然全量命中。</li>
+        <li>子智能体稳定缓存分片：同父会话同角色的子代理共享常温分片，跨运行字节级命中；SSE 与大响应透明支持 gzip / zstd 压缩传输。</li>
+        <li>图片走 Files API（DeepSeek 等）：同一图片跨轮复用文件引用，零重复上传。</li>
+        <li>遥测新增「压缩账本」：折叠 / 丢弃 / 存根 / 摘要 / 回本全量记账，与请求账本、AuxMemo 并列；修复右侧功能区开启（窄主区）时遥测宽表格溢出裁切——改为卡片内横向滚动。</li>
+      </ul>
+
+      <h2 id="v0-1-7">v0.1.7 · 预流阶段与响应暂停</h2>
+      <ul>
+        <li>修复深度推理 / 审阅等模式首字前的“卡住”：助手消息框现在即时出现，并实时显示预演阶段进度（并行预演三个候选方案 / 三专家预审 / 检索长期记忆）。</li>
+        <li>预流阶段全链路响应暂停：记忆召回、深度推理预演、审阅专家预审、MCP 服务预热、上下文自动压缩期间点击暂停，约 0.1 秒内中止回合并取消未完成的预演请求，无需刷新页面。</li>
+        <li>中止回合的缓存指纹链正确收尾：被中止回合不再参与字节链比对，下一轮不会误报“前缀链断裂”缓存告警。</li>
+      </ul>
+
+      <h2 id="v0-1-6">v0.1.6 · 协议适配器与缓存档位</h2>
+      <ul>
+        <li>协议适配器矩阵拓宽：新增 OpenAI Responses 与 Azure OpenAI（Responses）适配器——GPT-5.x / o 系列原生接口与 Azure v1 数据面（api-key 认证），基准测试 / 自动反思 / 群聊评审等一次性调用同步支持。</li>
+        <li>缓存 TTL 三档位：模型管理页新增「缓存档位」设置——默认（协议默认窗口，Anthropic 1h / OpenAI 仅缓存路由键）、long（延长窗口：Anthropic 1h 标记 / OpenAI 24h 长保留）、short（5-10 分钟默认窗口）、none（不携带任何缓存标记与路由键，严格网关最安全）；原「OpenAI 24h 长缓存保留」开关自动迁移。</li>
+        <li>Anthropic 缓存记账修复：输入 / 缓存写入 / 缓存读取三桶互斥语义按厂商归一，修复此前 Anthropic 路径缓存未命中检测失效与成本低估；重写前缀按 1 小时写入溢价（2×）计价。</li>
+        <li>会话亲和路由头覆盖全部适配器类型，none 档位自动关闭。</li>
+      </ul>
+
+      <h2 id="v0-1-5">v0.1.5 · 更新检查节流</h2>
+      <ul>
+        <li>应用内更新检查节流调整为每天一次：启动时静默检查由 60 分钟间隔改为 24 小时一次，降低启动网络请求；发现新版本仍仅点亮侧边栏版本徽标 + 弹提示，下载安装保持手动。</li>
+      </ul>
+
+      <h2 id="v0-1-4">v0.1.4 · 缓存时长与隐私增强</h2>
+      <ul>
+        <li>模型缓存时间调整为 60 分钟：Anthropic（Claude 系）请求携带 cache_control {"type":"ephemeral","ttl":"1h"}，缓存窗口由默认 5 分钟延长至 60 分钟——系统提示块与最新消息双断点标记，会话搁置 1 小时内回来前缀依然命中（OpenAI 兼容端点依赖上游自动缓存，行为不变）。</li>
+        <li>隐私匿名化修复与增强：手机号识别支持 +86 国际前缀（含边界防护，不会误伤相邻数字）；新增自定义正则脱敏模式，设置页可配置（最多 64 条），用于姓名、内部编号等内置规则覆盖不到的敏感信息。</li>
+        <li>隐私映射日志：所有假名替换落本机 JSONL 日志（时间 / 会话 / 类型 / 原文 / 假名），设置页新增「映射日志」查看与一键清空，替换了什么一目了然。</li>
+        <li>策略沙箱三维自定义清单：文件路径（通配符 deny/allow）、命令程序名（deny/ask/allow，大小写与引号路径鲁棒解析）、网络域名（deny/allow + 全拦开关 + 恶意 URL 启发式），每条命令执行前三态裁决：放行 / 强制审批 / 直接拦截；设置页独立弹窗编辑。</li>
+        <li>应用内更新检查节流由 24 小时缩短为 60 分钟。</li>
+      </ul>
+
+      <h2 id="v0-1-3">v0.1.3 · 审阅模式与写后验证</h2>
+      <ul>
+        <li>新增「审阅」工作流模式：正确性 / 安全边界 / 可维护性三专家并行只读预审，主模型汇合去重定级输出结构化发现表（严重度 / 后果 / 根因 / 位置 / 验证方式），无法核实的条目标注「待核」。</li>
+        <li>写后自动验证钩子：设置页可配置 post_write_command，每次写 / 改文件成功后自动在工作区根执行（如 lint / test），输出以「写后验证」段回灌模型——验证不依赖模型自觉。</li>
+        <li>目标模式证据分级：清单 ✅ 需附行内证据（路径 / 命令 / 测试名），无证据的 ✅ 计为「待补」并在目标摘要条橙色提示，杜绝“打勾即完成”。</li>
+        <li>智能体宪法强化：内置质量纪律——修改后最小验证并重跑、复现→定位→修复→重跑链条、范围边界、引用前必读、结论必须附可核验证据。</li>
+        <li>技能路由阶梯（优先复用已装技能）与自动反思记忆隐私红线（密钥 / 令牌 / 绝对路径不入记忆库）。</li>
+      </ul>
+
+      <h2 id="v0-1-2">v0.1.2 · 开源与开箱即用</h2>
+      <ul>
+        <li>仓库正式公开开源（AGPL-3.0），欢迎 Star / Issue / PR。</li>
+        <li>应用内更新检查开箱即用：仓库公开后匿名即可查询 Releases，移除设置页的 GitHub 访问令牌配置。</li>
+        <li>侧边栏版本号与 MCP clientInfo 版本号改为随构建自动注入。</li>
+      </ul>
+
+      <h2 id="v0-1-1">v0.1.1 · 更新检查与 Key 保护</h2>
+      <ul>
+        <li>应用内更新检查：点击侧边栏底部版本号手动检查，或开启启动时自动检查（24 小时节流）。</li>
+        <li>macOS / Linux 下的 Key 等价保护：API Key 主密钥存入系统钥匙串 / 密钥环，AES-256-GCM 加密落盘，与 Windows DPAPI 等价。</li>
+        <li>设置页「应用更新」卡片：启动自动检查开关。</li>
+      </ul>
+
+      <div class="callout">
+        <b>安装说明</b>
+        Windows 下载 .exe（NSIS 安装向导）或 .msi；macOS 下载 .dmg（Apple Silicon 与 Intel 通用二进制）；Linux 下载 .deb、.rpm 或 .AppImage。安装包未做代码签名：Windows 首次运行可能出现 SmartScreen 提示，macOS 首次打开需在「系统设置 → 隐私与安全性」中放行。
+      </div>
+
+      <div class="pager">
+        <a href="security.html"><span>上一页</span><b>← 安全与隐私</b></a>
+        <a class="next" href="../index.html"><span>返回</span><b>回到首页 ⌂</b></a>
+      </div>
+    </main>
+
+    <!-- ============ 右侧目录 ============ -->
+    <aside class="toc">
+      <div class="toc-title">本页目录</div>
+      <a href="#v0-2-0">v0.2.0</a>
+      <a href="#v0-1-9">v0.1.9</a>
+      <a href="#v0-1-8">v0.1.8</a>
+      <a href="#v0-1-7">v0.1.7</a>
+      <a href="#v0-1-6">v0.1.6</a>
+      <a href="#v0-1-5">v0.1.5</a>
+      <a href="#v0-1-4">v0.1.4</a>
+      <a href="#v0-1-3">v0.1.3</a>
+      <a href="#v0-1-2">v0.1.2</a>
+      <a href="#v0-1-1">v0.1.1</a>
+    </aside>
+  </div>
+
+  <!-- ======================= Footer ======================= -->
+  <footer class="footer">
+    <div class="wrap footer-grid">
+      <div class="footer-brand">
+        <img src="../logo.png" alt="" width="22" height="22" /><b>CCHarness</b>
+        <p>把多个大模型装进同一个桌面工作台。自带模型、缓存是一级指标、智能体干活，掌控在你。</p>
+      </div>
+      <div class="footer-col">
+        <h4>产品</h4>
+        <a href="https://github.com/Technicalflight/CCHarness/releases/latest" target="_blank" rel="noopener">下载最新版</a>
+        <a href="install.html">下载与安装</a>
+        <a href="../index.html#features">核心特性</a>
+        <a href="cache.html">缓存工程</a>
+      </div>
+      <div class="footer-col">
+        <h4>指南</h4>
+        <a href="index.html">什么是 CCHarness</a>
+        <a href="workflows.html">工作流模式</a>
+        <a href="agents.html">智能体与工具</a>
+        <a href="security.html">安全与隐私</a>
+        <a href="changelog.html">更新日志</a>
+      </div>
+      <div class="footer-col">
+        <h4>项目</h4>
+        <a href="https://github.com/Technicalflight/CCHarness" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a href="https://github.com/Technicalflight/CCHarness/issues" target="_blank" rel="noopener">反馈 Issue</a>
+        <a href="https://github.com/Technicalflight/CCHarness/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/Technicalflight/CCHarness/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 License</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© <span id="cchYear">2026</span> CCHarness Authors · Built with Tauri + React + Rust</span>
+      <span>本站为纯静态页面，部署于 GitHub Pages</span>
+    </div>
+  </footer>
+
+  <script src="../main.js"></script>
+</body>
+</html>
