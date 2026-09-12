@@ -1034,6 +1034,7 @@ pub fn build_body(
                 beh.and_then(|b| b.temperature),
                 p.cache_tier(),
                 tools,
+                lp.thinking_level(),
             )
         }
     }

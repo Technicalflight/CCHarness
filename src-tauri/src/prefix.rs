@@ -268,10 +268,28 @@ impl LanePrefix {
     /// Rebuild Zone H from a transcript (epoch reset path). Always bumps the
     /// epoch: a rebuilt prefix is a fresh cache identity even when the bytes
     /// are identical.
+    ///
+    /// Bound head state (model / sampling / reasoning / cache tier / tools
+    /// hash) survives the rebuild: the caller binds those BEFORE deciding to
+    /// rebuild, so resetting them here would silently drop the first
+    /// post-rebuild request's sampling parameters and re-trigger spurious
+    /// epoch bumps next turn. `in_history_system` is the one deliberate
+    /// reset — a rebuild bakes the CURRENT system text into Zone S, so any
+    /// stored in-history state is stale by definition.
     pub fn rebuild(&mut self, system_prompt: &str, messages: &[ChatMessage]) {
         let cache_key = self.cache_key.clone();
+        let bound = (
+            self.model.clone(),
+            self.thinking.clone(),
+            self.temperature,
+            self.max_output,
+            self.privacy,
+            self.cache_tier.clone(),
+            self.tools_hash,
+        );
         let fresh = Self::new(system_prompt, &cache_key);
         *self = fresh;
+        (self.model, self.thinking, self.temperature, self.max_output, self.privacy, self.cache_tier, self.tools_hash) = bound;
         for m in messages {
             self.append(m);
         }
@@ -300,6 +318,13 @@ impl LanePrefix {
             self.epoch += 1;
         }
         self.thinking = normalized;
+    }
+
+    /// Reasoning-effort level bound to this prefix — for arms that map it to
+    /// a protocol-native shape (Anthropic budget_tokens) while keeping the
+    /// epoch discipline in one place.
+    pub fn thinking_level(&self) -> Option<&str> {
+        self.thinking.as_deref()
     }
 
     /// Rebind per-model sampling parameters (temperature / output cap).
@@ -579,7 +604,14 @@ impl LanePrefix {
         }
         body.push_str(",\"input\":[");
         let mut first = true;
-        for part in self.zone_parts() {
+        for (i, part) in self.zone_parts().into_iter().enumerate() {
+            // Zone S already rides as top-level `instructions` above —
+            // demoting it again would duplicate the whole prompt in every
+            // request. Only IN-HISTORY system fragments (Zone H, RollingMemo
+            // injections) take the user-turn demotion inside responses_items.
+            if i == 0 && !self.system_json.is_empty() {
+                continue;
+            }
             // Zone fragments are stored as chat-completions message bytes;
             // converting them here is deterministic (total mapping + sorted
             // serde_json keys), so the same fragment always yields the same
@@ -703,7 +735,11 @@ impl LanePrefix {
 /// bytes — the precondition for the Responses `input` array staying
 /// byte-stable across turns.
 ///
-///   system    → dropped (rides as top-level `instructions`)
+///   system    → demoted to a user turn ([系统更新] marked). Zone S itself
+///               rides as top-level `instructions`, but IN-HISTORY system
+///               messages (RollingMemo injection) must reach the model —
+///               dropping them here marked the memo watermark as delivered
+///               while the Responses channel never saw the bytes.
 ///   user      → {type:"message", content:[input_text | input_image …]}
 ///   assistant → {type:"message", content:[output_text]} + one
 ///               {type:"function_call", call_id, name, arguments} per call
@@ -711,7 +747,17 @@ impl LanePrefix {
 fn responses_items(m: &Value) -> Vec<Value> {
     let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
     match role {
-        "system" => Vec::new(),
+        "system" => {
+            let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if text.is_empty() {
+                return Vec::new();
+            }
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": format!("[系统更新]\n\n{text}") }],
+            })]
+        }
         "tool" => vec![json!({
             "type": "function_call_output",
             "call_id": m.get("tool_call_id").cloned().unwrap_or(Value::Null),
@@ -851,7 +897,20 @@ pub fn build_anthropic_body(
     temperature: Option<f64>,
     tier: CacheTier,
     tools: Option<&Value>,
+    thinking: Option<&str>,
 ) -> String {
+    // Effort → budget_tokens mapping: Anthropic has no effort dial, the
+    // closest protocol-native equivalent is the thinking budget (API floor
+    // 1024). Unknown levels map to None rather than risking an API-invalid
+    // budget. With thinking enabled Anthropic rejects a modified
+    // temperature, so the temperature field is dropped for that combination.
+    let budget = thinking.and_then(|level| match level {
+        "minimal" => Some(1024),
+        "low" => Some(4096),
+        "medium" => Some(8192),
+        "high" => Some(16384),
+        _ => None,
+    });
     let cache_mark = || match tier {
         CacheTier::Long => Some(json!({ "type": "ephemeral", "ttl": "1h" })),
         CacheTier::Short => Some(json!({ "type": "ephemeral" })),
@@ -980,13 +1039,23 @@ pub fn build_anthropic_body(
             other => other,
         };
     }
+    // thinking requires max_tokens strictly above the budget; raise the cap
+    // rather than shipping a combination the API rejects
+    let mut max_tokens = max_output.unwrap_or(8192);
+    if let Some(b) = budget {
+        if max_tokens <= b {
+            max_tokens = b + 1024;
+        }
+    }
     let mut body = serde_json::json!({
         "model": model,
-        "max_tokens": max_output.unwrap_or(8192),
+        "max_tokens": max_tokens,
         "stream": true,
         "messages": msgs,
     });
-    if let Some(t) = temperature {
+    if let Some(b) = budget {
+        body["thinking"] = json!({ "type": "enabled", "budget_tokens": b });
+    } else if let Some(t) = temperature {
         body["temperature"] = serde_json::Value::Number(
             serde_json::Number::from_f64(t).expect("temperature f64"),
         );
@@ -1150,7 +1219,7 @@ mod tests {
         let mut msgs = lp.history_messages();
         msgs.push(ChatMessage::plain("user", "第二轮：继续"));
         let body =
-            build_anthropic_body("claude-test", "sys", &msgs, None, None, CacheTier::None, None);
+            build_anthropic_body("claude-test", "sys", &msgs, None, None, CacheTier::None, None, None);
         // round 1 replays — the P0 regression this test pins
         assert!(body.contains("第一轮：项目结构是什么"), "{body}");
         assert!(body.contains("项目包含 src 和 docs。"), "{body}");
@@ -1224,7 +1293,7 @@ mod tests {
         assert_eq!(back[0].images[0].mime, "image/png");
         assert_eq!(back[0].images[0].b64, "QUJD");
         let body =
-            build_anthropic_body("claude-test", "s", &back, None, None, CacheTier::None, None);
+            build_anthropic_body("claude-test", "s", &back, None, None, CacheTier::None, None, None);
         assert!(body.contains("\"type\":\"image\""), "{body}");
         assert!(body.contains("看这张图"), "{body}");
     }
@@ -1320,11 +1389,11 @@ mod tests {
     fn anthropic_body_honors_behavior_opts() {
         let msgs = [ChatMessage::plain("user", "hi")];
         // no overrides: built-in 8192 cap, no temperature
-        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long, None);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long, None, None);
         assert!(b.contains("\"max_tokens\":8192"), "{b}");
         assert!(!b.contains("temperature"), "{b}");
         // overrides applied
-        let b = build_anthropic_body("claude-x", "sys", &msgs, Some(2048), Some(0.5), CacheTier::Long, None);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, Some(2048), Some(0.5), CacheTier::Long, None, None);
         assert!(b.contains("\"max_tokens\":2048"), "{b}");
         assert!(b.contains("\"temperature\":0.5"), "{b}");
     }
@@ -1339,7 +1408,7 @@ mod tests {
             ChatMessage::plain("assistant", "回答一"),
             ChatMessage::plain("user", "第二轮"),
         ];
-        let b = build_anthropic_body("claude-x", "系统提示", &msgs, None, None, CacheTier::Long, None);
+        let b = build_anthropic_body("claude-x", "系统提示", &msgs, None, None, CacheTier::Long, None, None);
         // exactly two markers: system + newest-message breakpoint
         assert_eq!(b.matches("\"ttl\":\"1h\"").count(), 2, "{b}");
         let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
@@ -1366,7 +1435,7 @@ mod tests {
             "看图",
             vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into(), file_ref: None }],
         )];
-        let b = build_anthropic_body("claude-x", "", &msgs, None, None, CacheTier::Long, None);
+        let b = build_anthropic_body("claude-x", "", &msgs, None, None, CacheTier::Long, None, None);
         let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
         let blocks = v["messages"][0]["content"].as_array().expect("blocks");
         assert_eq!(blocks.last().unwrap()["type"], "image");
@@ -1379,7 +1448,7 @@ mod tests {
         // Short: ephemeral markers WITHOUT ttl — the API-default 5-minute
         // window at the cheaper write rate (serde_json sorts object keys,
         // so match the marker substring without assuming key order)
-        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Short, None);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Short, None, None);
         assert!(b.contains("\"cache_control\":{\"type\":\"ephemeral\"}"), "{b}");
         assert!(!b.contains("ttl"), "{b}");
         assert_eq!(b.matches("\"cache_control\"").count(), 2, "{b}");
@@ -1388,7 +1457,7 @@ mod tests {
         assert!(v["system"][0]["cache_control"].get("ttl").is_none());
 
         // None: no markers anywhere; system degrades to the plain string
-        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::None, None);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::None, None, None);
         assert!(!b.contains("cache_control"), "{b}");
         let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
         assert_eq!(v["system"], serde_json::json!("sys"));
@@ -1415,7 +1484,7 @@ mod tests {
                 }
             }
         ]);
-        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long, Some(&tools));
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long, Some(&tools), None);
         let v: serde_json::Value = serde_json::from_str(&b).unwrap();
         let t = &v["tools"][0];
         assert_eq!(t["name"], "read_file");
@@ -1468,7 +1537,7 @@ mod tests {
             "看图",
             vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into(), file_ref: None }],
         )];
-        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long, None);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long, None, None);
         assert!(b.contains("\"type\":\"image\""), "{b}");
         assert!(b.contains("\"media_type\":\"image/png\""), "{b}");
         assert!(b.contains("\"data\":\"aGk=\""), "{b}");
@@ -1609,6 +1678,89 @@ mod tests {
         assert_eq!(parts[0]["text"], "看图");
         assert_eq!(parts[1]["type"], "input_image");
         assert_eq!(parts[1]["image_url"], "data:image/png;base64,aGk=");
+    }
+
+    #[test]
+    fn rebuild_preserves_bound_head_state() {
+        let mut lp = LanePrefix::new("旧系统提示", "k3");
+        lp.bind_model("gpt-5.1");
+        lp.bind_behavior(Some(0.3), Some(4096));
+        lp.bind_thinking(Some("high"));
+        lp.bind_cache_tier(CacheTier::Long);
+        lp.bind_tools_hash(Some(0xBEEF));
+        lp.append(&ChatMessage::plain("user", "第一轮"));
+
+        // callers bind the head, THEN decide to rebuild (system change /
+        // restart recovery / privacy flip) — the rebuild must not wipe the
+        // just-bound state, or the first post-rebuild request silently
+        // loses its sampling parameters
+        lp.bind_privacy(true);
+        lp.rebuild("新系统提示", &[ChatMessage::plain("user", "第一轮")]);
+        assert_eq!(lp.model.as_deref(), Some("gpt-5.1"));
+        assert_eq!(lp.temperature, Some(0.3));
+        assert_eq!(lp.max_output, Some(4096));
+        assert_eq!(lp.thinking.as_deref(), Some("high"));
+        assert_eq!(lp.cache_tier, CacheTier::Long);
+        assert_eq!(lp.tools_hash, Some(0xBEEF));
+        // bind_privacy flipped BEFORE rebuild — the post-bind value survives
+        assert!(lp.privacy);
+        assert!(lp.epoch >= 1);
+        // the rebuild did its actual job: new Zone S text + Zone H replayed
+        let next = lp.build_openai_body("gpt-5.1", &ChatMessage::plain("user", "hi"));
+        assert!(next.contains("新系统提示"), "{next}");
+        assert!(next.contains("第一轮"), "{next}");
+        // post-rebuild request still carries the sampling parameters
+        assert!(next.contains("\"temperature\":0.3"), "{next}");
+        assert!(next.contains("\"max_tokens\":4096"), "{next}");
+    }
+
+    #[test]
+    fn responses_body_demotes_in_history_system() {
+        let lp = LanePrefix::new("", "k4");
+        // a system message can only be an in-history injection here (Zone S
+        // rides as top-level instructions) — it must reach the model as a
+        // user turn, not vanish while the memo watermark advances
+        let body = lp.build_responses_body(
+            "gpt-5.1",
+            &[ChatMessage::plain("system", "记忆要点：偏好深色主题")],
+            None,
+        );
+        let v: Value = serde_json::from_str(&body).expect("valid json");
+        let items = v["input"].as_array().expect("items");
+        assert_eq!(items.len(), 1, "{body}");
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(
+            items[0]["content"][0]["text"],
+            "[系统更新]\n\n记忆要点：偏好深色主题"
+        );
+        // empty system text emits nothing
+        let body = lp.build_responses_body("gpt-5.1", &[ChatMessage::plain("system", "")], None);
+        let v: Value = serde_json::from_str(&body).expect("valid json");
+        assert!(v["input"].as_array().unwrap().is_empty(), "{body}");
+    }
+
+    #[test]
+    fn anthropic_body_maps_thinking_budget() {
+        let msgs = [ChatMessage::plain("user", "hi")];
+        let b = build_anthropic_body(
+            "claude-x", "sys", &msgs, None, None, CacheTier::None, None, Some("high"),
+        );
+        assert!(b.contains("\"thinking\":{\"budget_tokens\":16384,\"type\":\"enabled\"}") || b.contains("\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":16384}"), "{b}");
+        // thinking forbids a modified temperature
+        assert!(!b.contains("\"temperature\""), "{b}");
+        // low maps smaller and raises max_tokens above the budget when needed
+        let b = build_anthropic_body(
+            "claude-x", "sys", &msgs, Some(2048), Some(0.5), CacheTier::None, None, Some("low"),
+        );
+        assert!(b.contains("\"budget_tokens\":4096"), "{b}");
+        assert!(b.contains("\"max_tokens\":5120"), "{b}");
+        // unknown level → no thinking field, temperature passthrough restored
+        let b = build_anthropic_body(
+            "claude-x", "sys", &msgs, None, Some(0.5), CacheTier::None, None, Some("weird"),
+        );
+        assert!(!b.contains("\"thinking\""), "{b}");
+        assert!(b.contains("\"temperature\":0.5"), "{b}");
     }
 
     #[test]
