@@ -72,13 +72,13 @@ pub(crate) fn open_approval(state: &AppState, id: &str) -> tokio::sync::oneshot:
     state
         .approvals
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get_or_insert_with(HashMap::new)
         .insert(id.to_string(), tx);
     rx
 }
 
-fn take_approval(state: &AppState, id: &str) -> Option<tokio::sync::oneshot::Sender<bool>> {
+pub(crate) fn take_approval(state: &AppState, id: &str) -> Option<tokio::sync::oneshot::Sender<bool>> {
     state.approvals.lock().unwrap_or_else(|p| p.into_inner()).as_mut()?.remove(id)
 }
 
@@ -393,7 +393,12 @@ pub(crate) fn backup_snapshot(
     file: &std::path::Path,
     cap_mb: u64,
 ) -> Result<(), String> {
-    let dir = data_dir.join("backups").join(session_id);
+    // session_id joins a filesystem path — sanitize like every other
+    // session-keyed directory (todos/spill/attachments); this is the one
+    // backup path that used to take the raw id, so a hostile id could
+    // escape the backups dir through traversal segments
+    let safe = crate::sessions::sanitize_id(session_id);
+    let dir = data_dir.join("backups").join(safe);
     fs::create_dir_all(&dir).map_err(|e| format!("backup dir: {e}"))?;
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f");
     let name = file
@@ -1613,6 +1618,12 @@ pub async fn wiki_generate(state: State<'_, AppState>, session_id: String) -> Re
     )
     .await?;
     let path = wiki_path(&ws);
+    // the tool write chain refuses symlink/junction targets and checks the
+    // canonical boundary — this standalone write must not bypass them, or a
+    // planted `.ccharness` junction redirects model-generated content
+    // outside the workspace
+    crate::agent_tools::canonical_escape_check(&path, std::path::Path::new(&ws), ".ccharness/wiki.md")?;
+    crate::agent_tools::refuse_symlink_target(&path, ".ccharness/wiki.md")?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("无法创建 .ccharness 目录: {e}"))?;
     }
@@ -1620,7 +1631,13 @@ pub async fn wiki_generate(state: State<'_, AppState>, session_id: String) -> Re
         "<!-- CCHarness /wiki 生成于 {}；重新生成会覆盖本文件 -->\n\n{text}\n",
         chrono::Local::now().format("%Y-%m-%d %H:%M")
     );
-    fs::write(&path, &stamped).map_err(|e| format!("写入 wiki.md 失败: {e}"))?;
+    {
+        use std::io::Write;
+        let mut f = crate::agent_tools::open_write_hardened(&path, true)
+            .map_err(|e| format!("写入 wiki.md 失败: {e}"))?;
+        f.write_all(stamped.as_bytes())
+            .map_err(|e| format!("写入 wiki.md 失败: {e}"))?;
+    }
     Ok(serde_json::json!({
         "path": path.to_string_lossy(),
         "chars": text.chars().count(),

@@ -15,6 +15,9 @@ const WRITE_FILE_CAP: usize = 1024 * 1024;
 const LIST_CAP: usize = 200;
 const GLOB_CAP: usize = 100;
 const GREP_FILE_CAP: usize = 400;
+/// Per-file read cap for grep: the whole file is buffered, so a multi-GB
+/// text blob in the workspace would spike memory — skip it instead.
+const GREP_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const GREP_MATCH_CAP: usize = 50;
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "dist", "build", ".next", "__pycache__"];
 
@@ -177,11 +180,18 @@ fn wildcard_match(pattern: &str, subject: &str) -> bool {
 }
 
 /// Host of a URL: lowercased, without scheme / userinfo / port / path.
+/// Parsed with the WHATWG parser (rust-url): string splitting mishandles
+/// IPv6 literals (`[::1]:80`), decimal hosts (`http://2130706433/`) and
+/// userinfo tricks, and a deny list that misses them is silently bypassed.
 fn url_host(url: &str) -> String {
+    if let Ok(u) = url::Url::parse(url) {
+        return u.host_str().unwrap_or("").trim_matches(['[', ']']).to_lowercase();
+    }
+    // unparseable input: fall back to lexical extraction so deny lists
+    // still see SOMETHING (the fetch itself will refuse the URL anyway)
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let rest = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let host = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
-    let host = host.split(':').next().unwrap_or(host);
     host.trim_matches(|c: char| c == '[' || c == ']').to_lowercase()
 }
 
@@ -792,7 +802,7 @@ pub fn resolve_in_workspace(workspace: &str, rel: &str) -> Result<PathBuf, Strin
 /// component to exist — a not-yet-created leaf is covered by its deepest
 /// existing ancestor, which is exactly the chain `create_dir_all`/`fs::write`
 /// would follow.
-fn canonical_escape_check(p: &Path, base: &Path, rel_trim: &str) -> Result<(), String> {
+pub(crate) fn canonical_escape_check(p: &Path, base: &Path, rel_trim: &str) -> Result<(), String> {
     let Ok(ws_canon) = fs::canonicalize(base) else {
         return Ok(()); // workspace root not on disk — nothing to compare against
     };
@@ -816,7 +826,7 @@ fn canonical_escape_check(p: &Path, base: &Path, rel_trim: &str) -> Result<(), S
 /// the final target component. A *dangling* link cannot be resolved by
 /// `canonicalize` at all, yet `fs::write` through it would create the file
 /// at the link's destination — outside the workspace.
-fn refuse_symlink_target(path: &Path, rel: &str) -> Result<(), String> {
+pub(crate) fn refuse_symlink_target(path: &Path, rel: &str) -> Result<(), String> {
     if fs::symlink_metadata(path)
         .map(|m| m.is_symlink())
         .unwrap_or(false)
@@ -866,6 +876,32 @@ fn normalize_plain(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Open `path` for writing with the FINAL component hardened against
+/// check-to-open swaps: a symlink/junction appearing between
+/// `refuse_symlink_target` and the open can no longer redirect the write
+/// outside the workspace. Unix fails with ELOOP (`O_NOFOLLOW`); Windows
+/// opens the reparse point itself, so a swap-in writes the link object,
+/// never its target. Intermediate path components remain racy without
+/// openat2 semantics — recorded residual, not a regression.
+pub(crate) fn open_write_hardened(path: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true);
+    if create {
+        o.create(true).truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        o.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    o.open(path)
 }
 
 fn truncate_result(mut s: String) -> String {
@@ -1344,6 +1380,11 @@ pub fn spawn_background(workspace: &str, command: &str) -> Result<u32, String> {
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        c.process_group(0); // 自成进程组：kill_background 可整组 SIGKILL
+    }
     let mut child = c.spawn().map_err(|e| format!("启动失败: {e}"))?;
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
@@ -1477,11 +1518,12 @@ pub fn kill_background(shell_id: u32) -> Result<String, String> {
     if s.done.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(format!("shell {shell_id} 已退出，无需终止"));
     }
+    // kill the whole tree, same as the foreground run_command — a bare
+    // child.kill() only terminates the shell (cmd/sh) and orphaned
+    // grandchildren (dev servers, listeners) keep running
     let mut c = s.child.lock().unwrap_or_else(|p| p.into_inner());
-    match c.kill() {
-        Ok(()) => Ok(format!("shell {shell_id}（{}）已终止", s.command)),
-        Err(e) => Err(format!("终止失败: {e}")),
-    }
+    kill_tree(&mut *c);
+    Ok(format!("shell {shell_id}（{}）已终止", s.command))
 }
 
 /// Post-write verification hook (better-harness style feedback loop): run the
@@ -1550,7 +1592,6 @@ fn web_fetch(url: &str) -> Result<String, String> {
         // neither DNS rebinding nor a redirect bounce can land on an
         // address we never vetted (string-only hop checks lose to a name
         // that resolves loopback, incl. ::ffff:-mapped answers).
-        use std::net::ToSocketAddrs;
         const MAX_HOPS: usize = 5;
         let mut current = reqwest::Url::parse(&url_owned).map_err(|e| format!("URL 无效: {e}"))?;
         for hop in 0..=MAX_HOPS {
@@ -1568,11 +1609,13 @@ fn web_fetch(url: &str) -> Result<String, String> {
                 return Err(format!("重定向目标被网络策略拦截: {e}"));
             }
             let port = current.port_or_known_default().unwrap_or(80);
+            // bounded resolution: a hostile name backed by a hung resolver
+            // would otherwise pin the fetch thread forever (std
+            // to_socket_addrs has no timeout)
+            let addrs = crate::urlguard::resolve_bounded(&host, port)
+                .ok_or_else(|| format!("DNS 解析失败或超时: {host}"))?;
             let mut pinned: Option<std::net::SocketAddr> = None;
-            for sa in (host.as_str(), port)
-                .to_socket_addrs()
-                .map_err(|e| format!("DNS 解析失败: {e}"))?
-            {
+            for sa in addrs {
                 if crate::urlguard::is_loopback_or_private(&sa.ip().to_string()) {
                     return Err(format!("解析结果 {} 位于本机/内网，请求已拒绝", sa.ip()));
                 }
@@ -1737,7 +1780,12 @@ fn apply_patch(workspace: &str, rel: &str, hunks: &[Value]) -> Result<String, St
         content = content.replacen(old, new, 1);
     }
     let newline_normalized = content.replace("\r\n", "\n");
-    fs::write(&path, &newline_normalized).map_err(|e| format!("写入失败: {e}"))?;
+    {
+        use std::io::Write;
+        let mut f = open_write_hardened(&path, true).map_err(|e| format!("写入失败: {e}"))?;
+        f.write_all(newline_normalized.as_bytes())
+            .map_err(|e| format!("写入失败: {e}"))?;
+    }
     Ok(format!(
         "OK: {rel} 应用 {} 处替换（现 {} B，{} 行）",
         hunks.len(),
@@ -1806,7 +1854,12 @@ fn write_file(workspace: &str, rel: &str, content: &str) -> Result<String, Strin
         }
     }
     let newline_normalized = content.replace("\r\n", "\n");
-    fs::write(&path, &newline_normalized).map_err(|e| format!("写入失败: {e}"))?;
+    {
+        use std::io::Write;
+        let mut f = open_write_hardened(&path, true).map_err(|e| format!("写入失败: {e}"))?;
+        f.write_all(newline_normalized.as_bytes())
+            .map_err(|e| format!("写入失败: {e}"))?;
+    }
     Ok(format!(
         "OK: {} {}（{} B，{} 行）",
         if existed { "覆写" } else { "创建" },
@@ -1831,7 +1884,11 @@ fn edit_file(workspace: &str, rel: &str, old_text: &str, new_text: &str) -> Resu
         return Err(format!("old_text 出现 {n} 次，不唯一——请带更多上下文重试"));
     }
     let updated = current.replacen(old_text, new_text, 1);
-    fs::write(&path, updated).map_err(|e| format!("写入失败: {e}"))?;
+    {
+        use std::io::Write;
+        let mut f = open_write_hardened(&path, false).map_err(|e| format!("写入失败: {e}"))?;
+        f.write_all(updated.as_bytes()).map_err(|e| format!("写入失败: {e}"))?;
+    }
     Ok(format!(
         "OK: 编辑 {}（-{} / +{} 字符）",
         rel,
@@ -1991,6 +2048,11 @@ fn grep_files(workspace: &str, pattern: &str, glob_filter: &str) -> Result<Strin
                 return;
             }
         }
+        // single-file size cap: the whole file is read into memory, and a
+        // multi-GB text blob inside the workspace would spike it
+        if fs::metadata(path).map(|m| m.len()).unwrap_or(0) > GREP_FILE_MAX_BYTES {
+            return;
+        }
         scanned += 1;
         if let Ok(content) = fs::read_to_string(path) {
             for (i, line) in content.lines().enumerate() {
@@ -2022,10 +2084,29 @@ fn walk_text_files(root: &Path, dir: &Path, visit: &mut impl FnMut(&str, &Path))
     // resolves once; every directory recursed into and every file visited
     // must canonicalize back inside it. Unresolvable entries are skipped.
     let Ok(root_canon) = fs::canonicalize(root) else { return };
-    walk_text_files_inner(&root_canon, dir, visit);
+    let mut visited = std::collections::HashSet::new();
+    walk_text_files_inner(&root_canon, dir, visit, 0, &mut visited);
 }
 
-fn walk_text_files_inner(root_canon: &Path, dir: &Path, visit: &mut impl FnMut(&str, &Path)) {
+/// Depth cap per traversal: a junction cycle (junctions need no admin
+/// rights) canonicalizes back INSIDE the workspace, so the boundary check
+/// alone cannot stop `ws/loop → ws` from recursing forever.
+const WALK_MAX_DEPTH: usize = 32;
+
+fn walk_text_files_inner(
+    root_canon: &Path,
+    dir: &Path,
+    visit: &mut impl FnMut(&str, &Path),
+    depth: usize,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    if depth > WALK_MAX_DEPTH {
+        return;
+    }
+    let Ok(canon_dir) = fs::canonicalize(dir) else { return };
+    if !visited.insert(canon_dir) {
+        return; // already traversed — a cycle would loop forever here
+    }
     let Ok(entries) = fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let p = e.path();
@@ -2038,7 +2119,7 @@ fn walk_text_files_inner(root_canon: &Path, dir: &Path, visit: &mut impl FnMut(&
                 Ok(real) if real.starts_with(root_canon) => {}
                 _ => continue,
             }
-            walk_text_files_inner(root_canon, &p, visit);
+            walk_text_files_inner(root_canon, &p, visit, depth + 1, visited);
         } else {
             // file symlinks too: the content reader follows links, so the
             // resolved target must sit inside the workspace as well — and

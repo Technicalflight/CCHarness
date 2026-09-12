@@ -26,10 +26,15 @@ fn classify_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
-            // loopback, RFC1918, link-local, 0.0.0.0, CGNAT, reserved broadcast
+            // loopback, RFC1918, link-local, 0.0.0.0, CGNAT, reserved broadcast,
+            // multicast 224/4, reserved 240/4. 198.18/15 (RFC 2544 benchmarking)
+            // is deliberately NOT refused: fake-IP-mode proxy resolvers (Clash,
+            // Mihomo, …) answer every domain with an address in that range, so
+            // classifying it private would lock proxied setups out of all
+            // providers — there it means "reachable through the local proxy".
             o[0] == 127 || o[0] == 10 || (o[0] == 172 && (o[1] & 0xf0) == 16) || (o[0] == 192 && o[1] == 168)
                 || (o[0] == 169 && o[1] == 254) || o[0] == 0 || (o[0] == 100 && (o[1] & 0xc0) == 64)
-                || o[0] == 255
+                || o[0] == 255 || (o[0] & 0xf0) == 224 || o[0] >= 240
         }
         IpAddr::V6(v6) => {
             // IPv4-mapped IPv6 (::ffff:0:0/96) must be judged by its
@@ -39,9 +44,52 @@ fn classify_ip(ip: &IpAddr) -> bool {
                 return classify_ip(&IpAddr::V4(v4));
             }
             let seg = v6.segments();
-            // loopback, link-local fe80::/10, unique-local fc00::/7
+            // loopback, link-local fe80::/10, unique-local fc00::/7,
+            // NAT64 64:ff9b::/96 and 6to4 2002::/16 (both embed an IPv4
+            // address reachable through infrastructure gateways — classify
+            // by the embedded address, conservative fallback: private)
+            if seg[0] == 0x64 && seg[1] == 0xff9b {
+                let v4 = std::net::Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    seg[6] as u8,
+                    (seg[7] >> 8) as u8,
+                    seg[7] as u8,
+                );
+                return classify_ip(&IpAddr::V4(v4));
+            }
+            if seg[0] == 0x2002 {
+                let v4 = std::net::Ipv4Addr::new(
+                    (seg[1] >> 8) as u8,
+                    seg[1] as u8,
+                    (seg[2] >> 8) as u8,
+                    seg[2] as u8,
+                );
+                return classify_ip(&IpAddr::V4(v4));
+            }
             v6.is_loopback() || (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xfe00) == 0xfc00
         }
+    }
+}
+
+/// Resolve `host` and return every socket address, bounded: DNS must answer
+/// within 3s on a worker thread (std `to_socket_addrs` has no timeout, and a
+/// hung resolver would stall the caller). Timed-out or failed resolution
+/// returns None — callers treat it as refuse (fail-closed). A timed-out
+/// worker thread may still complete later; the OS reaps it and its result
+/// is dropped (std threads cannot be aborted safely).
+pub fn resolve_bounded(host: &str, port: u16) -> Option<Vec<std::net::SocketAddr>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<std::net::SocketAddr>>();
+    let target = (host.to_string(), port);
+    std::thread::spawn(move || {
+        let addrs = target
+            .to_socket_addrs()
+            .map(|it| it.collect::<Vec<_>>())
+            .unwrap_or_default();
+        let _ = tx.send(addrs);
+    });
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(addrs) if !addrs.is_empty() => Some(addrs),
+        _ => None,
     }
 }
 

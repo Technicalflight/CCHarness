@@ -7,7 +7,7 @@
 use crate::chat::{self, SendCtx};
 use crate::commands::{
     backup_snapshot, grant_key, lp_is_empty, next_record_ts, open_approval, prefixes_lock,
-    restore_args, save_todos, warn_save, TodoItem, AppState, APPROVAL_TIMEOUT_SECS,
+    restore_args, save_todos, take_approval, warn_save, TodoItem, AppState, APPROVAL_TIMEOUT_SECS,
     GOAL_MAX_TOOL_ROUNDS, MAX_DELEGATIONS_PER_TURN, MAX_TOOL_ROUNDS, SendResult, WRITE_LOG_CAP,
 };
 use crate::compaction::{maybe_auto_compact, rolling_memo_apply, render_memo, tools_hash};
@@ -2207,7 +2207,7 @@ async fn run_send(
                                                 let rx = open_approval(&state, &approval_id);
                                                 let _ = channel.send(StreamEvent::ApprovalRequest {
                                                     lane,
-                                                    approval_id,
+                                                    approval_id: approval_id.clone(),
                                                     tool: tc.name.clone(),
                                                     path: server.name.clone(),
                                                     preview: format!(
@@ -2217,14 +2217,18 @@ async fn run_send(
                                                             .unwrap_or_default()
                                                     ),
                                                 });
-                                                Ok(matches!(
-                                                    tokio::time::timeout(
-                                                        std::time::Duration::from_secs(APPROVAL_TIMEOUT_SECS),
-                                                        rx
-                                                    )
-                                                    .await,
-                                                    Ok(Ok(true))
-                                                ))
+                                                let decision = tokio::time::timeout(
+                                                    std::time::Duration::from_secs(APPROVAL_TIMEOUT_SECS),
+                                                    rx,
+                                                )
+                                                .await;
+                                                if !matches!(decision, Ok(Ok(true))) {
+                                                    // timed out / resolver gone — drop the
+                                                    // stale entry so the pending map cannot
+                                                    // accumulate across a long session
+                                                    take_approval(&state, &approval_id);
+                                                }
+                                                Ok(matches!(decision, Ok(Ok(true))))
                                             }
                                         }
                                     }
@@ -2401,15 +2405,16 @@ async fn run_send(
                                                 &args,
                                             ),
                                         });
-                                        match tokio::time::timeout(
+                                        let decision = tokio::time::timeout(
                                             std::time::Duration::from_secs(APPROVAL_TIMEOUT_SECS),
                                             rx,
                                         )
-                                        .await
-                                        {
-                                            Ok(Ok(true)) => true,
-                                            _ => false,
+                                        .await;
+                                        if !matches!(decision, Ok(Ok(true))) {
+                                            // timed out / resolver gone — drop the stale entry
+                                            take_approval(&state, &approval_id);
                                         }
+                                        matches!(decision, Ok(Ok(true)))
                                     };
                                     if approved {
                                         let dd = data_dir.to_path_buf();
@@ -2528,15 +2533,16 @@ async fn run_send(
                                             ),
                                         });
                                         // 120s deny — a dropped channel denies too
-                                        match tokio::time::timeout(
+                                        let decision = tokio::time::timeout(
                                             std::time::Duration::from_secs(APPROVAL_TIMEOUT_SECS),
                                             rx,
                                         )
-                                        .await
-                                        {
-                                            Ok(Ok(true)) => true,
-                                            _ => false,
+                                        .await;
+                                        if !matches!(decision, Ok(Ok(true))) {
+                                            // timed out / resolver gone — drop the stale entry
+                                            take_approval(&state, &approval_id);
                                         }
+                                        matches!(decision, Ok(Ok(true)))
                                     };
                                     if approved {
                                         // review-panel capture: before/after
