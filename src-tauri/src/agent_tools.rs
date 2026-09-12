@@ -730,7 +730,15 @@ pub fn schema_filtered(allow: &[String]) -> Value {
 /// Resolve a workspace-relative path, refusing escapes, absolute paths and
 /// symlink tricks as far as lexical + canonical checks allow.
 pub fn resolve_in_workspace(workspace: &str, rel: &str) -> Result<PathBuf, String> {
-    let rel_trim = rel.trim().trim_matches(['/', '\\']);
+    let rel_trim = rel.trim();
+    // Windows tolerates stray leading slashes on workspace-relative input
+    // ("/sub/file.txt" meaning "sub/file.txt"); on POSIX a leading slash IS
+    // the absolute marker and must reach the absolute branch untouched —
+    // trimming it there would silently re-base /etc/passwd into the
+    // workspace instead of refusing it (CI Linux catch, v0.2.0).
+    #[cfg(windows)]
+    let rel_trim = rel_trim.trim_start_matches(['/', '\\']);
+    let rel_trim = rel_trim.trim_end_matches(['/', '\\']);
     if rel_trim.is_empty() {
         return Ok(PathBuf::from(workspace));
     }
