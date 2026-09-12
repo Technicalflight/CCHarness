@@ -998,6 +998,14 @@ export function ChatView() {
     lane0?.tools.length,
   ]);
 
+  // msgs 引用在流式期间不变 → 分组与工具索引不重建 → 配合 memo 化的
+  // AssistantGroup / UserItem，历史消息在 delta 期间零重渲染。
+  // 这两个 useMemo 必须位于下方 `if (!meta)` 提前 return 之前——hooks
+  // 不允许出现在条件 return 之后，否则无会话 ↔ 有会话切换时 hooks
+  // 数量变化直接崩溃（Rules of Hooks）。
+  const toolIndex = useMemo(() => buildToolResultIndex(msgs), [msgs]);
+  const items = useMemo(() => groupTranscript(msgs), [msgs]);
+
   const heroSend = async (text: string, skillNames: string[], images?: ChatImage[]) => {
     const t = text.trim();
     if (!t || heroBusy) return;
@@ -1190,10 +1198,6 @@ export function ChatView() {
 
   const binding = meta.bindings[0];
   const hit = lastRequest[meta.id];
-  // msgs 引用在流式期间不变 → 分组与工具索引不重建 → 配合 memo 化的
-  // AssistantGroup / UserItem，历史消息在 delta 期间零重渲染
-  const toolIndex = useMemo(() => buildToolResultIndex(msgs), [msgs]);
-  const items = useMemo(() => groupTranscript(msgs), [msgs]);
   // goal summary inputs: session cost + persisted goal snapshot
   const goalCost = aggregateCost(msgs.filter((m) => m.role === "assistant"));
   const refreshGoalNow = () => refreshGoal(meta.id);
