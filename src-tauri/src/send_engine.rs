@@ -1384,17 +1384,12 @@ async fn run_send(
                 };
                 (lp.clone(), system_injection, memo_injection)
             };
-            // advance the injection watermark when a memo block went out,
-            // so the same revision never injects twice (a later rebuild
-            // re-injects via the needs_rebuild branch regardless)
-            if memo_injection.is_some() {
-                let _guard = save_lock.lock().await;
-                if let Ok(mut s) = store.load(&session_id) {
-                    s.meta.rolling_memo_injected_rev = s.meta.rolling_memo_rev;
-                    s.meta.updated_at = now_ms();
-                    warn_save(&session_id, "memo watermark", store.save(&s));
-                }
-            }
+            // NOTE: the injection watermark does NOT advance here — it used
+            // to, but the memo only enters Zone H when the turn actually
+            // lands; a failed/stopped turn never wrote the memo into Zone H,
+            // yet the watermark already claimed it was injected, so the
+            // memory silently vanished until the next rebuild. The watermark
+            // advances right after the Zone H append at turn end instead.
 
             let mut transcript = chat::transcript_for_lane(&sf_snapshot, lane, &cfg.workflows, &data_dir);
             scrub_outbound(&mut transcript);
@@ -1878,6 +1873,24 @@ async fn run_send(
                 }
 
                 if outcome.status != "ok" {
+                    // byte-parity with the restart rebuild: the persisted
+                    // transcript now carries the partial assistant (with its
+                    // tool_calls) plus the synthetic "not executed" tool
+                    // results above — Zone H must carry exactly the same
+                    // records, or the next live request misses the
+                    // guarantee-cache while a restart shifts the context
+                    if outcome.status == "stopped" {
+                        sent_this_turn.push(asst_msg);
+                        for cid in &pending_call_ids {
+                            sent_this_turn.push(ChatMessage {
+                                role: "tool".into(),
+                                content: crate::chat::UNPAIRED_TOOL_NOTE.into(),
+                                tool_calls: None,
+                                tool_call_id: Some(cid.clone()),
+                                images: Vec::new(),
+                            });
+                        }
+                    }
                     turn_status = outcome.status;
                     break;
                 }
@@ -2628,6 +2641,12 @@ async fn run_send(
 
             // Zone T falls into Zone H for the next user turn
             if turn_status != "error" {
+                // did a RollingMemo block ship this turn? The watermark only
+                // advances AFTER the Zone H append below (see the block at
+                // the end) — advancing it before the request let a
+                // failed/stopped turn silently lose the memory until the
+                // next rebuild.
+                let memo_landed = memo_injection.is_some();
                 let mut warm_slot: Option<crate::warmer::WarmSlot> = None;
                 {
                     let mut guard = prefixes_lock(&state);
@@ -2654,6 +2673,19 @@ async fn run_send(
                                 });
                             }
                         }
+                    }
+                }
+                // the memo block has now genuinely entered Zone H (append
+                // above) — only now advance the injection watermark, so a
+                // failed/stopped turn re-injects instead of losing the
+                // memory. The prefixes guard is already dropped here, so
+                // taking save_lock keeps the lock order acyclic.
+                if memo_landed {
+                    let _guard = save_lock.lock().await;
+                    if let Ok(mut s) = store.load(&session_id) {
+                        s.meta.rolling_memo_injected_rev = s.meta.rolling_memo_rev;
+                        s.meta.updated_at = now_ms();
+                        warn_save(&session_id, "memo watermark", store.save(&s));
                     }
                 }
                 if let Some(slot) = warm_slot {
