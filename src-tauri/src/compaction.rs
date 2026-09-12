@@ -997,6 +997,7 @@ mod memo_tests {
             data_dir: dir.clone(),
             store: SessionStore::new(&dir),
             client: reqwest::Client::new(),
+            stream_client: reqwest::Client::new(),
             stops: std::sync::Mutex::new(HashMap::new()),
             save_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             prefixes: std::sync::Mutex::new(None),

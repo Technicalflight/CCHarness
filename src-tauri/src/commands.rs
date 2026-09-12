@@ -114,6 +114,9 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub store: SessionStore,
     pub client: reqwest::Client,
+    /// 流式专用：读空闲超时而非总时长上限 —— 长推理/大输出按分钟计，
+    /// client 级 300s 总超时会掐断正常生成（上游 90s 无字节才算死）。
+    pub stream_client: reqwest::Client,
     /// Cancellation flags per session.
     pub stops: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Serializes session-file read-modify-write across lanes.
@@ -209,6 +212,11 @@ impl AppState {
             .connect_timeout(std::time::Duration::from_secs(20))
             .build()
             .expect("http client");
+        let stream_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .read_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .expect("stream http client");
         let store = SessionStore::new(&data_dir);
         // mirror the sandbox policy into the tool guard before any turn runs
         let boot_settings = config::load(&data_dir).settings;
@@ -231,6 +239,7 @@ impl AppState {
             store,
             data_dir,
             client,
+            stream_client,
             stops: Mutex::new(HashMap::new()),
             save_lock: Arc::new(tokio::sync::Mutex::new(())),
             prefixes: Mutex::new(None),
@@ -646,7 +655,7 @@ pub async fn test_provider(provider: Provider) -> TestResult {
     {
         return TestResult { ok: false, message: msg, models: vec![] };
     }
-    match chat::fetch_models_async(&reqwest::Client::new(), &provider).await {
+    match chat::fetch_models_async(&models_client(), &provider).await {
         Ok(models) => TestResult {
             ok: true,
             message: format!("连接成功，{} 个模型可用", models.len()),
@@ -663,7 +672,7 @@ pub async fn fetch_models(provider: Provider) -> Result<Vec<String>, String> {
     {
         return Err(msg);
     }
-    chat::fetch_models_async(&reqwest::Client::new(), &provider).await
+    chat::fetch_models_async(&models_client(), &provider).await
 }
 
 // ---------- sessions ----------
@@ -682,6 +691,16 @@ pub fn create_session(
 ) -> Result<SessionMeta, String> {
     let sf = state.store.create(&kind, bindings, &title)?;
     Ok(sf.meta)
+}
+
+/// 模型列表拉取用的临时 client：connect/total 都有兜底（裸 Client::new
+/// 没有任何超时，代理半死时能挂满操作系统级 TCP 超时）。
+fn models_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("models http client")
 }
 
 #[tauri::command]

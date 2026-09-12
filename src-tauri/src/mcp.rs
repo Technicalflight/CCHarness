@@ -76,6 +76,55 @@ pub fn split_tool_name(name: &str) -> Option<(String, String)> {
 impl McpManager {
     /// Ensure a server is spawned + handshaked + tool list cached. Safe to
     /// call repeatedly; returns the number of tools on success.
+    /// Spawn + insert if the entry is missing or provably dead. The
+    /// dead-entry sweep (try_wait reap / error-entry respawn) lives here so
+    /// the handshake retry path reuses the exact same logic.
+    fn spawn_if_absent(&self, cfg: &McpServerConfig) -> Result<(), String> {
+        let mut guard = self.procs.lock().unwrap();
+        let procs = guard.get_or_insert_with(HashMap::new);
+        let dead = match procs.get_mut(&cfg.id) {
+            Some(e) => match e.child.as_mut() {
+                Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+                None => e.stdin.is_none() && e.state.starts_with("error:"),
+            },
+            None => false,
+        };
+        if dead {
+            procs.remove(&cfg.id);
+        }
+        if procs.contains_key(&cfg.id) {
+            return Ok(());
+        }
+        match spawn_server(cfg) {
+            Ok((stdin, pending, child)) => {
+                procs.insert(
+                    cfg.id.clone(),
+                    ProcEntry {
+                        stdin,
+                        pending,
+                        child,
+                        tools: Vec::new(),
+                        state: "connecting…".into(),
+                    },
+                );
+                Ok(())
+            }
+            Err(e) => {
+                procs.insert(
+                    cfg.id.clone(),
+                    ProcEntry {
+                        stdin: None,
+                        pending: std::sync::Arc::new(Mutex::new(HashMap::new())),
+                        child: None,
+                        tools: Vec::new(),
+                        state: format!("error: {e}"),
+                    },
+                );
+                Err(e)
+            }
+        }
+    }
+
     pub async fn ensure(&self, cfg: &McpServerConfig) -> Result<usize, String> {
         if cfg.transport == "http" {
             if let crate::urlguard::UrlCheck::Refused(msg) =
@@ -85,54 +134,26 @@ impl McpManager {
                 return Err(msg);
             }
         }
-        // spawn if absent
-        {
-            let mut guard = self.procs.lock().unwrap();
-            let procs = guard.get_or_insert_with(HashMap::new);
-            // 自愈 + 回收：进程已退出的条目先移除（try_wait 兼作收割），
-            // 否则永远复用死条目、handshake 次次超时
-            let dead = match procs.get_mut(&cfg.id) {
-                Some(e) => match e.child.as_mut() {
-                    Some(c) => matches!(c.try_wait(), Ok(Some(_))),
-                    None => e.stdin.is_none() && e.state.starts_with("error:"),
-                },
-                None => false,
-            };
-            if dead {
-                procs.remove(&cfg.id);
-            }
-            if !procs.contains_key(&cfg.id) {
-                match spawn_server(cfg) {
-                    Ok((stdin, pending, child)) => {
-                        procs.insert(
-                            cfg.id.clone(),
-                            ProcEntry {
-                                stdin,
-                                pending,
-                                child,
-                                tools: Vec::new(),
-                                state: "connecting…".into(),
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        procs.insert(
-                            cfg.id.clone(),
-                            ProcEntry {
-                                stdin: None,
-                                pending: std::sync::Arc::new(Mutex::new(HashMap::new())),
-                                child: None,
-                                tools: Vec::new(),
-                                state: format!("error: {e}"),
-                            },
-                        );
-                        return Err(e);
+        self.spawn_if_absent(cfg)?;
+        // (re)handshake outside the map lock; one bounded retry: a failed
+        // handshake poisons the entry (dead process / broken stdin pipe),
+        // so drop it, respawn once and try again. 连接类操作幂等，重试
+        // 安全；工具调用不在这里重试（副作用不可重放）。
+        let tools = match self.handshake(cfg).await {
+            Ok(t) => t,
+            Err(first) => {
+                {
+                    let mut guard = self.procs.lock().unwrap();
+                    if let Some(procs) = guard.as_mut() {
+                        procs.remove(&cfg.id);
                     }
                 }
+                self.spawn_if_absent(cfg)?;
+                self.handshake(cfg)
+                    .await
+                    .map_err(|second| format!("{first}；重试仍失败: {second}"))?
             }
-        }
-        // (re)handshake outside the map lock
-        let tools = self.handshake(cfg).await?;
+        };
         let mut guard = self.procs.lock().unwrap();
         if let Some(procs) = guard.as_mut() {
             if let Some(entry) = procs.get_mut(&cfg.id) {

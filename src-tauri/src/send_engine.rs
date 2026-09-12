@@ -1013,7 +1013,9 @@ async fn run_send(
         let stop = stop.clone();
         let save_lock = state.save_lock.clone();
         let data_dir = state.data_dir.clone();
-        let client = state.client.clone();
+        // 聊天流式走 read_idle 客户端：没有总时长上限，上游 90s 无字节
+        // 才判死（image_generate 自带 per-request 300s，不受影响）
+        let client = state.stream_client.clone();
         let system = system.clone();
         let app = app.clone();
 
