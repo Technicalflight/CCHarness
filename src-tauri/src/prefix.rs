@@ -717,6 +717,32 @@ fn responses_tools(tools: &Value) -> Value {
     )
 }
 
+/// Chat-completions tool schema → Anthropic tool schema
+/// ({type:"function",function:{name,description,parameters}} →
+/// {name,description,input_schema}). Order-preserving; entries without a
+/// `function` object are dropped.
+fn anthropic_tools(tools: &Value) -> Value {
+    Value::Array(
+        tools
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|t| {
+                let f = t.get("function")?;
+                Some(json!({
+                    "name": f.get("name").cloned().unwrap_or(Value::Null),
+                    "description": f.get("description").cloned().unwrap_or(Value::Null),
+                    "input_schema": f
+                        .get("parameters")
+                        .cloned()
+                        .unwrap_or(json!({ "type": "object" })),
+                }))
+            })
+            .collect(),
+    )
+}
+
 /// Anthropic bodies are structurally different (top-level system, required
 /// max_tokens), so Zone stability is maintained per-role fragments but the
 /// exact byte-layout guarantee belongs to the OpenAI-compat path.
@@ -746,6 +772,7 @@ pub fn build_anthropic_body(
     max_output: Option<u32>,
     temperature: Option<f64>,
     tier: CacheTier,
+    tools: Option<&Value>,
 ) -> String {
     let cache_mark = || match tier {
         CacheTier::Long => Some(json!({ "type": "ephemeral", "ttl": "1h" })),
@@ -811,6 +838,14 @@ pub fn build_anthropic_body(
         body["temperature"] = serde_json::Value::Number(
             serde_json::Number::from_f64(t).expect("temperature f64"),
         );
+    }
+    if let Some(t) = tools {
+        let converted = anthropic_tools(t);
+        if converted.as_array().is_some_and(|a| !a.is_empty()) {
+            // cache prefix order is tools → system → messages; the tool set
+            // is byte-stable per epoch, so it sits BEFORE the system mark
+            body["tools"] = converted;
+        }
     }
     if !system_prompt.is_empty() {
         if let Some(mark) = cache_mark() {
@@ -1023,11 +1058,11 @@ mod tests {
     fn anthropic_body_honors_behavior_opts() {
         let msgs = [ChatMessage::plain("user", "hi")];
         // no overrides: built-in 8192 cap, no temperature
-        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long, None);
         assert!(b.contains("\"max_tokens\":8192"), "{b}");
         assert!(!b.contains("temperature"), "{b}");
         // overrides applied
-        let b = build_anthropic_body("claude-x", "sys", &msgs, Some(2048), Some(0.5), CacheTier::Long);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, Some(2048), Some(0.5), CacheTier::Long, None);
         assert!(b.contains("\"max_tokens\":2048"), "{b}");
         assert!(b.contains("\"temperature\":0.5"), "{b}");
     }
@@ -1042,7 +1077,7 @@ mod tests {
             ChatMessage::plain("assistant", "回答一"),
             ChatMessage::plain("user", "第二轮"),
         ];
-        let b = build_anthropic_body("claude-x", "系统提示", &msgs, None, None, CacheTier::Long);
+        let b = build_anthropic_body("claude-x", "系统提示", &msgs, None, None, CacheTier::Long, None);
         // exactly two markers: system + newest-message breakpoint
         assert_eq!(b.matches("\"ttl\":\"1h\"").count(), 2, "{b}");
         let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
@@ -1069,7 +1104,7 @@ mod tests {
             "看图",
             vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into(), file_ref: None }],
         )];
-        let b = build_anthropic_body("claude-x", "", &msgs, None, None, CacheTier::Long);
+        let b = build_anthropic_body("claude-x", "", &msgs, None, None, CacheTier::Long, None);
         let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
         let blocks = v["messages"][0]["content"].as_array().expect("blocks");
         assert_eq!(blocks.last().unwrap()["type"], "image");
@@ -1082,7 +1117,7 @@ mod tests {
         // Short: ephemeral markers WITHOUT ttl — the API-default 5-minute
         // window at the cheaper write rate (serde_json sorts object keys,
         // so match the marker substring without assuming key order)
-        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Short);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Short, None);
         assert!(b.contains("\"cache_control\":{\"type\":\"ephemeral\"}"), "{b}");
         assert!(!b.contains("ttl"), "{b}");
         assert_eq!(b.matches("\"cache_control\"").count(), 2, "{b}");
@@ -1091,11 +1126,37 @@ mod tests {
         assert!(v["system"][0]["cache_control"].get("ttl").is_none());
 
         // None: no markers anywhere; system degrades to the plain string
-        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::None);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::None, None);
         assert!(!b.contains("cache_control"), "{b}");
         let v: serde_json::Value = serde_json::from_str(&b).expect("valid json");
         assert_eq!(v["system"], serde_json::json!("sys"));
         assert_eq!(v["messages"][0]["content"], serde_json::json!("hi"));
+    }
+
+    #[test]
+    fn anthropic_body_injects_tools() {
+        let msgs = [ChatMessage::plain("user", "hi")];
+        // chat schema converts to {name, description, input_schema}
+        let tools = serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "读文件",
+                    "parameters": { "type": "object", "properties": { "path": { "type": "string" } } }
+                }
+            }
+        ]);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long, Some(&tools));
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        let t = &v["tools"][0];
+        assert_eq!(t["name"], "read_file");
+        assert_eq!(t["description"], "读文件");
+        assert_eq!(t["input_schema"]["type"], "object");
+        assert!(t.get("function").is_none(), "must not keep chat nesting");
+        // cache prefix order (tools → system → messages) is an API-side
+        // structural rule — serde_json sorts object keys, so the byte order
+        // of "tools"/"system" in the payload is irrelevant and unasserted
     }
 
     #[test]
@@ -1139,7 +1200,7 @@ mod tests {
             "看图",
             vec![ChatImage { mime: "image/png".into(), b64: "aGk=".into(), file_ref: None }],
         )];
-        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long);
+        let b = build_anthropic_body("claude-x", "sys", &msgs, None, None, CacheTier::Long, None);
         assert!(b.contains("\"type\":\"image\""), "{b}");
         assert!(b.contains("\"media_type\":\"image/png\""), "{b}");
         assert!(b.contains("\"data\":\"aGk=\""), "{b}");

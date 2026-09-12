@@ -158,6 +158,9 @@ pub async fn stream_lane(
     let mut cfilter = crate::confidence::ConfidenceFilter::new();
     let mut tool_accs: Vec<ToolCallAcc> = Vec::new();
     let mut finish_reason: Option<String> = None;
+    // Anthropic block index → tool_accs position (text blocks interleave)
+    let mut anthropic_blocks: std::collections::HashMap<u64, usize> =
+        std::collections::HashMap::new();
 
     use futures_util::StreamExt;
     loop {
@@ -219,7 +222,17 @@ pub async fn stream_lane(
                         )
                     }
                     ProviderKind::Anthropic => {
-                        handle_anthropic_frame(ctx, &v, &mut content, &mut reasoning, &mut usage, &mut cfilter)
+                        handle_anthropic_frame(
+                            ctx,
+                            &v,
+                            &mut content,
+                            &mut reasoning,
+                            &mut usage,
+                            &mut cfilter,
+                            &mut tool_accs,
+                            &mut finish_reason,
+                            &mut anthropic_blocks,
+                        )
                     }
                 }
             }
@@ -475,6 +488,7 @@ fn handle_openai_frame(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_anthropic_frame(
     ctx: &SendCtx<'_>,
     v: &Value,
@@ -482,6 +496,9 @@ fn handle_anthropic_frame(
     reasoning: &mut String,
     usage: &mut UsageStat,
     cfilter: &mut crate::confidence::ConfidenceFilter,
+    tool_accs: &mut Vec<ToolCallAcc>,
+    finish_reason: &mut Option<String>,
+    blocks: &mut std::collections::HashMap<u64, usize>,
 ) {
     match v.get("type").and_then(|x| x.as_str()) {
         Some("message_start") => {
@@ -500,6 +517,9 @@ fn handle_anthropic_frame(
                 usage.cache_write = Some(w);
             }
         }
+        Some("content_block_start") => {
+            anthropic_tool_start(v, tool_accs, blocks);
+        }
         Some("content_block_delta") => {
             let d = v.get("delta");
             match d.map(|d| d.get("type").and_then(|t| t.as_str())) {
@@ -509,7 +529,10 @@ fn handle_anthropic_frame(
                         ctx.emit_reasoning(t);
                     }
                 }
-                Some(Some("text_delta")) | Some(Some("input_json_delta")) | None => {
+                Some(Some("input_json_delta")) => {
+                    anthropic_tool_delta(v, d, tool_accs, blocks);
+                }
+                Some(Some("text_delta")) | None => {
                     if let Some(t) = d.and_then(|d| d.get("text")).and_then(|x| x.as_str()) {
                         let clean = cfilter.push(t);
                         if !clean.is_empty() {
@@ -522,11 +545,54 @@ fn handle_anthropic_frame(
             }
         }
         Some("message_delta") => {
+            // Anthropic stop_reason → OpenAI 语义（stream_lane 的
+            // wants_tools 检查的是 "tool_calls"）
+            if v.pointer("/delta/stop_reason").and_then(|x| x.as_str()) == Some("tool_use") {
+                *finish_reason = Some("tool_calls".to_string());
+            }
             if let Some(out) = v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()) {
                 usage.output = Some(out);
             }
         }
         _ => {}
+    }
+}
+
+/// content_block_start(type=tool_use)：注册一个调用accumulator，
+/// 记录 block index → accumulator 位置（text/tool 块交错时 index 不连续）。
+fn anthropic_tool_start(
+    v: &Value,
+    tool_accs: &mut Vec<ToolCallAcc>,
+    blocks: &mut std::collections::HashMap<u64, usize>,
+) {
+    if v.pointer("/content_block/type").and_then(|x| x.as_str()) != Some("tool_use") {
+        return;
+    }
+    let idx = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
+    blocks.insert(idx, tool_accs.len());
+    tool_accs.push(ToolCallAcc {
+        id: v.pointer("/content_block/id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        name: v.pointer("/content_block/name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        args: String::new(),
+    });
+}
+
+/// content_block_delta(input_json_delta)：分片字段是 partial_json —— 此前
+/// 这类分片被当 text_delta 处理（读 delta.text 读不到 → 工具参数整体
+/// 丢失，tool_use 静默失效）。按 block index 追加到对应 accumulator。
+fn anthropic_tool_delta(
+    v: &Value,
+    d: Option<&Value>,
+    tool_accs: &mut [ToolCallAcc],
+    blocks: &mut std::collections::HashMap<u64, usize>,
+) {
+    if let Some(t) = d.and_then(|d| d.get("partial_json")).and_then(|x| x.as_str()) {
+        let idx = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
+        if let Some(pos) = blocks.get(&idx) {
+            if let Some(acc) = tool_accs.get_mut(*pos) {
+                acc.args.push_str(t);
+            }
+        }
     }
 }
 
@@ -924,7 +990,10 @@ fn merge_alternating(msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::new();
     for m in msgs {
         if let Some(last) = out.last_mut() {
-            if last.role == m.role && m.role == "user" {
+            // 相邻同角色（user 或 assistant）都必须合并：tool 记录被
+            // Anthropic 路径丢弃后，连续 assistant 会触发 400
+            // roles-must-alternate
+            if last.role == m.role && (m.role == "user" || m.role == "assistant") {
                 last.content.push_str("\n\n");
                 last.content.push_str(&m.content);
                 continue;
@@ -951,13 +1020,20 @@ pub fn build_body(
             lp.build_responses_body(model, new_msgs, tools)
         }
         ProviderKind::Anthropic => {
-            // Anthropic path: tool schema not injected in v1; the request keeps
-            // its legacy shape (top-level system + merged roles). new_msgs
-            // collapse to a single trailing user turn for compat.
+            // Anthropic path: legacy shape (top-level system + merged roles).
+            // In-history system messages (RollingMemo / workflow re-injection)
+            // have no Anthropic role — they used to be silently DROPPED here,
+            // making the memo invisible on Anthropic providers; now they are
+            // demoted to user turns with a marker prefix.
             let mut msgs: Vec<ChatMessage> = Vec::new();
             for m in new_msgs {
-                if m.role == "user" || m.role == "assistant" {
-                    msgs.push(m.clone());
+                match m.role.as_str() {
+                    "user" | "assistant" => msgs.push(m.clone()),
+                    "system" if !m.content.is_empty() => msgs.push(ChatMessage::plain(
+                        "user",
+                        format!("[系统更新]\n\n{}", m.content),
+                    )),
+                    _ => {}
                 }
             }
             let merged = merge_alternating(msgs);
@@ -969,6 +1045,7 @@ pub fn build_body(
                 beh.and_then(|b| b.max_output),
                 beh.and_then(|b| b.temperature),
                 p.cache_tier(),
+                tools,
             )
         }
     }
@@ -1471,6 +1548,78 @@ mod tests {
 
     fn usage(input: Option<u64>, cached: Option<u64>, cache_write: Option<u64>) -> UsageStat {
         UsageStat { input, output: Some(100), cached, cache_write }
+    }
+
+    // --- Anthropic streaming tool_use (input_json_delta / partial_json)
+
+    #[test]
+    fn anthropic_tool_stream_assembles_partial_json() {
+        let mut accs: Vec<ToolCallAcc> = Vec::new();
+        let mut blocks: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        let frame = |partial: &str, idx: u64| {
+            serde_json::json!({
+                "index": idx,
+                "delta": { "type": "input_json_delta", "partial_json": partial }
+            })
+        };
+        anthropic_tool_start(
+            &serde_json::json!({
+                "index": 1,
+                "content_block": { "type": "tool_use", "id": "toolu_1", "name": "read_file" }
+            }),
+            &mut accs,
+            &mut blocks,
+        );
+        // {"path":  +  "a.rs"  +  }  →  分片三段拼出完整参数 JSON
+        for part in ["{\"path\":", "\"a.rs\"", "}"] {
+            let f = frame(part, 1);
+            anthropic_tool_delta(&f, Some(f.get("delta").unwrap()), &mut accs, &mut blocks);
+        }
+        assert_eq!(accs.len(), 1);
+        assert_eq!(accs[0].name, "read_file");
+        assert_eq!(accs[0].id, "toolu_1");
+        assert_eq!(accs[0].args, r#"{"path":"a.rs"}"#);
+    }
+
+    #[test]
+    fn anthropic_body_carries_system_updates_and_tools() {
+        let p = mk_provider(ProviderKind::Anthropic);
+        // in-history system 消息（RollingMemo 注入）必须降级为 user 出现，
+        // 而不是被丢弃；tools 必须转换注入
+        let lp = LanePrefix::new("sys", "k");
+        let new_msgs = vec![
+            ChatMessage::plain("system", "滚动记忆：用户偏好深色主题"),
+            ChatMessage::plain("user", "继续"),
+        ];
+        let tools = serde_json::json!([
+            { "type": "function", "function": { "name": "read_file", "parameters": { "type": "object" } } }
+        ]);
+        let body = build_body(
+            &p,
+            "claude-x",
+            &lp,
+            &new_msgs,
+            "sys",
+            Some(&tools),
+        );
+        assert!(body.contains("[系统更新]"), "system update must survive: {body}");
+        assert!(body.contains("滚动记忆"), "{body}");
+        assert!(body.contains("\"tools\""), "{body}");
+        assert!(body.contains("\"input_schema\""), "{body}");
+        assert!(!body.contains("\"role\":\"system\""), "no system role in messages: {body}");
+    }
+
+    #[test]
+    fn merge_alternating_collapses_consecutive_assistants() {
+        let msgs = vec![
+            ChatMessage::plain("user", "a"),
+            ChatMessage::plain("assistant", "b"),
+            ChatMessage::plain("assistant", "c"),
+            ChatMessage::plain("user", "d"),
+        ];
+        let merged = merge_alternating(msgs);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[1].content, "b\n\nc");
     }
 
     // --- item: one-shot bodies carry no cache marks (pi compaction discipline)
