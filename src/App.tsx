@@ -22,7 +22,13 @@ import { SubagentsView } from "./views/SubagentsView";
 import { WorkflowView } from "./views/WorkflowView";
 
 export function App() {
-  const { view, bootstrap, sidebarOpen, runUpdateCheck } = useApp();
+  // per-field selectors: the ROOT component re-rendering on every stream
+  // delta cascades through TitleBar and every unmemoized child (P1 —
+  // ChatView/Sidebar/ArenaView were split earlier; this was the holdout)
+  const view = useApp((s) => s.view);
+  const bootstrap = useApp((s) => s.bootstrap);
+  const sidebarOpen = useApp((s) => s.sidebarOpen);
+  const runUpdateCheck = useApp((s) => s.runUpdateCheck);
   const previewOpen = useApp((s) => s.previewOpen);
   const panelW = useApp((s) => s.panelW);
   const [closeAsk, setCloseAsk] = useState(false);

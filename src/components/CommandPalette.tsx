@@ -59,8 +59,12 @@ export function CommandPalette() {
       label: "新建会话",
       tag: "操作",
       run: async () => {
-        const binding = store.sessions.find((s) => s.kind === "chat" && s.bindings[0])?.bindings[0];
-        await store.newSession("chat", binding ? [binding] : [], "新会话");
+        try {
+          const binding = store.sessions.find((s) => s.kind === "chat" && s.bindings[0])?.bindings[0];
+          await store.newSession("chat", binding ? [binding] : [], "新会话");
+        } catch (e) {
+          store.toast("error", `新建会话失败: ${String(e)}`);
+        }
       },
     });
     list.push({
@@ -68,8 +72,12 @@ export function CommandPalette() {
       label: "新建竞技场（多模型对比）",
       tag: "操作",
       run: async () => {
-        const lanes = store.sessions.find((s) => s.kind === "arena")?.bindings ?? [];
-        await store.newSession("arena", lanes, "竞技场");
+        try {
+          const lanes = store.sessions.find((s) => s.kind === "arena")?.bindings ?? [];
+          await store.newSession("arena", lanes, "竞技场");
+        } catch (e) {
+          store.toast("error", `新建竞技场失败: ${String(e)}`);
+        }
       },
     });
     list.push({

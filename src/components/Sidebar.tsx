@@ -127,6 +127,7 @@ export function Sidebar() {
   const selectSession = useApp((s) => s.selectSession);
   const deleteSession = useApp((s) => s.deleteSession);
   const newSession = useApp((s) => s.newSession);
+  const toast = useApp((s) => s.toast);
   const refreshSessions = useApp((s) => s.refreshSessions);
   const lastRequest = useApp((s) => s.lastRequest);
   const config = useApp((s) => s.config);
@@ -315,8 +316,14 @@ export function Sidebar() {
           className="mini-btn"
           title="新建会话"
           onClick={async () => {
-            const binding = sessions.find((s) => s.kind === "chat" && s.bindings[0])?.bindings[0];
-            await newSession("chat", binding ? [binding] : [], "新会话");
+            try {
+              const binding = sessions.find((s) => s.kind === "chat" && s.bindings[0])?.bindings[0];
+              await newSession("chat", binding ? [binding] : [], "新会话");
+            } catch (e) {
+              // a silent unhandled rejection here just looks like a dead
+              // button — surface it
+              toast("error", `新建会话失败: ${String(e)}`);
+            }
           }}
         >
           ＋

@@ -118,14 +118,23 @@ export function ReviewView() {
     setPicked(null);
     setWrites([]);
     setMsgs([]);
+    // alive guard: slow loads for the previous session must not overwrite
+    // the (already cleared) state of the newly selected one
+    let alive = true;
     void (async () => {
       try {
-        setWrites(await api.listSessionWrites(sel));
-        setMsgs(await api.getSessionMessages(sel));
+        const w = await api.listSessionWrites(sel);
+        const m = await api.getSessionMessages(sel);
+        if (!alive) return;
+        setWrites(w);
+        setMsgs(m);
       } catch (e) {
-        toast("error", `审阅数据加载失败: ${String(e)}`);
+        if (alive) toast("error", `审阅数据加载失败: ${String(e)}`);
       }
     })();
+    return () => {
+      alive = false;
+    };
   }, [sel, toast]);
 
   const pick = async (ts: number) => {

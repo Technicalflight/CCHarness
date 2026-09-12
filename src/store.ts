@@ -503,19 +503,35 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   deleteSession: async (id) => {
+    // streaming guard: deleting mid-turn must stop the run first — the
+    // orphaned stream keeps burning tokens and its events land on a dead
+    // session with confusing toasts
+    if (get().busy[id] || get().streaming[id]?.length) {
+      try {
+        await get().stop(id);
+      } catch {
+        /* already stopped */
+      }
+    }
     await api.deleteSession(id);
     set((s) => {
       const messages = { ...s.messages };
       delete messages[id];
       const todos = { ...s.todos };
       delete todos[id];
+      const streaming = { ...s.streaming };
+      delete streaming[id];
+      const busy = { ...s.busy };
+      delete busy[id];
+      const queue = { ...s.queue };
+      delete queue[id];
       // 会话没了，挂着写入审批卡没有任何意义 —— 一并清掉
       const approvals: Record<string, PendingApproval> = {};
       for (const [k, v] of Object.entries(s.approvals)) {
         if (v.sessionId !== id) approvals[k] = v;
       }
       const activeSessionId = s.activeSessionId === id ? null : s.activeSessionId;
-      return { messages, todos, approvals, activeSessionId };
+      return { messages, todos, approvals, activeSessionId, streaming, busy, queue };
     });
     await get().refreshSessions();
   },

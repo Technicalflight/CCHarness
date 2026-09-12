@@ -116,6 +116,9 @@ const UserItem = memo(function UserItem({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
+              // isComposing guard: IME confirmation Enter must not fire a
+              // destructive rollback + resend (same guard as the composer)
+              if (e.nativeEvent.isComposing || e.key === "Process") return;
               if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
                 e.preventDefault();
                 if (draft.trim()) onResend(draft.trim());

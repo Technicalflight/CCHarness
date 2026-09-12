@@ -52,13 +52,20 @@ export function TelemetryView() {
 
   useEffect(() => {
     if (!sel) return;
+    // alive guard: a slow response for the previous selection must not
+    // land after the user switched sessions
+    let alive = true;
     void (async () => {
       try {
-        setTel(await api.getTelemetry(sel));
+        const t = await api.getTelemetry(sel);
+        if (alive) setTel(t);
       } catch (e) {
-        toast("error", `遥测加载失败: ${String(e)}`);
+        if (alive) toast("error", `遥测加载失败: ${String(e)}`);
       }
     })();
+    return () => {
+      alive = false;
+    };
   }, [sel, toast]);
 
   const summary = tel?.summary;

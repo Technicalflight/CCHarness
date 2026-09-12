@@ -690,7 +690,14 @@ export function Composer({
                 }
                 if (e.key === "Enter" && hashMenu.sessions.length > 0) {
                   e.preventDefault();
-                  void pickSession(hashMenu.sessions[0]);
+                  // Enter picks the first FILTERED item — the visible list
+                  // is the filtered one, so raw[0] after a search would
+                  // reference a session the user cannot even see
+                  const q = hashMenu.q.toLowerCase();
+                  const first = hashMenu.sessions.find(
+                    (s) => !hashMenu.q || s.title.toLowerCase().includes(q)
+                  );
+                  if (first) void pickSession(first);
                 }
               }}
             />
@@ -733,21 +740,32 @@ export function Composer({
             }
             // overlong text paste → auto-attach (ZCode parity): a huge dump
             // would wreck the draft box; as an attachment it rides as a
-            // fenced block appended at send time, removable via its chip
+            // fenced block appended at send time, removable via its chip.
+            // Same caps as addFiles — the auto path must not bypass the
+            // per-file (200KB) and total (500KB) attachment limits.
             if (!imageMode) {
               const txt = e.clipboardData?.getData("text/plain") ?? "";
               if (txt.length > 12_000) {
                 e.preventDefault();
                 const size = new Blob([txt]).size;
-                setAttachments((cur) => [
-                  ...cur,
-                  {
-                    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                    name: `粘贴文本 ${txt.length} 字`,
-                    size,
-                    text: txt,
-                  },
-                ]);
+                if (size > 200 * 1024) {
+                  toast("error", `粘贴内容超过单附件 200KB 上限 —— 请拆分后分次粘贴`);
+                  return;
+                }
+                const entry = {
+                  id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                  name: `粘贴文本 ${txt.length} 字`,
+                  size,
+                  text: txt,
+                };
+                setAttachments((cur) => {
+                  const merged = [...cur, entry];
+                  if (merged.reduce((s, a) => s + a.size, 0) > 500 * 1024) {
+                    toast("error", "附件总大小超过 500KB —— 粘贴内容未附加");
+                    return cur;
+                  }
+                  return merged;
+                });
                 toast("info", `粘贴内容过长（${txt.length} 字符）—— 已自动转为附件注入，可点标签移除`);
                 return;
               }
