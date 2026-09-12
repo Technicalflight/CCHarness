@@ -95,8 +95,17 @@ function ContextMeter({ sessionId, contextWindow }: { sessionId: string; context
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     };
     document.addEventListener("mousedown", close);
-    void api.getTelemetry(sessionId).then(setTel).catch(() => {});
-    return () => document.removeEventListener("mousedown", close);
+    // alive guard: a slow response for the previous session must not
+    // land after the user switched sessions while the popover was open
+    let alive = true;
+    void api
+      .getTelemetry(sessionId)
+      .then((t) => alive && setTel(t))
+      .catch(() => {});
+    return () => {
+      alive = false;
+      document.removeEventListener("mousedown", close);
+    };
   }, [open, sessionId]);
 
   const inputTok = last?.input_tokens ?? null;

@@ -742,13 +742,18 @@ export function ChatView() {
   // worktree isolation: status follows the selected session and refreshes as
   // messages land, so the changed-file badge updates right after a turn
   const [wtInfo, setWtInfo] = useState<WtInfo | null>(null);
+  // Identity of the session the worktree status currently belongs to.
+  // A slow wtInfo response from a previous session must never land after
+  // the user switched (same cross-session class as the chat-lane fixes).
+  const wtSidRef = useRef<string | null>(activeSessionId);
   const refreshWt = (sid: string) => {
     void api
       .wtInfo(sid)
-      .then(setWtInfo)
+      .then((r) => wtSidRef.current === sid && setWtInfo(r))
       .catch(() => {});
   };
   useEffect(() => {
+    wtSidRef.current = activeSessionId;
     if (!activeSessionId) {
       setWtInfo(null);
       return;
@@ -756,7 +761,7 @@ export function ChatView() {
     let alive = true;
     void api
       .wtInfo(activeSessionId)
-      .then((r) => alive && setWtInfo(r))
+      .then((r) => alive && wtSidRef.current === activeSessionId && setWtInfo(r))
       .catch(() => {});
     return () => {
       alive = false;
