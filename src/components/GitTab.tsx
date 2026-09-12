@@ -7,6 +7,7 @@ import { useApp } from "../store";
 import * as api from "../lib/api";
 import type { GitBranch, GitFile, GitOverview, GitRemote } from "../types";
 import { Icon } from "../lib/icons";
+import { ConfirmDialog } from "./Dialog";
 
 const LT_CLS: Record<string, string> = {
   M: "lt-m",
@@ -77,6 +78,13 @@ export function GitTab({ workspace, wtActive }: { workspace: string; wtActive: b
   const [diffPath, setDiffPath] = useState<string | null>(null);
   const [diffText, setDiffText] = useState("");
   const [diffLoading, setDiffLoading] = useState(false);
+  // 自绘确认框（应用纪律：不调用浏览器 confirm）——挂起动作随状态一起存
+  const [confirmAsk, setConfirmAsk] = useState<null | {
+    title: string;
+    description: string;
+    danger?: boolean;
+    action: () => void;
+  }>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
   const refresh = useCallback(async () => {
@@ -154,9 +162,15 @@ export function GitTab({ workspace, wtActive }: { workspace: string; wtActive: b
     void run("取消暂存", () => api.gitUnstage(workspace, path));
   };
   const discard = (path: string) => {
-    if (!window.confirm(`丢弃「${path}」的未提交改动？此操作不可恢复。`)) return;
-    setBusyPath(path);
-    void run("丢弃改动", () => api.gitDiscard(workspace, path));
+    setConfirmAsk({
+      title: "丢弃未提交改动",
+      description: `「${path}」的未提交改动将被还原，此操作不可恢复。`,
+      danger: true,
+      action: () => {
+        setBusyPath(path);
+        void run("丢弃改动", () => api.gitDiscard(workspace, path));
+      },
+    });
   };
   const switchBranch = (name: string) => {
     setBranchMenu(false);
@@ -234,19 +248,25 @@ export function GitTab({ workspace, wtActive }: { workspace: string; wtActive: b
   };
 
   const removeRemote = (name: string) => {
-    if (!window.confirm(`移除远程仓库「${name}」？（本地文件不受影响）`)) return;
-    if (syncing) return;
-    setSyncing(name);
-    void (async () => {
-      try {
-        await api.gitRemoteRemove(workspace, name);
-        await loadRemotes();
-      } catch (e) {
-        toast("error", `移除远程失败: ${String(e)}`);
-      } finally {
-        setSyncing(null);
-      }
-    })();
+    setConfirmAsk({
+      title: "移除远程仓库",
+      description: `将移除远程「${name}」（本地文件不受影响）。`,
+      danger: true,
+      action: () => {
+        if (syncing) return;
+        setSyncing(name);
+        void (async () => {
+          try {
+            await api.gitRemoteRemove(workspace, name);
+            await loadRemotes();
+          } catch (e) {
+            toast("error", `移除远程失败: ${String(e)}`);
+          } finally {
+            setSyncing(null);
+          }
+        })();
+      },
+    });
   };
 
   const commit = async () => {
@@ -601,6 +621,19 @@ export function GitTab({ workspace, wtActive }: { workspace: string; wtActive: b
             ))}
           </div>
         </div>
+      )}
+      {confirmAsk && (
+        <ConfirmDialog
+          title={confirmAsk.title}
+          description={confirmAsk.description}
+          danger={confirmAsk.danger}
+          onCancel={() => setConfirmAsk(null)}
+          onConfirm={() => {
+            const act = confirmAsk.action;
+            setConfirmAsk(null);
+            act();
+          }}
+        />
       )}
     </div>
   );

@@ -773,6 +773,8 @@ export function ChatView() {
 
   // isolation popover + diff overlay state
   const [wtOpen, setWtOpen] = useState(false);
+  // 合并/丢弃隔离改动走自绘确认框（应用纪律：不调用浏览器 confirm）
+  const [wtAsk, setWtAsk] = useState<null | "merge" | "discard">(null);
   const [wtDiffOpen, setWtDiffOpen] = useState(false);
   const [wtDiffText, setWtDiffText] = useState("");
   const modeFloatRef = useRef<HTMLDivElement>(null);
@@ -798,9 +800,16 @@ export function ChatView() {
       toast("error", String(e));
     }
   };
-  const mergeWt = async () => {
+  const mergeWt = () => {
     if (!activeSessionId) return;
-    if (!window.confirm(`将把隔离分支的 ${wtCount} 个文件改动以未提交形式应用回主工作区，并删除 worktree。继续？`)) return;
+    setWtAsk("merge");
+  };
+  const discardWt = () => {
+    if (!activeSessionId) return;
+    setWtAsk("discard");
+  };
+  const runWtMerge = async () => {
+    if (!activeSessionId) return;
     setWtOpen(false);
     try {
       const summary = await api.wtMerge(activeSessionId);
@@ -810,9 +819,8 @@ export function ChatView() {
       toast("error", String(e));
     }
   };
-  const discardWt = async () => {
+  const runWtDiscard = async () => {
     if (!activeSessionId) return;
-    if (!window.confirm(`丢弃隔离分支的全部 ${wtCount} 个文件改动？此操作不可恢复。`)) return;
     setWtOpen(false);
     try {
       await api.wtDiscard(activeSessionId);
@@ -1925,6 +1933,24 @@ export function ChatView() {
           confirmText="确认压缩"
           onCancel={() => setCompactEst(null)}
           onConfirm={() => void runCompact()}
+        />
+      )}
+      {wtAsk && (
+        <ConfirmDialog
+          title={wtAsk === "merge" ? "合并隔离改动" : "丢弃隔离改动"}
+          description={
+            wtAsk === "merge"
+              ? `将把隔离分支的 ${wtCount} 个文件改动以未提交形式应用回主工作区，并删除 worktree。继续？`
+              : `将丢弃隔离分支的全部 ${wtCount} 个文件改动（不可恢复），并退出隔离。`
+          }
+          confirmText={wtAsk === "merge" ? "合并" : "丢弃"}
+          danger={wtAsk === "discard"}
+          onCancel={() => setWtAsk(null)}
+          onConfirm={() => {
+            const kind = wtAsk;
+            setWtAsk(null);
+            void (kind === "merge" ? runWtMerge() : runWtDiscard());
+          }}
         />
       )}
       {wtDiffOpen && (
