@@ -78,30 +78,42 @@ function FilesTab({
   const [loading, setLoading] = useState(false);
   const consumedRef = useRef<string | null>(null);
   const fsVersion = useApp((s) => s.fsVersion);
+  // stale-response guard: every navigation (open / change dir / refresh)
+  // bumps the sequence; only the latest-issued async result may touch state,
+  // so a slow earlier read can never land on top of a newer one
+  const navSeq = useRef(0);
 
   const loadDir = async (rel: string) => {
+    const seq = ++navSeq.current;
     setLoading(true);
     setError("");
     try {
-      setEntries(await api.listWorkspaceDir(workspace, rel));
+      const list = await api.listWorkspaceDir(workspace, rel);
+      if (seq !== navSeq.current) return;
+      setEntries(list);
     } catch (e) {
+      if (seq !== navSeq.current) return;
       setEntries([]);
       setError(String(e));
     } finally {
-      setLoading(false);
+      if (seq === navSeq.current) setLoading(false);
     }
   };
 
   const openFile = async (rel: string) => {
+    const seq = ++navSeq.current;
     setLoading(true);
     setError("");
     try {
-      setContent(await api.readWorkspaceFile(workspace, rel));
+      const content = await api.readWorkspaceFile(workspace, rel);
+      if (seq !== navSeq.current) return;
+      setContent(content);
       setFile(rel);
     } catch (e) {
+      if (seq !== navSeq.current) return;
       setError(String(e));
     } finally {
-      setLoading(false);
+      if (seq === navSeq.current) setLoading(false);
     }
   };
 
@@ -117,10 +129,14 @@ function FilesTab({
   useEffect(() => {
     if (fsVersion === 0) return;
     if (file) {
+      const seq = ++navSeq.current;
       void (async () => {
         try {
-          setContent(await api.readWorkspaceFile(workspace, file));
+          const content = await api.readWorkspaceFile(workspace, file);
+          if (seq !== navSeq.current) return;
+          setContent(content);
         } catch {
+          if (seq !== navSeq.current) return;
           setFile(null);
           void loadDir(dir);
         }
@@ -148,7 +164,15 @@ function FilesTab({
     return (
       <div className="pv-code">
         <div className="pv-code-bar">
-          <button className="pv-ib" title="返回目录" onClick={() => setFile(null)}>
+          <button
+            className="pv-ib"
+            title="返回目录"
+            onClick={() => {
+              // an in-flight file read must not re-open the file view
+              ++navSeq.current;
+              setFile(null);
+            }}
+          >
             <Icon name="chevronRight" size={14} style={{ transform: "rotate(180deg)" }} />
           </button>
           <span className="pv-code-path" title={file}>

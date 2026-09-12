@@ -69,7 +69,10 @@ export function TitleBar() {
         }
       })
       .then((f) => {
-        unlisten = f;
+        // the subscription promise may resolve AFTER unmount ran the cleanup
+        // — storing `f` then would leak the listener forever; unlisten now
+        if (alive) unlisten = f;
+        else f();
       })
       .catch(() => {});
     return () => {

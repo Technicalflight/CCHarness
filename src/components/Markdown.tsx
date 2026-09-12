@@ -11,28 +11,46 @@ let mermaidMod: Promise<{ default: typeof import("mermaid").default }> | null = 
 function loadMermaid() {
   if (!mermaidMod) {
     mermaidMod = import("mermaid");
-    mermaidMod.then(({ default: mermaid }) => {
-      const light = document.documentElement.getAttribute("data-theme") === "light";
-      mermaid.initialize({
-        startOnLoad: false,
-        securityLevel: "strict",
-        theme: light ? "neutral" : "dark",
-      });
-    });
   }
   return mermaidMod;
+}
+
+// the app theme lives in data-theme on <html>; mermaid bakes its palette
+// into the SVG at render time, so blocks must re-render when it flips
+function useAppTheme(): "light" | "dark" {
+  const [theme, setTheme] = useState<"light" | "dark">(() =>
+    document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark"
+  );
+  useEffect(() => {
+    const obs = new MutationObserver(() =>
+      setTheme(document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark")
+    );
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => obs.disconnect();
+  }, []);
+  return theme;
 }
 
 function MermaidBlock({ code }: { code: string }) {
   const [svg, setSvg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [showSource, setShowSource] = useState(false);
+  const theme = useAppTheme();
   useEffect(() => {
     let cancelled = false;
     setSvg(null);
     setErr(null);
     loadMermaid()
-      .then(({ default: mermaid }) => mermaid.render(`mmd-${Math.random().toString(36).slice(2)}`, code))
+      .then(({ default: mermaid }) => {
+        // (re)initialize per render — initialize is mermaid's global config
+        // and the theme may have flipped since the last block was drawn
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: "strict",
+          theme: theme === "light" ? "neutral" : "dark",
+        });
+        return mermaid.render(`mmd-${Math.random().toString(36).slice(2)}`, code);
+      })
       .then(({ svg: out }) => {
         if (!cancelled) setSvg(out);
       })
@@ -42,7 +60,7 @@ function MermaidBlock({ code }: { code: string }) {
     return () => {
       cancelled = true;
     };
-  }, [code]);
+  }, [code, theme]);
   return (
     <div className="code-block mermaid-block">
       <div className="code-head">
