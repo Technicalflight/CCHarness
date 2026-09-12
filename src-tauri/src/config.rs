@@ -419,6 +419,30 @@ pub struct McpServerConfig {
     pub headers: std::collections::BTreeMap<String, String>,
 }
 
+impl McpServerConfig {
+    /// stdio env vars and http headers routinely carry credentials
+    /// (Authorization tokens, API-key env vars). They get the same
+    /// at-rest sealing as provider keys; `load`/`save` call these so the
+    /// in-memory config always holds plaintext while the disk never does.
+    fn seal_credentials(&mut self) {
+        for v in self.env.values_mut() {
+            *v = protect_api_key(v);
+        }
+        for v in self.headers.values_mut() {
+            *v = protect_api_key(v);
+        }
+    }
+
+    fn unseal_credentials(&mut self) {
+        for v in self.env.values_mut() {
+            *v = unprotect_api_key(v);
+        }
+        for v in self.headers.values_mut() {
+            *v = unprotect_api_key(v);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MarketSkill {
     #[serde(default)]
@@ -872,6 +896,9 @@ pub fn load(data_dir: &Path) -> AppConfig {
         p.api_key = unprotect_api_key(&p.api_key);
     }
     cfg.settings.embeddings_key = unprotect_api_key(&cfg.settings.embeddings_key);
+    for m in &mut cfg.mcp_servers {
+        m.unseal_credentials();
+    }
     cfg
 }
 
@@ -883,6 +910,9 @@ pub fn save(data_dir: &Path, cfg: &AppConfig) {
         p.api_key = protect_api_key(&p.api_key);
     }
     out.settings.embeddings_key = protect_api_key(&out.settings.embeddings_key);
+    for m in &mut out.mcp_servers {
+        m.seal_credentials();
+    }
     // atomic-ish: write temp then rename
     let path = config_path(data_dir);
     let tmp = data_dir.join("config.json.tmp");

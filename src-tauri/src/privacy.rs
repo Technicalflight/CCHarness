@@ -102,6 +102,12 @@ fn trim_log(path: &Path) {
         let mut body = kept.into_iter().rev().collect::<Vec<_>>().join("\n");
         body.push('\n');
         let _ = std::fs::write(path, body);
+        // the rewrite must not relax the owner-only mode of the original
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
     }
 }
 
@@ -116,6 +122,14 @@ fn log_hit(session: &str, kind: &str, original: &str, surrogate: &str) {
         surrogate: surrogate.chars().take(160).collect(),
     };
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        // the log stores the ORIGINAL values (that is its purpose) — on
+        // unix it must not be readable by group/others, same discipline as
+        // master_key and config.json
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         use std::io::Write;
         if let Ok(line) = serde_json::to_string(&entry) {
             let _ = writeln!(f, "{line}");

@@ -300,6 +300,17 @@ pub fn get_config(state: State<'_, AppState>) -> AppConfig {
         p.api_key = config::mask_key(&p.api_key);
     }
     cfg.settings.embeddings_key = config::mask_key(&cfg.settings.embeddings_key);
+    // MCP stdio env vars / http headers carry credentials too (Authorization
+    // tokens, API-key envs) — same discipline: masked on the way out,
+    // restored on the way back in save_config
+    for m in &mut cfg.mcp_servers {
+        for v in m.env.values_mut() {
+            *v = config::mask_key(v);
+        }
+        for v in m.headers.values_mut() {
+            *v = config::mask_key(v);
+        }
+    }
     cfg
 }
 
@@ -332,6 +343,33 @@ pub fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<(), 
     }
     if config::is_masked_key(&cfg.settings.embeddings_key) {
         cfg.settings.embeddings_key = stored.settings.embeddings_key.clone();
+    }
+    // masked MCP credentials mean "unchanged" — same restore rule as keys
+    for m in &mut cfg.mcp_servers {
+        if let Some(sm) = stored.mcp_servers.iter().find(|sm| sm.id == m.id) {
+            for (k, v) in &mut m.env {
+                if config::is_masked_key(v) {
+                    *v = sm.env.get(k).cloned().unwrap_or_default();
+                }
+            }
+            for (k, v) in &mut m.headers {
+                if config::is_masked_key(v) {
+                    *v = sm.headers.get(k).cloned().unwrap_or_default();
+                }
+            }
+        } else {
+            // a brand-new server cannot carry meaningful masks — clear them
+            for v in m.env.values_mut() {
+                if config::is_masked_key(v) {
+                    *v = String::new();
+                }
+            }
+            for v in m.headers.values_mut() {
+                if config::is_masked_key(v) {
+                    *v = String::new();
+                }
+            }
+        }
     }
     config::save(&state.data_dir, &cfg);
     sync_sandbox_policy(&cfg.settings);
@@ -1048,6 +1086,35 @@ pub fn import_session(
 ) -> Result<SessionMeta, String> {
     if !std::path::Path::new(&path).is_file() {
         return Err(format!("文件不存在: {path}"));
+    }
+    // path containment: without it this command is an arbitrary file-read
+    // primitive under a compromised webview (the transcript would flow into
+    // model context). Known sources must stay inside their canonical
+    // transcript directory; the generic adapter is confined to the user's
+    // profile tree (where these transcript files live anyway).
+    let canonical = std::fs::canonicalize(&path).map_err(|e| format!("无法解析路径: {e}"))?;
+    match crate::importer::source_dir(&source) {
+        Some(base) => {
+            let base_canon = std::fs::canonicalize(&base)
+                .map_err(|_| format!("来源目录不可用: {}", base.display()))?;
+            if !canonical.starts_with(&base_canon) {
+                return Err(format!(
+                    "路径不在 {} 的转录目录内",
+                    source
+                ));
+            }
+        }
+        None => {
+            let home = std::fs::canonicalize(
+                std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .map_err(|_| "无法确定用户主目录")?,
+            )
+            .map_err(|_| "无法确定用户主目录")?;
+            if !canonical.starts_with(&home) {
+                return Err("通用导入仅支持用户主目录内的转录文件".into());
+            }
+        }
     }
     // same size cap as import_scan: a huge file would be read wholesale
     // into memory (OOM) — and under an XSS this command is an arbitrary

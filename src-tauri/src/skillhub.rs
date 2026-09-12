@@ -141,6 +141,11 @@ pub async fn install_skill(
     }
     let mut raw = String::new();
     f.read_to_string(&mut raw).map_err(|e| format!("SKILL.md 不是 UTF-8 文本: {e}"))?;
+    // the declared-size check above trusts the zip central directory; the
+    // decompressed output is what memory actually holds — re-check for real
+    if raw.len() > 2 * 1024 * 1024 {
+        return Err("SKILL.md 解压后超过 2MB".into());
+    }
     let skill_md: String = raw;
 
     // normalize: our scanner reads name/description/inject from frontmatter;

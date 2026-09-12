@@ -45,7 +45,7 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 /// Default transcript locations per source id.
-fn source_dir(source: &str) -> Option<PathBuf> {
+pub(crate) fn source_dir(source: &str) -> Option<PathBuf> {
     let home = home_dir()?;
     match source {
         "claude-code" => Some(home.join(".claude").join("projects")),
