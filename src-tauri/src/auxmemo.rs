@@ -219,7 +219,10 @@ fn l2_put(data_dir: &Path, ns: &str, key: &str, e: &EntryMeta) -> std::io::Resul
     payload.extend_from_slice(&json);
     keystream_xor(&mk, &nonce, &mut payload[MAGIC.len() + 16..]);
     let path = key_file(data_dir, ns, key);
-    let tmp = dir.join(format!(".{key}.tmp"));
+    // the tmp name must be unique per write: two concurrent puts of the same
+    // key would otherwise interleave into ONE tmp file and the rename could
+    // publish a torn entry
+    let tmp = dir.join(format!(".{}.{}.tmp", key, uuid::Uuid::new_v4()));
     fs::write(&tmp, &payload)?;
     fs::rename(&tmp, &path)?;
     enforce_bound(&dir);

@@ -46,8 +46,20 @@ impl SessionStore {
                 let p = e.path();
                 if p.extension().and_then(|x| x.to_str()) == Some("json") {
                     if let Ok(raw) = fs::read_to_string(&p) {
-                        if let Ok(sf) = serde_json::from_str::<SessionFile>(&raw) {
-                            metas.push(sf.meta);
+                        match serde_json::from_str::<SessionFile>(&raw) {
+                            Ok(sf) => metas.push(sf.meta),
+                            Err(err) => {
+                                // a corrupt session must not vanish silently:
+                                // log it, keep a rescue copy, and let the
+                                // orphan sweep treat it as EXISTING (its subs
+                                // must not be purged while it may be repairable)
+                                eprintln!(
+                                    "[sessions] {} 解析失败（{}）；已备份 .broken",
+                                    p.display(),
+                                    err
+                                );
+                                let _ = fs::copy(&p, p.with_extension("json.broken"));
+                            }
                         }
                     }
                 }
@@ -55,6 +67,24 @@ impl SessionStore {
         }
         metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         metas
+    }
+
+    /// Session ids present on disk (file stems) — includes corrupt files
+    /// that list() cannot parse, so the orphan sweep never kills a sub
+    /// whose parent file merely failed to parse this run.
+    fn on_disk_ids(&self) -> std::collections::HashSet<String> {
+        let mut ids = std::collections::HashSet::new();
+        if let Ok(entries) = fs::read_dir(&self.dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("json") {
+                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                        ids.insert(stem.to_string());
+                    }
+                }
+            }
+        }
+        ids
     }
 
     pub fn load(&self, id: &str) -> Result<SessionFile, String> {
@@ -163,7 +193,10 @@ impl SessionStore {
     /// Returns how many files were purged.
     pub fn delete_orphan_subs(&self) -> usize {
         let metas = self.list();
-        let ids: std::collections::HashSet<&str> = metas.iter().map(|m| m.id.as_str()).collect();
+        // existence is judged by the FILE on disk, not by the parsed list —
+        // a corrupt parent would otherwise count as missing and its living
+        // subs would be purged as orphans
+        let ids: std::collections::HashSet<String> = self.on_disk_ids();
         let mut purged = 0usize;
         for m in &metas {
             if m.kind != "sub" {

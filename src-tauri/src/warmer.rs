@@ -55,7 +55,7 @@ static GEN: AtomicU64 = AtomicU64::new(0);
 pub fn cancel(session_id: &str, lane: u32) {
     if let Some(handle) = WARMERS
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .as_mut()
         .and_then(|m| m.remove(&(session_id.to_string(), lane)))
     {
@@ -91,7 +91,7 @@ pub fn schedule(
     });
     WARMERS
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get_or_insert_with(HashMap::new)
         .insert(key, (gen, handle));
 }

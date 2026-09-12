@@ -43,6 +43,10 @@ pub(crate) fn git_net(cwd: &Path, args: &[&str]) -> Result<String, String> {
 
 fn git_deadline(cwd: &Path, args: &[&str], secs: u64) -> Result<String, String> {
     let mut c = std::process::Command::new("git");
+    // quotePath off: git's default escapes non-ASCII filenames to C-style
+    // octet octals ("\346\226\207.txt"), which the panel displays garbled
+    // AND feeds back as a pathspec that matches nothing
+    c.arg("-c").arg("core.quotePath=false");
     c.args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
@@ -57,15 +61,20 @@ fn git_deadline(cwd: &Path, args: &[&str], secs: u64) -> Result<String, String> 
         .map_err(|e| format!("无法启动 git（请确认已安装并加入 PATH）: {e}"))?;
     let out = child.stdout.take().expect("stdout piped");
     let err = child.stderr.take().expect("stderr piped");
-    let t_out = std::thread::spawn(move || {
+    // readers report through a channel: a killed git that spawned a
+    // grandchild still holding the pipe (credential helpers do) would make
+    // join() block forever — a bounded receive keeps the deadline honest
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
         let mut b = Vec::new();
         let _ = std::io::Read::read_to_end(&mut std::io::BufReader::new(out), &mut b);
-        b
+        let _ = tx_out.send(b);
     });
-    let t_err = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut b = Vec::new();
         let _ = std::io::Read::read_to_end(&mut std::io::BufReader::new(err), &mut b);
-        b
+        let _ = tx_err.send(b);
     });
     let deadline = Instant::now() + Duration::from_secs(secs);
     let status = loop {
@@ -84,8 +93,11 @@ fn git_deadline(cwd: &Path, args: &[&str], secs: u64) -> Result<String, String> 
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).to_string();
-    let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).to_string();
+    // short grace for the pipe readers; a lingering grandchild holding the
+    // write end must not hang the caller past its deadline
+    let grace = Duration::from_millis(2000);
+    let stdout = String::from_utf8_lossy(&rx_out.recv_timeout(grace).unwrap_or_default()).to_string();
+    let stderr = String::from_utf8_lossy(&rx_err.recv_timeout(grace).unwrap_or_default()).to_string();
     match status {
         Some(st) if st.success() => Ok(stdout.trim_end().to_string()),
         Some(st) => Err(format!(

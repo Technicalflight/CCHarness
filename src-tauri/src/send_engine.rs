@@ -2384,7 +2384,7 @@ async fn run_send(
                                         || state
                                             .grants
                                             .lock()
-                                            .unwrap()
+                                            .unwrap_or_else(|p| p.into_inner())
                                             .as_ref()
                                             .is_some_and(|s| {
                                                 s.contains(&grant_key(&session_id, "take_screenshot"))
@@ -2504,7 +2504,7 @@ async fn run_send(
                                                 || state
                                                     .grants
                                                     .lock()
-                                                    .unwrap()
+                                                    .unwrap_or_else(|p| p.into_inner())
                                                     .as_ref()
                                                     .is_some_and(|s| {
                                                         s.contains(&grant_key(&session_id, &tc.name))

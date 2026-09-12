@@ -19,13 +19,13 @@ pub(crate) fn sm_put(state: &AppState, session_id: &str, gate: &str) {
     state
         .workflow
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get_or_insert_with(HashMap::new)
         .insert(session_id.to_string(), gate.to_string());
     state
         .sm_state
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get_or_insert_with(HashMap::new)
         .insert(session_id.to_string(), gate.to_string());
 }
@@ -67,7 +67,7 @@ pub(crate) fn workflow_of_in(state: &AppState, session_id: &str, data_dir: &std:
     let cached = state
         .workflow
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .and_then(|m| m.get(session_id))
         .cloned();
@@ -82,7 +82,7 @@ pub(crate) fn workflow_of_in(state: &AppState, session_id: &str, data_dir: &std:
                 state
                     .workflow
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|p| p.into_inner())
                     .get_or_insert_with(HashMap::new)
                     .insert(session_id.to_string(), g.clone());
                 Some(g)
@@ -115,7 +115,7 @@ pub async fn set_workflow_mode(
         state
             .workflow
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .get_or_insert_with(HashMap::new)
             .insert(session_id.clone(), mode.clone());
         // checkpoint: "agent" clears the persisted gate, everything else
@@ -266,7 +266,7 @@ async fn set_goal_inner(
     state
         .workflow
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get_or_insert_with(HashMap::new)
         .insert(session_id.to_string(), "goal".to_string());
     persist_gate(state, session_id, Some("goal")).await;
@@ -450,7 +450,7 @@ pub fn sm_get(state: State<'_, AppState>, session_id: String) -> String {
     state
         .sm_state
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .and_then(|m| m.get(&session_id))
         .cloned()
@@ -473,6 +473,12 @@ pub async fn sm_set(
         .iter()
         .find(|d| d.id == def_id)
         .ok_or_else(|| format!("工作流不存在: {def_id}"))?;
+    // a DISABLED workflow must not be enterable — same discipline as the
+    // set_workflow_mode whitelist; otherwise the progress-bar chips could
+    // activate a gate the user turned off
+    if !def.enabled {
+        return Err(format!("工作流「{}」已停用", def.name));
+    }
     if !def.states.iter().any(|s| s.name == state_name) {
         return Err(format!("工作流「{}」没有状态「{state_name}」", def.name));
     }
@@ -486,7 +492,7 @@ pub(crate) fn permission_of(state: &AppState, session_id: &str) -> &'static str 
     let m = state
         .permissions
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .and_then(|m| m.get(session_id))
         .cloned();
@@ -509,7 +515,7 @@ pub fn set_permission_mode(
     state
         .permissions
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get_or_insert_with(HashMap::new)
         .insert(session_id, mode);
     Ok(())

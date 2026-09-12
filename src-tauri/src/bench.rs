@@ -52,6 +52,10 @@ pub struct BenchRun {
 
 const HISTORY_CAP: usize = 50;
 
+/// Serializes load-modify-save of the history file: two concurrent bench
+/// runs would otherwise race and the loser's run record vanishes.
+static HISTORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn history_path(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join("bench_history.json")
 }
@@ -280,6 +284,7 @@ pub async fn bench_run(
         judge,
         results,
     };
+    let _g = HISTORY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut history = load_history(&state.data_dir);
     history.insert(0, run.clone());
     save_history(&state.data_dir, &history).ok(); // best-effort persistence
