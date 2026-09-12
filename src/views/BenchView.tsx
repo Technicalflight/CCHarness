@@ -10,7 +10,9 @@ import * as api from "../lib/api";
 import type { BenchCase, BenchRun } from "../types";
 
 export function BenchView() {
-  const { config, toast } = useApp();
+  // per-field selectors — a bare useApp() re-renders on every stream delta
+  const config = useApp((s) => s.config);
+  const toast = useApp((s) => s.toast);
   const providers = useMemo(
     () => (config?.providers ?? []).filter((p) => p.enabled && p.api_key.trim().length > 0),
     [config]

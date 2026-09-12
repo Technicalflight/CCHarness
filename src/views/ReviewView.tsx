@@ -102,7 +102,9 @@ function ToolCallList({ msgs }: { msgs: MessageRecord[] }) {
 }
 
 export function ReviewView() {
-  const { sessions, toast } = useApp();
+  // per-field selectors — a bare useApp() re-renders on every stream delta
+  const sessions = useApp((s) => s.sessions);
+  const toast = useApp((s) => s.toast);
   const chatSessions = sessions.filter((s) => s.kind === "chat");
   const [sel, setSel] = useState<string>("");
   const [writes, setWrites] = useState<WriteLogEntry[]>([]);

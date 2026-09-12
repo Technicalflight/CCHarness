@@ -33,7 +33,7 @@ function SubagentEditor({
   onDone: (p: SubagentProfile) => void;
   onCancel: () => void;
 }) {
-  const { config } = useApp();
+  const config = useApp((s) => s.config);
   const [d, setD] = useState<SubagentProfile>(initial);
   if (!config) return null;
 
@@ -143,7 +143,9 @@ function SubagentEditor({
 }
 
 export function SubagentsView() {
-  const { config, persistConfig, toast } = useApp();
+  const config = useApp((s) => s.config);
+  const persistConfig = useApp((s) => s.persistConfig);
+  const toast = useApp((s) => s.toast);
   const [editing, setEditing] = useState<SubagentProfile | null>(null);
 
   if (!config) return null;

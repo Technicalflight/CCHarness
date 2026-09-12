@@ -43,7 +43,10 @@ function newId(): string {
 }
 
 function ProviderCard({ provider: p }: { provider: Provider }) {
-  const { config, persistConfig, toast } = useApp();
+  // per-field selectors — a bare useApp() re-renders the card on every stream delta
+  const config = useApp((s) => s.config);
+  const persistConfig = useApp((s) => s.persistConfig);
+  const toast = useApp((s) => s.toast);
   const [draft, setDraft] = useState<Provider>(p);
   const [testing, setTesting] = useState(false);
   const [pricingFor, setPricingFor] = useState<string | null>(null);
@@ -392,7 +395,9 @@ function ProviderCard({ provider: p }: { provider: Provider }) {
 }
 
 export function ModelsView() {
-  const { config, persistConfig, toast } = useApp();
+  const config = useApp((s) => s.config);
+  const persistConfig = useApp((s) => s.persistConfig);
+  const toast = useApp((s) => s.toast);
   const [adding, setAdding] = useState(false);
   const [importing, setImporting] = useState(false);
 

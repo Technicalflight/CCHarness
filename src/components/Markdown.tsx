@@ -4,6 +4,7 @@
 import { memo, useEffect, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import * as api from "../lib/api";
 
 // mermaid is heavy (~1MB): loaded on demand — the first ```mermaid block
 // in a session triggers the dynamic import, everything else never pays.
@@ -125,6 +126,29 @@ function languageOf(className: string | undefined): string {
 }
 
 const components: Components = {
+  // a bare <a href> navigates the WHOLE webview: the app UI gets replaced
+  // by the external site, IPC dies with the origin and every in-flight
+  // stream is lost. Model-generated links make that a one-click hazard, so
+  // external targets open through the system shell instead.
+  a({ node: _node, children, href, ...rest }) {
+    const external = !!href && /^(https?|mailto):/i.test(href);
+    return (
+      <a
+        {...rest}
+        href={external ? undefined : href}
+        onClick={
+          external
+            ? (e) => {
+                e.preventDefault();
+                void api.openExternal(href!).catch(() => {});
+              }
+            : rest.onClick
+        }
+      >
+        {children}
+      </a>
+    );
+  },
   pre({ children }) {
     // react-markdown hands us <pre><code className="language-x">…</code></pre>
     const child = Array.isArray(children) ? children[0] : children;

@@ -29,7 +29,10 @@ const AUX_ORIGIN_META: Record<AuxOrigin, { label: string; color: string }> = {
 };
 
 export function TelemetryView() {
-  const { sessions, toast } = useApp();
+  // per-field selectors: a bare useApp() re-renders the whole view on every
+  // stream delta (sessions/toast are the only fields this view touches)
+  const sessions = useApp((s) => s.sessions);
+  const toast = useApp((s) => s.toast);
   const [sel, setSel] = useState<string>("");
   const [tel, setTel] = useState<SessionTelemetry | null>(null);
   const [global, setGlobal] = useState<GlobalStats | null>(null);

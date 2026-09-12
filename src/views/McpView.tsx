@@ -502,7 +502,7 @@ function ServerCard({
   onEdit: () => void;
   onDelete: () => void;
 }) {
-  const { persistConfig } = useApp();
+  const persistConfig = useApp((s) => s.persistConfig);
   const stateOk = status?.state === "ok";
   const metas: string[] = [];
   if (server.cwd) metas.push(`cwd ${server.cwd}`);
@@ -567,7 +567,10 @@ function ServerCard({
 /* ------------------------------------------------------------------ */
 
 export function McpView() {
-  const { config, persistConfig, toast } = useApp();
+  // per-field selectors — a bare useApp() re-renders on every stream delta
+  const config = useApp((s) => s.config);
+  const persistConfig = useApp((s) => s.persistConfig);
+  const toast = useApp((s) => s.toast);
   const [status, setStatus] = useState<McpStatusEntry[]>([]);
   const [testingId, setTestingId] = useState<string | null>(null);
   /** Draft being added/edited in the dialog; null = closed. */

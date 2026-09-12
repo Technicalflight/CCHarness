@@ -56,7 +56,7 @@ function WorkflowEditor({
   onDone: (w: WorkflowDef) => void;
   onCancel: () => void;
 }) {
-  const { config } = useApp();
+  const config = useApp((s) => s.config);
   const [d, setD] = useState<WorkflowDef>(initial);
   if (!config) return null;
 
@@ -350,7 +350,9 @@ function WorkflowEditor({
 }
 
 export function WorkflowView() {
-  const { config, persistConfig, toast } = useApp();
+  const config = useApp((s) => s.config);
+  const persistConfig = useApp((s) => s.persistConfig);
+  const toast = useApp((s) => s.toast);
   const [editing, setEditing] = useState<WorkflowDef | null>(null);
 
   if (!config) return null;

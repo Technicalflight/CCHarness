@@ -14,7 +14,14 @@ const IMPORT_SOURCES = [
 ];
 
 export function SettingsView() {
-  const { config, persistConfig, toast, refreshSessions, selectSession, runUpdateCheck } = useApp();
+  // per-field selectors — a bare useApp() re-renders the 900-line settings
+  // DOM on every stream delta while another view is streaming
+  const config = useApp((s) => s.config);
+  const persistConfig = useApp((s) => s.persistConfig);
+  const toast = useApp((s) => s.toast);
+  const refreshSessions = useApp((s) => s.refreshSessions);
+  const selectSession = useApp((s) => s.selectSession);
+  const runUpdateCheck = useApp((s) => s.runUpdateCheck);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   // update check preference lives in localStorage (client-side only);
   // "off" = disabled, anything else / missing = enabled
