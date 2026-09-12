@@ -17,6 +17,7 @@ use crate::sessions::{now_ms, SessionStore};
 use crate::types_rs::{MessageRecord, RequestStat, SessionBinding, StreamEvent};
 use crate::workflow::{
     handle_goal_tool, parse_goal_summary_ext, permission_of, persist_gate, record_workflow_of,
+    strip_list_prefix,
     sm_put, workflow_of_in,
 };
 use serde_json::Value;
@@ -2782,9 +2783,9 @@ async fn run_send(
                 let (ok, total, done, claimed) = parse_goal_summary_ext(&turn_text);
                 let pending: String = turn_text
                     .lines()
-                    .find(|l| l.trim_start().starts_with('⬜'))
+                    .find(|l| strip_list_prefix(l).starts_with('⬜'))
                     .map(|l| {
-                        l.trim_start()
+                        strip_list_prefix(l)
                             .trim_start_matches('⬜')
                             .trim()
                             .chars()

@@ -158,6 +158,31 @@ pub fn get_workflow_mode(state: State<'_, AppState>, session_id: String) -> Stri
 /// handle_goal_tool); pause/resume/clear are user-only.
 const GOAL_STATUSES: &[&str] = &["active", "paused", "achieved", "unmet", "budget_limited"];
 
+/// Checklist lines tolerate Markdown list syntax: models frequently emit
+/// "- ✅ …" / "1. ✅ …" even though the directive shows bare markers, and a
+/// line the parser misses silently deflates the progress counters. Only the
+/// common, unambiguous forms are stripped — a missed line is the status quo,
+/// a wrongly counted one is worse.
+pub(crate) fn strip_list_prefix(line: &str) -> &str {
+    let s = line.trim_start();
+    if let Some(rest) = s
+        .strip_prefix("- ")
+        .or_else(|| s.strip_prefix("* "))
+        .or_else(|| s.strip_prefix("+ "))
+    {
+        return rest.trim_start();
+    }
+    // ordered list: "12. " or "12、"
+    let digits_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if digits_end > 0 {
+        let rest = &s[digits_end..];
+        if let Some(after) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix("、")) {
+            return after.trim_start();
+        }
+    }
+    s
+}
+
 /// Parse the LAST ```goal checklist block in an assistant reply — extended
 /// (better-harness "claimed vs exercised" grading): counts ✅ criteria whose
 /// line carries NO inline evidence — no backtick
@@ -191,7 +216,7 @@ pub fn parse_goal_summary_ext(content: &str) -> (usize, usize, bool, usize) {
     let mut total = 0usize;
     let mut claimed = 0usize;
     for line in body.lines() {
-        let t = line.trim_start();
+        let t = strip_list_prefix(line);
         if t.starts_with("✅") {
             ok += 1;
             total += 1;
@@ -537,6 +562,27 @@ mod goal_tests {
     fn claimed_zero_when_all_rows_evidenced() {
         let content = "```goal\n✅ 修复断裂 `git diff --check`\n✅ 复跑通过（cargo test 全绿）\nGOAL_DONE\n```";
         assert_eq!(pgs(content), (2, 2, true, 0));
+    }
+
+    #[test]
+    fn bullet_prefixed_criteria_still_counted() {
+        // 模型常用 Markdown 列表语法输出清单：- / * / 1. / 12、 都要计入
+        let content = "```goal\n- ✅ 一 `a.rs`\n* ⬜ 二\n1. ✅ 三（证明）\n12、 ⬜ 四\nplain 说明\n```";
+        assert_eq!(pgs(content), (2, 4, false, 0));
+    }
+
+    #[test]
+    fn bullet_prefixed_claimed_still_flagged() {
+        // 列表项剥掉前缀后再做证据审计：无反引号无括注 → claimed
+        let content = "```goal\n- ✅ 无证据行\n+ ✅ 也无证据\n```";
+        assert_eq!(pgs(content), (2, 2, false, 2));
+    }
+
+    #[test]
+    fn decimal_lookalike_lines_not_stripped() {
+        // "3.5 倍" 不是有序列表前缀——不能把 ".5 倍…" 剥成判定行
+        let content = "```goal\n3.5 倍性能达标\n```";
+        assert_eq!(pgs(content), (0, 0, false, 0));
     }
 }
 
