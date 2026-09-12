@@ -1473,6 +1473,28 @@ pub fn post_write_verify(workspace: &str, command: &str) -> Option<String> {
     }
 }
 
+/// Sandbox network triple for one URL (deny list / malicious heuristics /
+/// block-all with allow exceptions). Lives next to the fetch loop so it can
+/// be replayed for EVERY redirect hop — entry-time checks alone lose to a
+/// 302 that bounces past the deny/block-all lists.
+fn sandbox_net_check(url: &str) -> Result<(), String> {
+    let p = SANDBOX.lock().unwrap_or_else(|p| p.into_inner());
+    if !p.on || !p.network {
+        return Ok(());
+    }
+    let host = url_host(url);
+    if p.net_malicious && malicious_url(url, &host) {
+        return Err(format!("「{host}」命中恶意域名拦截规则（网络策略）"));
+    }
+    if p.net_deny.iter().any(|d| domain_match(d, &host)) {
+        return Err(format!("「{host}」命中网络禁止名单（网络策略）"));
+    }
+    if p.net_block_all && !p.net_allow.iter().any(|d| domain_match(d, &host)) {
+        return Err("已开启「阻止所有外部网络」，目标域名不在允许名单（网络策略）".into());
+    }
+    Ok(())
+}
+
 /// Fetch a public URL and return readable plain text. Runs on a dedicated
 /// thread (reqwest blocking + join) because tool execution is sync inside an
 /// async command. SSRF: the same urlguard policy as provider endpoints, plus
@@ -1508,6 +1530,11 @@ fn web_fetch(url: &str) -> Result<String, String> {
                 .to_string();
             if crate::urlguard::is_loopback_or_private(&host) {
                 return Err(format!("目标 {host} 位于本机/内网，请求已拒绝"));
+            }
+            // sandbox net policy replays on EVERY hop: entry-time checks
+            // alone lose to a 302 that bounces past deny/block-all lists
+            if let Err(e) = sandbox_net_check(current.as_str()) {
+                return Err(format!("重定向目标被网络策略拦截: {e}"));
             }
             let port = current.port_or_known_default().unwrap_or(80);
             let mut pinned: Option<std::net::SocketAddr> = None;

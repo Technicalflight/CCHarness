@@ -316,17 +316,27 @@ impl McpManager {
             entry.pending.lock().unwrap_or_else(|p| p.into_inner()).insert(id, tx);
             (entry.stdin.clone(), entry.pending.clone())
         };
-        // …then write through the async stdin lock (Send-safe across await)
+        // …then write through the async stdin lock (Send-safe across await).
+        // A stuck child that never drains its pipe would park write_all
+        // forever and take the whole tool loop down with it — the write and
+        // flush are bounded like the response wait.
         match stdin_arc {
             Some(s) => {
                 let mut stdin = s.lock().await;
-                if let Err(e) = stdin.write_all(line.as_bytes()).await {
+                let write = async {
+                    stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+                    stdin.flush().await.map_err(|e| e.to_string())?;
+                    Ok::<(), String>(())
+                };
+                if let Err(e) = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    write,
+                )
+                .await
+                .unwrap_or_else(|_| Err("写入超时".to_string()))
+                {
                     pending_arc.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
                     return Err(format!("写入失败: {e}"));
-                }
-                if let Err(e) = stdin.flush().await {
-                    pending_arc.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
-                    return Err(format!("flush 失败: {e}"));
                 }
             }
             None => {
@@ -468,13 +478,65 @@ fn spawn_server(
         std::sync::Arc::new(Mutex::new(HashMap::new()));
     let pending_reader = pending.clone();
     tokio::spawn(async move {
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-            let Some(id) = v.get("id").and_then(|i| i.as_u64()) else { continue };
-            if let Some(tx) = pending_reader.lock().unwrap_or_else(|p| p.into_inner()).remove(&id) {
-                let _ = tx.send(v);
+        // bounded line reader: a hostile server pushing one giant line must
+        // not balloon memory (next_line() would grow the buffer without
+        // limit). Manual fill_buf scanning caps a line at 8 MB — far beyond
+        // any legal MCP frame — and oversized lines are dropped whole while
+        // the framing stays aligned.
+        const MAX_LINE: usize = 8 * 1024 * 1024;
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line: Vec<u8> = Vec::new();
+            let mut overflow = false;
+            let mut eof = false;
+            loop {
+                let available = match reader.fill_buf().await {
+                    Ok(b) => b,
+                    Err(_) => {
+                        eof = true;
+                        break;
+                    }
+                };
+                if available.is_empty() {
+                    eof = true;
+                    break;
+                }
+                match available.iter().position(|&b| b == b'\n') {
+                    Some(i) => {
+                        if !overflow && line.len() + i <= MAX_LINE {
+                            line.extend_from_slice(&available[..i]);
+                        }
+                        reader.consume(i + 1);
+                        break;
+                    }
+                    None => {
+                        if line.len() + available.len() > MAX_LINE {
+                            overflow = true;
+                        }
+                        if !overflow {
+                            line.extend_from_slice(available);
+                        }
+                        let n = available.len();
+                        reader.consume(n);
+                    }
+                }
+            }
+            if line.is_empty() && eof {
+                break;
+            }
+            if !overflow {
+                if let Ok(v) = serde_json::from_str::<Value>(&String::from_utf8_lossy(&line)) {
+                    if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
+                        if let Some(tx) =
+                            pending_reader.lock().unwrap_or_else(|p| p.into_inner()).remove(&id)
+                        {
+                            let _ = tx.send(v);
+                        }
+                    }
+                }
+            }
+            if eof {
+                break;
             }
         }
     });

@@ -319,6 +319,24 @@ fn sane_token(kind: &str, v: &str, strict: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Remote-URL transport safety: git executes `ext::`/`tunnel::` URLs via a
+/// shell transport helper, so a compromised webview passing `ext::sh -c …`
+/// as a "URL" is a silent RCE. Whitelist the schemes we actually support;
+/// local paths (including Windows drive paths) and scp/git@ shapes stay
+/// usable. Anything containing the transport-helper `::` marker is refused.
+fn sane_remote_url(url: &str) -> Result<(), String> {
+    if url.contains("::") {
+        return Err(format!("不允许的传输助手 URL: {url}"));
+    }
+    if let Some(scheme_end) = url.find("://") {
+        let scheme = url[..scheme_end].to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "https" | "http" | "ssh" | "file") {
+            return Err(format!("不支持的远程 URL 协议: {scheme}://"));
+        }
+    }
+    Ok(())
+}
+
 /// Register a remote (name + URL). Git rejects duplicate names — the error
 /// surfaces so the user can remove the old one or pick another name.
 #[tauri::command]
@@ -330,6 +348,7 @@ pub fn git_remote_add(workspace: String, name: String, url: String) -> Result<()
     }
     sane_token("远程名", name, true)?;
     sane_token("URL", url, false)?;
+    sane_remote_url(url)?;
     crate::worktree::git(Path::new(&workspace), &["remote", "add", name, url]).map(|_| ())
 }
 
@@ -512,6 +531,22 @@ mod tests {
         crate::worktree::git(&dir, &["init", "-q", "--bare"])
             .unwrap_or_else(|e| panic!("bare init: {e}"));
         dir
+    }
+
+    #[test]
+    fn remote_url_whitelist_blocks_transport_helpers() {
+        assert!(sane_remote_url("https://github.com/x/y.git").is_ok());
+        assert!(sane_remote_url("http://host/repo").is_ok());
+        assert!(sane_remote_url("ssh://git@github.com/x/y.git").is_ok());
+        assert!(sane_remote_url("git@github.com:x/y.git").is_ok());
+        // local paths (incl. Windows drive paths) stay usable
+        let p = std::env::temp_dir().to_string_lossy().to_string();
+        assert!(sane_remote_url(&p).is_ok());
+        // transport-helper syntax is an RCE primitive here
+        assert!(sane_remote_url("ext::sh -c calc").is_err());
+        assert!(sane_remote_url("tunnel::something").is_err());
+        assert!(sane_remote_url("ftp://host/repo").is_err());
+        assert!(sane_remote_url("data://x").is_err());
     }
 
     #[tokio::test]

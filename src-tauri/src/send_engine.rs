@@ -684,6 +684,19 @@ pub(crate) async fn run_subagent(
                     .unwrap_or_else(|e| format!("ERROR: 工具任务失败: {e}"))
                 }
             };
+            // guardrails: the sub lane reads untrusted external content too
+            // (web_fetch over unknown pages, grep over unknown workspaces) —
+            // the main lane fences its tool results, and this background
+            // path runs without a user watching the stream. Same shape as
+            // the main lane: wrap first, then spill.
+            let result = if cfg.settings.guardrails
+                && !result.starts_with("ERROR:")
+                && !result.starts_with("DENIED:")
+            {
+                crate::guard::wrap_untrusted(&tc.name, &result, &cfg.settings.guardrails_extra)
+            } else {
+                result
+            };
             // context-volume: same trim as the main lane, so a delegation
             // whose result is later promoted into the parent replay keeps
             // identical bytes
