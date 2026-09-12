@@ -1957,21 +1957,44 @@ fn grep_files(workspace: &str, pattern: &str, glob_filter: &str) -> Result<Strin
 }
 
 fn walk_text_files(root: &Path, dir: &Path, visit: &mut impl FnMut(&str, &Path)) {
+    // canonical boundary: a symlinked/junctioned DIRECTORY inside the
+    // workspace could redirect the whole traversal outside it and feed
+    // foreign files into model context (glob_files and read_file already
+    // guard this — the walk was the last unguarded traversal). The root
+    // resolves once; every directory recursed into and every file visited
+    // must canonicalize back inside it. Unresolvable entries are skipped.
+    let Ok(root_canon) = fs::canonicalize(root) else { return };
+    walk_text_files_inner(&root_canon, dir, visit);
+}
+
+fn walk_text_files_inner(root_canon: &Path, dir: &Path, visit: &mut impl FnMut(&str, &Path)) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let p = e.path();
         let name = e.file_name().to_string_lossy().to_string();
         if p.is_dir() {
-            if !SKIP_DIRS.contains(&name.as_str()) {
-                walk_text_files(root, &p, visit);
+            if SKIP_DIRS.contains(&name.as_str()) {
+                continue;
             }
+            match fs::canonicalize(&p) {
+                Ok(real) if real.starts_with(root_canon) => {}
+                _ => continue,
+            }
+            walk_text_files_inner(root_canon, &p, visit);
         } else {
-            let rel = p
-                .strip_prefix(root)
-                .unwrap_or(&p)
+            // file symlinks too: the content reader follows links, so the
+            // resolved target must sit inside the workspace as well — and
+            // the visitor reads the RESOLVED path, not the link
+            let Ok(real) = fs::canonicalize(&p) else { continue };
+            if !real.starts_with(root_canon) {
+                continue;
+            }
+            let rel = real
+                .strip_prefix(root_canon)
+                .unwrap_or(&real)
                 .to_string_lossy()
                 .replace('\\', "/");
-            visit(&rel, &p);
+            visit(&rel, &real);
         }
     }
 }
@@ -2072,6 +2095,51 @@ mod tests {
         assert!(resolve_in_workspace(ws, escape).is_err());
         // empty workspace: absolute candidates have no boundary → refuse
         assert!(resolve_in_workspace("", outside).is_err());
+    }
+
+    #[test]
+    fn walk_skips_directory_links_outside_workspace() {
+        let ws = std::env::temp_dir().join(format!("cch_walk_ws_{}", std::process::id()));
+        let out = std::env::temp_dir().join(format!("cch_walk_out_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("secret.txt"), "outside\n").unwrap();
+        std::fs::write(ws.join("inside.txt"), "inside\n").unwrap();
+        // junction/symlink the out dir into the workspace
+        #[cfg(windows)]
+        let linked = {
+            use std::os::windows::process::CommandExt;
+            let st = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(ws.join("link"))
+                .arg(&out)
+                .creation_flags(0x0800_0000)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            st && ws.join("link").is_dir()
+        };
+        #[cfg(not(windows))]
+        let linked = std::os::unix::fs::symlink(&out, ws.join("link")).is_ok();
+        if !linked {
+            // sandbox refused the link — the guard is untestable here
+            let _ = std::fs::remove_dir_all(&ws);
+            let _ = std::fs::remove_dir_all(&out);
+            return;
+        }
+        let mut seen: Vec<String> = Vec::new();
+        walk_text_files(Path::new(&ws), Path::new(&ws), &mut |rel, _| {
+            seen.push(rel.to_string());
+        });
+        assert!(seen.iter().any(|r| r.ends_with("inside.txt")), "{seen:?}");
+        assert!(
+            !seen.iter().any(|r| r.contains("secret")),
+            "walk escaped through the directory link: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]
