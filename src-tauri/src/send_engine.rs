@@ -462,6 +462,7 @@ pub(crate) async fn run_subagent(
     cfg: &AppConfig,
     parent_channel: &tauri::ipc::Channel<StreamEvent>,
     parent_lane: u32,
+    stop: Arc<AtomicBool>,
     call_id: &str,
 ) -> Result<String, String> {
     let store = SessionStore::new(data_dir);
@@ -528,6 +529,10 @@ pub(crate) async fn run_subagent(
         images: Vec::new(),
     };
     {
+        // the parent's delete cascade (delete_session) holds save_lock while
+        // tearing subs down — an unserialized write here could resurrect the
+        // deleted sub file
+        let _guard = state.save_lock.lock().await;
         let mut s = store.load(&sub_id)?;
         s.messages.push(task_record.clone());
         store.save(&s)?;
@@ -556,10 +561,18 @@ pub(crate) async fn run_subagent(
     let task_msg = ChatMessage::plain("user", format!("{}{task}", chat::SUBAGENT_DIRECTIVE));
     let mut sent_this_turn: Vec<ChatMessage> = vec![task_msg.clone()];
     let channel = tauri::ipc::Channel::<StreamEvent>::new(|_| Ok(()));
-    let stop = Arc::new(AtomicBool::new(false));
+    // the caller's stop flag (the parent session's) — delegations must die
+    // with the stop button instead of streaming their full round budget
+    // unattended and uncancelled
 
     let mut final_text: Option<String> = None;
     for _round in 1..=max_rounds {
+        // the stop check heads the loop so tool execution between rounds is
+        // also covered: a click during a long tool waits out that tool, then
+        // the next round never starts
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let body = chat::build_body(&provider, &model, &owned_prefix, &sent_this_turn, &system_full, Some(&tools));
         let message_id = Uuid::new_v4().to_string();
         let ctx = chat::SendCtx {
@@ -650,6 +663,7 @@ pub(crate) async fn run_subagent(
         };
         sent_this_turn.push(asst_msg.clone());
         {
+            let _guard = state.save_lock.lock().await;
             let mut s = store.load(&sub_id)?;
             s.messages.push(record);
             // stopped/errored mid-round: same pairing discipline as the
@@ -752,10 +766,13 @@ pub(crate) async fn run_subagent(
                 tool_call_id: Some(tc.id.clone()),
                 images: Vec::new(),
             });
-            let mut s = store.load(&sub_id)?;
-            s.messages.push(tool_record);
-            s.meta.updated_at = now_ms();
-            store.save(&s)?;
+            {
+                let _guard = state.save_lock.lock().await;
+                let mut s = store.load(&sub_id)?;
+                s.messages.push(tool_record);
+                s.meta.updated_at = now_ms();
+                store.save(&s)?;
+            }
         }
     }
 
@@ -984,6 +1001,36 @@ async fn run_send(
     if content.trim().is_empty() {
         return Err("空消息".into());
     }
+
+    /// Removes the session from the in-flight set on every exit path of
+    /// run_send — early returns must not leave the session permanently
+    /// locked out of sending.
+    struct InflightGuard<'a> {
+        inflight: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+        session_id: String,
+    }
+    impl Drop for InflightGuard<'_> {
+        fn drop(&mut self) {
+            self.inflight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.session_id);
+        }
+    }
+
+    // one send per session at a time — the guard above releases on return
+    if !state
+        .inflight
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(session_id.clone())
+    {
+        return Err("该会话已有进行中的发送，请等待完成或先停止".into());
+    }
+    let _inflight = InflightGuard {
+        inflight: &state.inflight,
+        session_id: session_id.clone(),
+    };
 
     // cancellation flag for this session
     let stop = Arc::new(AtomicBool::new(false));
@@ -1977,6 +2024,7 @@ async fn run_send(
                             &cfg,
                             &channel,
                             lane,
+                            stop.clone(),
                             cid,
                         ));
                     }
@@ -2096,6 +2144,7 @@ async fn run_send(
                             &cfg,
                             &channel,
                             lane,
+                            stop.clone(),
                             cid,
                         ));
                     }

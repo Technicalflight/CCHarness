@@ -119,6 +119,11 @@ pub struct AppState {
     pub stream_client: reqwest::Client,
     /// Cancellation flags per session.
     pub stops: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Sessions with a send already in flight. Two concurrent run_send tasks
+    /// on one session would share the LanePrefix and last_span keys,
+    /// interleave Zone H appends in completion order and clobber each
+    /// other's stop flag — the second send is refused up front instead.
+    pub inflight: Mutex<std::collections::HashSet<String>>,
     /// Serializes session-file read-modify-write across lanes.
     pub save_lock: Arc<tokio::sync::Mutex<()>>,
     /// Lane prefix state — one window, one engine. Key: (session_id, lane).
@@ -244,6 +249,7 @@ impl AppState {
             client,
             stream_client,
             stops: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(std::collections::HashSet::new()),
             save_lock: Arc::new(tokio::sync::Mutex::new(())),
             prefixes: Mutex::new(None),
             seq: AtomicU64::new(max_seq + 1),
@@ -1583,6 +1589,7 @@ pub async fn wiki_generate(state: State<'_, AppState>, session_id: String) -> Re
         &cfg,
         &channel,
         0,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         "wiki",
     )
     .await?;

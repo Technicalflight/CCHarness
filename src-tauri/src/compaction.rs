@@ -999,6 +999,7 @@ mod memo_tests {
             client: reqwest::Client::new(),
             stream_client: reqwest::Client::new(),
             stops: std::sync::Mutex::new(HashMap::new()),
+            inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             save_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             prefixes: std::sync::Mutex::new(None),
             seq: std::sync::atomic::AtomicU64::new(1),
