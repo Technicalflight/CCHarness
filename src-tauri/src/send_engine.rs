@@ -426,11 +426,30 @@ const SUB_MAX_ROUNDS: usize = 12;
 /// Result text handed back to the parent model (chars).
 const SUB_RESULT_CAP: usize = 4_000;
 
+/// Removes the sub lane's prefix entry when a delegation ends — success,
+/// error or early return alike (Drop). The entry is keyed by a fresh
+/// per-run sub_id, so once the run is over nothing can reuse it (sub
+/// transcripts never go through run_send's rebuild path); without this
+/// guard the static map grows one dead LanePrefix per delegation.
+struct SubPrefixGuard<'a> {
+    state: &'a AppState,
+    sub_id: String,
+}
+impl Drop for SubPrefixGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(map) = prefixes_lock(self.state).as_mut() {
+            map.remove(&(self.sub_id.clone(), 0u32));
+        }
+    }
+}
+
 /// Run a background sub-agent for `delegate_subagent`: its own hidden
 /// session (kind "sub"), own prefix state, read-only tools, no MCP, no UI
 /// streaming (events go to a discard channel). Returns the final conclusion
 /// text for the parent's tool-result message. Sub-sessions are kept on disk
-/// (inspectable) but excluded from sidebar lists by the frontend.
+/// (inspectable) but excluded from sidebar lists by the frontend; they carry
+/// the parent link and are deleted with it (sessions::subs_of cascade), and
+/// the per-run prefix entry dies with the run via SubPrefixGuard.
 pub(crate) async fn run_subagent(
     state: &AppState,
     client: &reqwest::Client,
@@ -457,7 +476,9 @@ pub(crate) async fn run_subagent(
     };
     let sf = store.create("sub", vec![binding_for_sub(profile, parent_binding)], &format!("🤖 子任务 · {title}"))?;
     let sub_id = sf.meta.id.clone();
-    store.set_workspace(&sub_id, parent_ws.clone())?;
+    // the parent link is the cascade key: deleting the parent session
+    // removes this transcript with it (sessions::subs_of / delete_session)
+    store.adopt_sub(&sub_id, parent_session, parent_ws.clone())?;
 
     let mut system_full = crate::sysprompt::assemble(&cfg.settings.system_prompt, parent_ws.as_deref());
     if let Some(p) = profile {
@@ -528,6 +549,8 @@ pub(crate) async fn run_subagent(
         lp.bind_tools_hash(tools_hash(Some(&tools)));
         lp.clone()
     };
+    // the entry dies with the run, on every exit path — see SubPrefixGuard
+    let _prefix_guard = SubPrefixGuard { state, sub_id: sub_id.clone() };
 
     let task_msg = ChatMessage::plain("user", format!("{}{task}", chat::SUBAGENT_DIRECTIVE));
     let mut sent_this_turn: Vec<ChatMessage> = vec![task_msg.clone()];
@@ -535,7 +558,6 @@ pub(crate) async fn run_subagent(
     let stop = Arc::new(AtomicBool::new(false));
 
     let mut final_text: Option<String> = None;
-    let mut turn_status = "error".to_string();
     for _round in 1..=max_rounds {
         let body = chat::build_body(&provider, &model, &owned_prefix, &sent_this_turn, &system_full, Some(&tools));
         let message_id = Uuid::new_v4().to_string();
@@ -660,12 +682,10 @@ pub(crate) async fn run_subagent(
             store.save(&s)?;
         }
         if outcome.status != "ok" {
-            turn_status = outcome.status;
             break;
         }
         if !has_tools {
             final_text = Some(outcome.content);
-            turn_status = "ok".into();
             break;
         }
         // execute read tools, feed results back
@@ -738,17 +758,11 @@ pub(crate) async fn run_subagent(
         }
     }
 
-    // fold the sub-turn into its lane's Zone H (mirrors run_send semantics)
-    if turn_status != "error" {
-        let mut guard = prefixes_lock(&state);
-        if let Some(map) = guard.as_mut() {
-            if let Some(lp) = map.get_mut(&(sub_id, 0)) {
-                for m in &sent_this_turn {
-                    lp.append(m);
-                }
-            }
-        }
-    }
+    // The sub-turn is NOT folded into a Zone H here: unlike a main lane,
+    // this entry is keyed by a per-run sub_id that nothing re-opens after
+    // the run — _prefix_guard removes it on return, so folding would only
+    // polish bytes that are about to be dropped.
+
     // flip the parent's delegate card out of its streaming state
     tap.forward("", true);
 

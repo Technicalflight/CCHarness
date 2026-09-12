@@ -83,6 +83,13 @@ fn main() {
             std::fs::create_dir_all(&data_dir).ok();
             app.manage(commands::AppState::new(data_dir));
 
+            // startup sweep: sub transcripts orphaned by pre-cascade deletes
+            // (or an interrupted adopt_sub) are unreachable — purge them
+            let purged = app.state::<commands::AppState>().store.delete_orphan_subs();
+            if purged > 0 {
+                eprintln!("CCHarness: 已清理 {purged} 个孤儿子任务会话文件");
+            }
+
             // heal a window that a previous session left partially off-screen
             // (e.g. a geometry restore landing on a maximized window): clamp
             // its position so at least ~120px of it stays on the monitor

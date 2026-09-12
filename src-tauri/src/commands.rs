@@ -774,15 +774,32 @@ fn models_client() -> reqwest::Client {
         .expect("models http client")
 }
 
-#[tauri::command]
-pub fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
-    if let Some(map) = prefixes_lock(&state).as_mut() {
-        map.retain(|(sid, _), _| sid != &session_id);
+/// In-memory and side-file teardown shared by a session and its cascade:
+/// prefix lane entries, privacy surrogates, spill files. The session JSON
+/// itself is removed by the caller via store.delete.
+fn purge_session_traces(state: &AppState, session_id: &str) {
+    if let Some(map) = prefixes_lock(state).as_mut() {
+        map.retain(|(sid, _), _| sid != session_id);
     }
     // 生命周期随行：内存里的隐私替身库与磁盘上的溢出文件都随会话消亡，
     // 不再无限累积（privacy::forget 此前是死代码，spills 目录从未清理）
-    crate::privacy::forget(&session_id);
-    crate::spill::purge_session(&session_id);
+    crate::privacy::forget(session_id);
+    crate::spill::purge_session(session_id);
+}
+
+#[tauri::command]
+pub fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    // Cascade (P1-5): kind-"sub" transcripts have no sidebar entry — they
+    // are reachable only through their parent, so they die with it. Their
+    // prefix entries, privacy surrogates and spills go through the same
+    // teardown as the parent.
+    for sub in state.store.subs_of(&session_id) {
+        purge_session_traces(&state, &sub);
+        if let Err(e) = state.store.delete(&sub) {
+            eprintln!("delete_session: 级联清理子会话 {sub} 失败: {e}");
+        }
+    }
+    purge_session_traces(&state, &session_id);
     state.store.delete(&session_id)
 }
 

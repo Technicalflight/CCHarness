@@ -1,4 +1,7 @@
-// Wire types shared across Rust modules — field names mirror src/types.ts.
+// Wire types shared across Rust modules — the wire-shape mirror of
+// src/types.ts. Every change must land in BOTH files in the same commit;
+// new SessionMeta / SessionFile fields need #[serde(default)] so older
+// session files keep loading.
 use serde::{Deserialize, Serialize};
 
 /// Active git-worktree isolation for a session (worktree isolation): all
@@ -25,7 +28,12 @@ pub struct SessionBinding {
 pub struct SessionMeta {
     pub id: String,
     pub title: String,
-    pub kind: String, // "chat" | "arena"
+    pub kind: String, // "chat" | "arena" | "sub"
+    /// Parent session id, set only for kind "sub" transcripts created by
+    /// delegate_subagent. Cascade key: the sub is reachable only through
+    /// its parent, so deleting the parent deletes the sub with it.
+    #[serde(default)]
+    pub parent: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
     pub bindings: Vec<SessionBinding>,

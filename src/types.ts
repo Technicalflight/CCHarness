@@ -1,5 +1,5 @@
-// Shared contract types. Field names mirror the Rust side (serde) —
-// any change here must be mirrored in src-tauri/src/*.
+// Shared contract types. Field names mirror src-tauri/src/types_rs.rs
+// (serde) — every change must land in BOTH files in the same commit.
 
 export type ProviderKind =
   | "openai_compatible"
@@ -337,6 +337,8 @@ export interface SessionMeta {
   title: string;
   /** "chat" | "arena" | "sub" (sub = hidden background sub-agent session) */
   kind: "chat" | "arena" | "sub";
+  /** kind "sub" only: parent session id — the sub is deleted with it. */
+  parent?: string | null;
   created_at: number;
   updated_at: number;
   /** chat: single binding. arena: one per lane. */

@@ -93,6 +93,7 @@ impl SessionStore {
             id: uuid::Uuid::new_v4().to_string(),
             title: if title.trim().is_empty() { default_title(kind) } else { title.trim().to_string() },
             kind: kind.to_string(),
+            parent: None,
             created_at: now,
             updated_at: now,
             bindings,
@@ -132,6 +133,51 @@ impl SessionStore {
         // referenced only by the deleted session — remove them with it
         let _ = fs::remove_dir_all(self.dir.join("attachments").join(sanitize_id(id)));
         Ok(())
+    }
+
+    /// Record a freshly created sub transcript's parent link + workspace in
+    /// one write (run_subagent would otherwise need two load-modify-save
+    /// passes over the same just-written file). The parent link is the
+    /// cascade key used by subs_of.
+    pub fn adopt_sub(&self, sub_id: &str, parent_id: &str, workspace: Option<String>) -> Result<(), String> {
+        let mut sf = self.load(sub_id)?;
+        sf.meta.parent = Some(parent_id.to_string());
+        sf.meta.workspace = workspace.map(|w| w.trim().to_string()).filter(|w| !w.is_empty());
+        self.save(&sf)
+    }
+
+    /// Ids of kind-"sub" transcripts belonging to `parent_id` — the cascade
+    /// delete set: sub transcripts have no sidebar entry, so they are only
+    /// reachable through the parent and die with it.
+    pub fn subs_of(&self, parent_id: &str) -> Vec<String> {
+        self.list()
+            .into_iter()
+            .filter(|m| m.kind == "sub" && m.parent.as_deref() == Some(parent_id))
+            .map(|m| m.id)
+            .collect()
+    }
+
+    /// Startup sweep: sub transcripts whose parent link is missing or points
+    /// at a session that no longer exists are unreachable garbage (deleted
+    /// parents from before the cascade existed, an interrupted adopt_sub).
+    /// Returns how many files were purged.
+    pub fn delete_orphan_subs(&self) -> usize {
+        let metas = self.list();
+        let ids: std::collections::HashSet<&str> = metas.iter().map(|m| m.id.as_str()).collect();
+        let mut purged = 0usize;
+        for m in &metas {
+            if m.kind != "sub" {
+                continue;
+            }
+            let orphan = match m.parent.as_deref() {
+                None => true,
+                Some(p) => !ids.contains(p),
+            };
+            if orphan && self.delete(&m.id).is_ok() {
+                purged += 1;
+            }
+        }
+        purged
     }
 
     pub fn rename(&self, id: &str, title: &str) -> Result<SessionMeta, String> {
@@ -489,6 +535,45 @@ mod tests {
         // the summary covers history past the branch point → must not leak in
         assert!(fork.compaction.is_none(), "折叠边界越过分支点时摘要必须失效");
         assert!(fork.meta.title.starts_with("↳"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P1-5 cascade: sub transcripts hang off their parent's meta link and
+    // must never outlive it.
+    #[test]
+    fn subs_of_lists_only_linked_subs() {
+        let (store, dir) = tmp_store("subs_of");
+        let parent = store.create("chat", vec![], "父").unwrap();
+        let other = store.create("chat", vec![], "旁人").unwrap();
+        let sub = store.create("sub", vec![], "🤖 子任务").unwrap();
+        store.adopt_sub(&sub.meta.id, &parent.meta.id, None).unwrap();
+        // an unlinked sub (pre-adopt crash window) belongs to nobody
+        let stray = store.create("sub", vec![], "🤖 子任务").unwrap();
+        let mut subs = store.subs_of(&parent.meta.id);
+        subs.sort();
+        assert_eq!(subs, vec![sub.meta.id.clone()]);
+        assert!(store.subs_of(&other.meta.id).is_empty());
+        assert_eq!(store.load(&sub.meta.id).unwrap().meta.parent.as_deref(), Some(parent.meta.id.as_str()));
+        assert!(store.load(&stray.meta.id).unwrap().meta.parent.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_orphan_subs_sweeps_unlinked_and_dead_parents() {
+        let (store, dir) = tmp_store("orphan_sweep");
+        let parent = store.create("chat", vec![], "父").unwrap();
+        let live = store.create("sub", vec![], "s1").unwrap();
+        store.adopt_sub(&live.meta.id, &parent.meta.id, None).unwrap();
+        let stray = store.create("sub", vec![], "s2").unwrap(); // no parent link
+        let dead = store.create("sub", vec![], "s3").unwrap(); // parent already deleted
+        store.adopt_sub(&dead.meta.id, "00000000-dead-beef-0000-000000000000", None).unwrap();
+        let gone_chat = store.create("chat", vec![], "普通会话不受清扫影响").unwrap();
+        assert_eq!(store.delete_orphan_subs(), 2);
+        assert!(store.load(&live.meta.id).is_ok(), "父会话在世的 sub 必须保留");
+        assert!(store.load(&stray.meta.id).is_err());
+        assert!(store.load(&dead.meta.id).is_err());
+        assert!(store.load(&parent.meta.id).is_ok());
+        assert!(store.load(&gone_chat.meta.id).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
