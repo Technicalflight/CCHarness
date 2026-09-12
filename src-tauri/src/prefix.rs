@@ -367,19 +367,23 @@ impl LanePrefix {
         self.system_json == message_json(&ChatMessage::plain("system", system_prompt))
     }
 
-    /// Adopt a changed system prompt WITHOUT rewriting Zone S: the caller
-    /// injects the new text as an in-history system message (request and
-    /// Zone H then carry old-Zone-S + the update, and models that honor the
-    /// latest system message treat it as effective). Returns true the first
-    /// time a given text is adopted — the caller injects exactly then. Any
-    /// rebuild (privacy/empty/model triggers, restart) resets this state via
-    /// `new`, and the rebuilt Zone S carries the current text directly.
-    pub fn adopt_system_in_history(&mut self, system_prompt: &str) -> bool {
-        if self.system_is(system_prompt) {
-            return false;
-        }
+    /// Whether the current system text still needs an in-history injection
+    /// (Zone S carries neither it nor a previously landed adoption). Peek
+    /// only — booking happens via mark_system_in_history once the
+    /// injection has actually entered Zone H, so a failed/stopped turn
+    /// re-injects instead of silently losing the update (same discipline
+    /// as the RollingMemo watermark).
+    pub fn system_needs_in_history(&self, system_prompt: &str) -> bool {
+        !self.system_is(system_prompt)
+    }
+
+    /// Book an in-history system adoption AFTER its injection message
+    /// landed in Zone H (turn-end append) — see system_needs_in_history.
+    /// Any rebuild (privacy/empty/model triggers, restart) resets this
+    /// state via `new`, and the rebuilt Zone S carries the current text
+    /// directly.
+    pub fn mark_system_in_history(&mut self, system_prompt: &str) {
         self.in_history_system = Some(system_prompt.to_string());
-        true
     }
 
     /// Public accessors used by the command layer.
@@ -1093,24 +1097,29 @@ mod tests {
     }
 
     #[test]
-    fn adopt_system_in_history_keeps_zone_s_bytes() {
+    fn in_history_system_injection_lands_only_after_mark() {
         let mut lp = sys();
         let bytes_before = lp.prefix_bytes();
         let digest_before = lp.digest_hex();
         let epoch_before = lp.epoch;
-        // changed system: adopt instead of rebuild
+        // changed system: peek says inject, but booking is deferred to the
+        // turn-end append — a failed turn must re-inject, not lose the text
         assert!(!lp.system_is("新系统提示"));
-        assert!(lp.adopt_system_in_history("新系统提示"));
-        // suppresses repeat injections, Zone S untouched, epoch untouched
+        assert!(lp.system_needs_in_history("新系统提示"));
+        assert!(lp.system_needs_in_history("新系统提示"), "peek 不记账，失败回合可重注入");
+        // the injection landed: booking suppresses repeat injections,
+        // Zone S untouched, epoch untouched
+        lp.mark_system_in_history("新系统提示");
         assert!(lp.system_is("新系统提示"));
-        assert!(!lp.adopt_system_in_history("新系统提示"));
+        assert!(!lp.system_needs_in_history("新系统提示"));
         assert_eq!(bytes_before, lp.prefix_bytes());
         assert_eq!(digest_before, lp.digest_hex());
         assert_eq!(epoch_before, lp.epoch);
         // Zone S still answers true for the ORIGINAL text (bytes unchanged)
         assert!(lp.system_is("你是严谨的编程助手"));
-        // a second change re-adopts (latest wins)
-        assert!(lp.adopt_system_in_history("第三个提示"));
+        // a second change re-injects (latest wins)
+        assert!(lp.system_needs_in_history("第三个提示"));
+        lp.mark_system_in_history("第三个提示");
         assert!(lp.system_is("第三个提示"));
         assert!(!lp.system_is("新系统提示"));
     }
@@ -1223,12 +1232,12 @@ mod tests {
     #[test]
     fn rebuild_resets_in_history_adoption() {
         let mut lp = sys();
-        assert!(lp.adopt_system_in_history("新系统提示"));
+        lp.mark_system_in_history("新系统提示");
         lp.rebuild("新系统提示", &[ChatMessage::plain("user", "a")]);
         // rebuilt Zone S carries the current text directly — no adoption
-        // state left behind, and adopt is a no-op for the same text
+        // state left behind, and peek is a no-op for the same text
         assert!(lp.system_is("新系统提示"));
-        assert!(!lp.adopt_system_in_history("新系统提示"));
+        assert!(!lp.system_needs_in_history("新系统提示"));
     }
 
     #[test]

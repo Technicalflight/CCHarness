@@ -1365,8 +1365,14 @@ async fn run_send(
                 if !needs_rebuild
                     && system_changed
                     && in_history_ok
-                    && lp.adopt_system_in_history(&system_full)
+                    && lp.system_needs_in_history(&system_full)
                 {
+                    // NOTE: the adoption is NOT booked here — same discipline
+                    // as the memo watermark below. Booking at prep time let a
+                    // failed/stopped turn claim the update was injected when
+                    // its message never entered Zone H, silently losing the
+                    // system change until a rebuild. Booking happens right
+                    // after the Zone H append at turn end.
                     system_injection = Some(system_full.clone());
                 }
                 if needs_rebuild {
@@ -2669,6 +2675,12 @@ async fn run_send(
                         if let Some(lp) = map.get_mut(&(session_id.clone(), lane)) {
                             for m in &sent_this_turn {
                                 lp.append(m);
+                            }
+                            // the in-history system update rode the request
+                            // and has now entered Zone H — only now book it,
+                            // so a failed turn re-injects (see prep comment)
+                            if let Some(sys_text) = &system_injection {
+                                lp.mark_system_in_history(sys_text);
                             }
                             // cache warmer (opt-in): snapshot the post-append
                             // prefix — exactly the span the next real request
