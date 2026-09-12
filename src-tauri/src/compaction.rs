@@ -811,6 +811,7 @@ pub(crate) async fn maybe_auto_compact(
                 tool_call_id: None,
                 skill_calls: None,
                 workflow: None,
+                workflow_text: None,
                 images: Vec::new(),
             });
             s.meta.updated_at = now_ms();
@@ -901,6 +902,7 @@ mod memo_tests {
             tool_call_id: None,
             skill_calls: None,
             workflow: None,
+            workflow_text: None,
             images: Vec::new(),
         }
     }
@@ -1121,6 +1123,7 @@ mod bucket_tests {
             tool_call_id: None,
             skill_calls: None,
             workflow: None,
+            workflow_text: None,
             images: Vec::new(),
         }
     }

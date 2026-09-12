@@ -526,6 +526,7 @@ pub(crate) async fn run_subagent(
         tool_call_id: None,
         skill_calls: None,
         workflow: Some("subagent".into()),
+        workflow_text: None,
         images: Vec::new(),
     };
     {
@@ -659,6 +660,7 @@ pub(crate) async fn run_subagent(
             tool_call_id: None,
             skill_calls: None,
             workflow: None,
+            workflow_text: None,
             images: Vec::new(),
         };
         sent_this_turn.push(asst_msg.clone());
@@ -687,6 +689,7 @@ pub(crate) async fn run_subagent(
                             tool_call_id: Some(cid.clone()),
                             skill_calls: None,
                             workflow: None,
+                            workflow_text: None,
                             images: Vec::new(),
                         });
                     }
@@ -757,6 +760,7 @@ pub(crate) async fn run_subagent(
                 tool_call_id: Some(tc.id.clone()),
                 skill_calls: None,
                 workflow: None,
+                workflow_text: None,
                 images: Vec::new(),
             };
             sent_this_turn.push(ChatMessage {
@@ -987,6 +991,15 @@ async fn run_review_rehearsal(
     Some(block)
 }
 
+/// Freeze the rendered sm-state prefix on a user record at send time (see
+/// MessageRecord::workflow_text). Non-sm gates need no freeze — their
+/// directives are build constants.
+fn freeze_sm_text(wf: &str, workflows: &[crate::config::WorkflowDef]) -> Option<String> {
+    let (def_id, state_name) = wf.strip_prefix("sm:")?.split_once(':')?;
+    let (def, st) = chat::resolve_sm(workflows, def_id, state_name)?;
+    Some(chat::sm_gate_prefix(&def.name, &st.name, &st.directive))
+}
+
 async fn run_send(
     app: tauri::AppHandle,
     state: &State<'_, AppState>,
@@ -1058,6 +1071,10 @@ async fn run_send(
     } else {
         crate::sessions::save_attachments(&state.data_dir, &session_id, &images)?
     };
+    // the exact workflow gate and its rendered state text are frozen on the
+    // record at send time — the rebuild must replay the SAME bytes even when
+    // the workflow definition is edited or deleted afterwards
+    let wf_gate = workflow_of_in(&state, &session_id, &state.data_dir);
     let user_record = MessageRecord {
         id: Uuid::new_v4().to_string(),
         lane: 0,
@@ -1073,7 +1090,8 @@ async fn run_send(
         tool_calls: None,
         tool_call_id: None,
         skill_calls: if skill_calls.is_empty() { None } else { Some(skill_calls) },
-        workflow: record_workflow_of(&workflow_of_in(&state, &session_id, &state.data_dir)),
+        workflow: record_workflow_of(&wf_gate),
+        workflow_text: freeze_sm_text(&wf_gate, &cfg.workflows),
         images: image_names,
     };
     {
@@ -1349,6 +1367,7 @@ async fn run_send(
                     tool_call_id: None,
                     skill_calls: None,
                     workflow: None,
+                    workflow_text: None,
                     images: Vec::new(),
                 };
                 {
@@ -1883,6 +1902,7 @@ async fn run_send(
                     tool_call_id: None,
                     skill_calls: None,
                     workflow: None,
+                    workflow_text: None,
                     images: Vec::new(),
                 };
                 last_confidence = outcome.confidence;
@@ -1926,6 +1946,7 @@ async fn run_send(
                                 tool_call_id: None,
                                 skill_calls: None,
                                 workflow: None,
+                                workflow_text: None,
                                 images: Vec::new(),
                             });
                         }
@@ -1953,6 +1974,7 @@ async fn run_send(
                                         tool_call_id: Some(cid.clone()),
                                         skill_calls: None,
                                         workflow: None,
+                                        workflow_text: None,
                                         images: Vec::new(),
                                     });
                                 }
@@ -2094,6 +2116,7 @@ async fn run_send(
                             tool_call_id: Some(fc.id.clone()),
                             skill_calls: None,
                             workflow: None,
+                            workflow_text: None,
                             images: Vec::new(),
                         };
                         {
@@ -2710,6 +2733,7 @@ async fn run_send(
                         tool_call_id: Some(tc.id.clone()),
                         skill_calls: None,
                         workflow: None,
+                        workflow_text: None,
                         images: rec_images,
                     };
                     {
@@ -2771,6 +2795,7 @@ async fn run_send(
                         tool_call_id: None,
                         skill_calls: None,
                         workflow: None,
+                        workflow_text: None,
                         images: Vec::new(),
                     });
                     sf.meta.updated_at = now_ms();

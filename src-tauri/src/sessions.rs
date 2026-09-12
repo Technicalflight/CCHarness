@@ -514,6 +514,7 @@ mod tests {
             tool_call_id: None,
             skill_calls: None,
             workflow: None,
+            workflow_text: None,
             images: Vec::new(),
         }
     }

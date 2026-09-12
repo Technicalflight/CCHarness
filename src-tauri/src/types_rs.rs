@@ -261,6 +261,13 @@ pub struct MessageRecord {
     /// produce identical bytes.
     #[serde(default)]
     pub workflow: Option<String>,
+    /// Frozen directive PREFIX for `sm:<def>:<state>` records: the rendered
+    /// state text captured at SEND time. Rebuilds prefer it, so editing or
+    /// deleting the workflow definition later cannot rewrite Zone H bytes
+    /// (which would full-miss the upstream cache and fork live vs restart
+    /// context). None for legacy records and every non-sm workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_text: Option<String>,
     /// Attachment filenames (relative, under
     /// <data_dir>/sessions/attachments/<session_id>/) carried by user
     /// messages (pasted/uploaded images) and tool records (e.g.

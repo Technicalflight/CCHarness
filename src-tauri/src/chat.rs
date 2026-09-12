@@ -1400,17 +1400,28 @@ pub fn transcript_for_lane(
             // ahead of the message so history and live appends stay
             // byte-identical (state text is immutable per record)
             ("user", _, Some(w)) if w.starts_with("sm:") => {
-                match w[3..].split_once(':') {
-                    Some((def_id, state_name)) => match resolve_sm(workflows, def_id, state_name) {
-                        Some((def, st)) => format!(
-                            "---\n[状态机工作流「{}」 · 当前状态：{}]\n{}\n---\n\n{}",
-                            def.name, st.name, st.directive, m.content
-                        ),
-                        // def or state was deleted/redefined — degrade to the
-                        // plain message instead of failing the whole rebuild
+                // the text FROZEN on the record at send time wins —
+                // re-resolving against the CURRENT workflow config would
+                // rewrite Zone H bytes whenever the definition was edited or
+                // removed, full-missing the upstream cache and forking
+                // live vs restart context. Resolution is only the fallback
+                // for legacy records written before the freeze existed.
+                if let Some(text) = &m.workflow_text {
+                    format!("{text}{}", m.content)
+                } else {
+                    match w[3..].split_once(':') {
+                        Some((def_id, state_name)) => match resolve_sm(workflows, def_id, state_name) {
+                            Some((def, st)) => format!(
+                                "{}{}",
+                                sm_gate_prefix(&def.name, &st.name, &st.directive),
+                                m.content
+                            ),
+                            // def or state was deleted/redefined — degrade to the
+                            // plain message instead of failing the whole rebuild
+                            None => m.content.clone(),
+                        },
                         None => m.content.clone(),
-                    },
-                    None => m.content.clone(),
+                    }
                 }
             }
             _ => m.content.clone(),
@@ -1450,6 +1461,13 @@ pub fn transcript_for_lane(
     }
     out.append(&mut pending_syn);
     out
+}
+
+/// The exact prefix injected ahead of a user message sent under an
+/// `sm:<def>:<state>` gate — single source of truth for the live injection,
+/// the per-record freeze and the rebuild fallback.
+pub fn sm_gate_prefix(def_name: &str, st_name: &str, directive: &str) -> String {
+    format!("---\n[状态机工作流「{def_name}」 · 当前状态：{st_name}]\n{directive}\n---\n\n")
 }
 
 pub fn cost_of(usage: &UsageStat, p: &Provider, model: &str) -> Option<f64> {

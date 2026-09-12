@@ -1166,6 +1166,7 @@ pub fn import_session(
             tool_call_id: None,
             skill_calls: None,
             workflow: None,
+            workflow_text: None,
             images: Vec::new(),
         })
         .collect();
