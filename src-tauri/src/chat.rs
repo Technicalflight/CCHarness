@@ -256,8 +256,17 @@ pub async fn stream_lane(
             arguments: if tc.args.trim().is_empty() { "{}".into() } else { tc.args },
         })
         .collect::<Vec<_>>();
-    let wants_tools =
-        finish_reason.as_deref() == Some("tool_calls") && !tool_calls.is_empty();
+    // The canonical signal is finish_reason == "tool_calls", but legacy
+    // gateways speak function_call semantics or just close with "stop"
+    // while still streaming tool_calls — dropping the batch there would
+    // silently lose a tool turn. Fall back to the observed accumulators:
+    // anything actually assembled counts on the lenient finishes.
+    let finish = finish_reason.as_deref();
+    let wants_tools = if finish == Some("tool_calls") {
+        !tool_calls.is_empty()
+    } else {
+        matches!(finish, Some("function_call") | None | Some("stop")) && !tool_calls.is_empty()
+    };
 
     let status = if stopped { "stopped" } else { "ok" };
     Ok(LaneOutcome {
@@ -464,10 +473,17 @@ fn handle_openai_frame(
                 }
             }
         }
-        // streamed tool-call fragments, indexed assembly
+        // streamed tool-call fragments, indexed assembly. The index comes
+        // from the wire — a hostile/broken frame with a huge index would
+        // allocate millions of accumulator slots here (OOM). Legal streams
+        // count up from 0 with no gaps, so anything beyond a small window
+        // past the known tail is a malformed frame: skip it.
         if let Some(arr) = d.get("tool_calls").and_then(|x| x.as_array()) {
             for tc in arr {
                 let idx = tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                if idx > 1024 || idx > tool_accs.len() + 64 {
+                    continue;
+                }
                 while tool_accs.len() <= idx {
                     tool_accs.push(ToolCallAcc::default());
                 }

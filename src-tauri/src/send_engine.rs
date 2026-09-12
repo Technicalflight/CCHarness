@@ -198,6 +198,19 @@ pub async fn group_send(
         };
         // run_send awaits its (single) lane task internally, so this loop is
         // strictly sequential — each member sees all earlier replies.
+        // Snapshot the newest persisted ts BEFORE the turn: run_send sends on
+        // lane 0 no matter which member is speaking, so the read-back below
+        // keys on "ok assistant after this mark" — keying on lane == idx made
+        // member 1+ read nothing and silently ended the table.
+        let before_ts = {
+            let _guard = state.save_lock.lock().await;
+            state
+                .store
+                .load(&session_id)
+                .ok()
+                .and_then(|sf| sf.messages.iter().map(|m| m.ts).max())
+                .unwrap_or(0)
+        };
         run_send(
             app.clone(),
             &state,
@@ -221,7 +234,7 @@ pub async fn group_send(
                     sf.messages
                         .iter()
                         .rev()
-                        .find(|m| m.lane == idx as u32 && m.role == "assistant" && m.status == "ok")
+                        .find(|m| m.ts > before_ts && m.role == "assistant" && m.status == "ok")
                         .map(|m| m.content.clone())
                 })
                 .unwrap_or_default()
@@ -328,8 +341,12 @@ fn file_agent_profiles(cfg: &AppConfig, data_dir: &std::path::Path) -> Vec<crate
     let dir = data_dir.join("agents");
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(&dir) else { return out };
-    for e in entries.flatten() {
-        let p = e.path();
+    // the profile list rides into request bytes (delegate tool description)
+    // — read_dir order is filesystem-defined (exFAT has none), so sort by
+    // file name to keep the head deterministic across rebuilds
+    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for p in paths {
         if p.extension().and_then(|x| x.to_str()) != Some("md") {
             continue;
         }
