@@ -788,7 +788,11 @@ fn purge_session_traces(state: &AppState, session_id: &str) {
 }
 
 #[tauri::command]
-pub fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+pub async fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    // teardown 与在途流式落盘互斥：lane 的整文件写回若排在删除之后会把
+    // 会话“复活”。前置的停止守卫（前端先 stop）已收窄窗口，这里串行化
+    // 掉剩余竞态。
+    let _guard = state.save_lock.lock().await;
     // Cascade (P1-5): kind-"sub" transcripts have no sidebar entry — they
     // are reachable only through their parent, so they die with it. Their
     // prefix entries, privacy surrogates and spills go through the same
@@ -1761,7 +1765,7 @@ pub struct WtInfo {
 /// until the user merges (wt_merge) or discards (wt_discard). The main
 /// workspace must be clean first, so a later `git apply` can't collide.
 #[tauri::command]
-pub fn wt_start(state: State<'_, AppState>, session_id: String) -> Result<crate::types_rs::WtState, String> {
+pub async fn wt_start(state: State<'_, AppState>, session_id: String) -> Result<crate::types_rs::WtState, String> {
     let sf = state.store.load(&session_id)?;
     if sf.meta.wt.is_some() {
         return Err("该会话已处于 worktree 隔离中".into());
@@ -1776,6 +1780,9 @@ pub fn wt_start(state: State<'_, AppState>, session_id: String) -> Result<crate:
         return Err("主工作区有未提交的改动 —— 请先提交或 stash 再开启隔离".into());
     }
     let st = crate::worktree::create(&ws, &state.data_dir, &session_id)?;
+    // meta 写入与流式落盘互斥（P1 同类纪律）：只锁元数据写，不横跨上面的
+    // 秒级 git 操作 —— save_lock 是全局串行锁，长持锁会卡住所有会话保存
+    let _guard = state.save_lock.lock().await;
     state.store.set_wt(&session_id, Some(st.clone()))?;
     Ok(st)
 }
@@ -1812,11 +1819,13 @@ pub fn wt_diff(state: State<'_, AppState>, session_id: String) -> Result<String,
 /// edits (git apply of the full binary diff), then remove worktree + branch.
 /// Fail-closed: on any apply error the worktree is kept untouched.
 #[tauri::command]
-pub fn wt_merge(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
+pub async fn wt_merge(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
     let sf = state.store.load(&session_id)?;
     let ws = sf.meta.workspace.clone().ok_or("会话未绑定工作区")?;
     let wt = sf.meta.wt.ok_or("当前未开启 worktree 隔离")?;
     let summary = crate::worktree::merge(&wt, &ws)?;
+    // 只锁元数据写，不横跨 git apply（见 wt_start 注释）
+    let _guard = state.save_lock.lock().await;
     state.store.set_wt(&session_id, None)?;
     Ok(summary)
 }
@@ -1824,11 +1833,13 @@ pub fn wt_merge(state: State<'_, AppState>, session_id: String) -> Result<String
 /// Discard the isolation branch and worktree — every change made inside the
 /// worktree is thrown away (the frontend confirms before calling this).
 #[tauri::command]
-pub fn wt_discard(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+pub async fn wt_discard(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
     let sf = state.store.load(&session_id)?;
     let ws = sf.meta.workspace.clone().ok_or("会话未绑定工作区")?;
     let wt = sf.meta.wt.ok_or("当前未开启 worktree 隔离")?;
     crate::worktree::discard(&wt, &ws)?;
+    // 只锁元数据写，不横跨 git 操作（见 wt_start 注释）
+    let _guard = state.save_lock.lock().await;
     state.store.set_wt(&session_id, None)?;
     Ok(())
 }
